@@ -24,4 +24,7 @@
   <ItemGroup>
     <None Include="Fixtures\v4-populated\*.sql" Link="Fixtures\v4-populated\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="Fixtures\v5-populated\*.sql" Link="Fixtures\v5-populated\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

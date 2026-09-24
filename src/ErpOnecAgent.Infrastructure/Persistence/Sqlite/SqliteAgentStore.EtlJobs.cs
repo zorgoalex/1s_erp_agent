@@ -232,14 +232,21 @@ public sealed partial class SqliteAgentStore
             throw new ArgumentOutOfRangeException(nameof(request), "Configuration version cannot be negative.");
         foreach (var entity in request.Entities)
         {
-            var keys = entity.EffectiveKeyFields();
-            if (string.IsNullOrWhiteSpace(entity.EntityCode) || string.IsNullOrWhiteSpace(entity.ODataPath) || string.IsNullOrWhiteSpace(entity.KeyField)
-                || keys.Any(string.IsNullOrWhiteSpace) || keys.Distinct(StringComparer.Ordinal).Count() != keys.Count || !keys.Contains(entity.KeyField, StringComparer.Ordinal)
-                || entity.PageSize is < 1 or > 10_000 || entity.Select is null || entity.Select.Count == 0 || entity.ODataVersion is < 3 or > 4
-                || !entity.Enabled
-                || (entity.UpdatedAtField is not null && entity.UpdatedAtEdmType is not ("Edm.DateTime" or "Edm.DateTimeOffset")))
+            if (!IsValidResolvedEntityDefinition(entity))
                 throw new ArgumentException($"Resolved entity definition '{entity.EntityCode}' is invalid.", nameof(request));
         }
+    }
+
+    // The structural invariants every resolved entity definition must satisfy — shared
+    // with the F1 capture path so a frozen definition is judged identically everywhere.
+    private static bool IsValidResolvedEntityDefinition(EtlEntityDefinition entity)
+    {
+        var keys = entity.EffectiveKeyFields();
+        return !(string.IsNullOrWhiteSpace(entity.EntityCode) || string.IsNullOrWhiteSpace(entity.ODataPath) || string.IsNullOrWhiteSpace(entity.KeyField)
+            || keys.Any(string.IsNullOrWhiteSpace) || keys.Distinct(StringComparer.Ordinal).Count() != keys.Count || !keys.Contains(entity.KeyField, StringComparer.Ordinal)
+            || entity.PageSize is < 1 or > 10_000 || entity.Select is null || entity.Select.Count == 0 || entity.ODataVersion is < 3 or > 4
+            || !entity.Enabled
+            || (entity.UpdatedAtField is not null && entity.UpdatedAtEdmType is not ("Edm.DateTime" or "Edm.DateTimeOffset")));
     }
 
     // Locally proposed CD-ETL-1 acceptance result: succeeded + data:{accepted:true, runId, mode}.

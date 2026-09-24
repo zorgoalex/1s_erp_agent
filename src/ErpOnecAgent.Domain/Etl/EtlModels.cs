@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace ErpOnecAgent.Domain.Etl;
 
-public enum EtlRunStatus { Pending, Running, Paused, Uploading, Completing, Succeeded, PartialSuccess, Failed, Cancelled }
+public enum EtlRunStatus { Pending, Running, Paused, Uploading, Completing, Succeeded, PartialSuccess, Failed, Cancelled, Blocked }
 public enum EtlBatchStatus { Creating, Ready, Uploading, Acknowledged, RetryWaiting, DeadLetter, Deleted }
 
 public sealed record EtlCursor(DateTimeOffset? UpdatedAtUtc, string? SourceId);
