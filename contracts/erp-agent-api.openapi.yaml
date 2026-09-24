@@ -1,0 +1,205 @@
+openapi: 3.1.0
+info:
+  title: ERP 1C Agent API
+  version: 1.0.0
+  description: Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
+servers:
+  - url: https://erp.example.com/api/integration/1c-agents/v1
+security:
+  - mutualTLS: []
+paths:
+  /session/start:
+    post:
+      operationId: startAgentSession
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SessionStartRequest' } } } }
+      responses:
+        '200': { description: Session response, content: { application/json: { schema: { $ref: '#/components/schemas/SessionStartResponse' } } } }
+  /commands/lease:
+    post:
+      operationId: leaseCommand
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LeaseRequest' } } } }
+      responses:
+        '200': { description: Lease response, content: { application/json: { schema: { $ref: '#/components/schemas/LeaseResponse' } } } }
+  /commands/{commandId}/received:
+    post:
+      operationId: acknowledgeCommandReceived
+      parameters: [ { $ref: '#/components/parameters/CommandId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReceivedAck' } } } }
+      responses: { '204': { description: Durable receive acknowledged }, '409': { $ref: '#/components/responses/Conflict' } }
+  /commands/{commandId}/lease/renew:
+    post:
+      operationId: renewCommandLease
+      parameters: [ { $ref: '#/components/parameters/CommandId' } ]
+      responses: { '204': { description: Lease renewed }, '409': { $ref: '#/components/responses/Conflict' } }
+  /commands/{commandId}/result:
+    put:
+      operationId: putCommandResult
+      parameters: [ { $ref: '#/components/parameters/CommandId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CommandResult' } } } }
+      responses: { '204': { description: Idempotent result ACK }, '409': { $ref: '#/components/responses/Conflict' } }
+  /heartbeat:
+    post:
+      operationId: sendHeartbeat
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Heartbeat' } } } }
+      responses: { '204': { description: Heartbeat accepted } }
+  /etl/batches:
+    post:
+      operationId: uploadEtlBatch
+      parameters:
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Content-SHA256, in: header, required: true, schema: { type: string } }
+        - { name: X-Batch-Id, in: header, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Run-Id, in: header, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Entity, in: header, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/x-ndjson: { schema: { type: string, format: binary } } } }
+      responses:
+        '200': { description: Batch ACK, content: { application/json: { schema: { $ref: '#/components/schemas/BatchAck' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /etl/runs/{runId}/complete:
+    post:
+      operationId: completeEtlRun
+      parameters: [ { name: runId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+      responses: { '204': { description: Idempotent run completion ACK } }
+  /configuration:
+    get:
+      operationId: getAgentConfiguration
+      parameters: [ { name: currentVersion, in: query, required: true, schema: { type: integer, format: int64 } } ]
+      responses: { '200': { description: Versioned configuration, content: { application/json: { schema: { type: object, additionalProperties: true } } } }, '304': { description: Unchanged } }
+components:
+  securitySchemes:
+    mutualTLS: { type: mutualTLS }
+  parameters:
+    CommandId: { name: commandId, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Conflict: { description: Idempotency or payload conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } } }
+  schemas:
+    SessionStartRequest:
+      type: object
+      required: [agentId, siteId, agentVersion, localSchemaVersion, capabilities, systemTimeUtc]
+      properties:
+        agentId: { type: string }
+        siteId: { type: string }
+        agentVersion: { type: string }
+        localSchemaVersion: { type: integer }
+        capabilities: { type: array, items: { type: string } }
+        systemTimeUtc: { type: string, format: date-time }
+    SessionStartResponse:
+      type: object
+      required: [sessionId, serverTimeUtc, accepted, minimumAgentVersion, configVersion, maintenanceMode]
+      properties:
+        sessionId: { type: string, format: uuid }
+        serverTimeUtc: { type: string, format: date-time }
+        accepted: { type: boolean }
+        minimumAgentVersion: { type: string }
+        configVersion: { type: integer, format: int64 }
+        maintenanceMode: { type: boolean }
+    LeaseRequest:
+      type: object
+      required: [sessionId, supportedCommandTypes, maxWaitSeconds, currentLoad]
+      properties:
+        sessionId: { type: string, format: uuid }
+        supportedCommandTypes: { type: array, items: { type: string } }
+        maxWaitSeconds: { type: integer, minimum: 1, maximum: 120 }
+        currentLoad: { type: object, required: [executing, capacity], properties: { executing: { type: integer }, capacity: { type: integer } } }
+    LeaseResponse:
+      type: object
+      required: [hasCommand]
+      properties:
+        hasCommand: { type: boolean }
+        leaseId: { type: [string, 'null'], format: uuid }
+        leaseExpiresAtUtc: { type: [string, 'null'], format: date-time }
+        command: { anyOf: [ { $ref: '#/components/schemas/CommandEnvelope' }, { type: 'null' } ] }
+    CommandEnvelope:
+      type: object
+      required: [commandId, commandType, payloadVersion, priority, createdAtUtc, payloadHash, payload]
+      properties:
+        commandId: { type: string, format: uuid }
+        commandType: { type: string }
+        payloadVersion: { type: integer, minimum: 1 }
+        priority: { type: integer }
+        orderingKey: { type: [string, 'null'] }
+        correlationId: { type: [string, 'null'], format: uuid }
+        createdAtUtc: { type: string, format: date-time }
+        notBeforeUtc: { type: [string, 'null'], format: date-time }
+        expiresAtUtc: { type: [string, 'null'], format: date-time }
+        requestedBy: { type: [object, 'null'], additionalProperties: true }
+        payloadHash: { type: string, description: Base64 SHA-256 of canonical payload JSON }
+        payload: { type: object, additionalProperties: true }
+    ReceivedAck:
+      type: object
+      required: [leaseId, receivedAtUtc, payloadHash]
+      properties:
+        leaseId: { type: string, format: uuid }
+        receivedAtUtc: { type: string, format: date-time }
+        payloadHash: { type: string }
+    Heartbeat:
+      type: object
+      required: [agentId, version, state, uptimeSeconds, oneC, queues, etl, machine, certificate]
+      properties:
+        agentId: { type: string }
+        version: { type: string }
+        state: { type: string }
+        uptimeSeconds: { type: integer, format: int64 }
+        oneC:
+          type: object
+          required: [odataAvailable, commandApiAvailable]
+          properties:
+            odataAvailable: { type: boolean }
+            commandApiAvailable: { type: boolean }
+            lastSuccessAtUtc: { type: [string, 'null'], format: date-time }
+            lastError: { type: [string, 'null'] }
+        queues:
+          type: object
+          required: [commandsPending, resultsPending, etlBatchesPending, deadLetters]
+          properties:
+            commandsPending: { type: integer, format: int64 }
+            resultsPending: { type: integer, format: int64 }
+            etlBatchesPending: { type: integer, format: int64 }
+            deadLetters: { type: integer, format: int64 }
+        etl:
+          type: object
+          properties:
+            lastSuccessAtUtc: { type: [string, 'null'], format: date-time }
+            currentRunId: { type: [string, 'null'], format: uuid }
+        machine:
+          type: object
+          required: [diskFreeBytes, workingSetBytes, cpuPercent, sqliteSizeBytes, spoolSizeBytes]
+          properties:
+            diskFreeBytes: { type: integer, format: int64 }
+            workingSetBytes: { type: integer, format: int64 }
+            cpuPercent: { type: number, format: double }
+            sqliteSizeBytes: { type: integer, format: int64 }
+            spoolSizeBytes: { type: integer, format: int64 }
+        certificate:
+          type: object
+          properties:
+            expiresAtUtc: { type: [string, 'null'], format: date-time }
+    CommandResult:
+      type: object
+      required: [commandId, status, completedAtUtc, resultVersion]
+      properties:
+        commandId: { type: string, format: uuid }
+        status: { type: string, enum: [succeeded, business_error, expired, cancelled, dead_letter] }
+        completedAtUtc: { type: string, format: date-time }
+        document: { type: [object, 'null'], additionalProperties: true }
+        error: { anyOf: [ { $ref: '#/components/schemas/ApiError' }, { type: 'null' } ] }
+        warnings: { type: array, items: { type: string } }
+        resultVersion: { type: integer }
+    BatchAck:
+      type: object
+      required: [batchId, status, rowsAccepted, checksumValid, acknowledgedAtUtc]
+      properties:
+        batchId: { type: string, format: uuid }
+        status: { type: string, const: acknowledged }
+        rowsAccepted: { type: integer }
+        checksumValid: { type: boolean }
+        acknowledgedAtUtc: { type: string, format: date-time }
+    ApiError:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        retryable: { type: boolean }
+        details: { type: [object, 'null'], additionalProperties: true }

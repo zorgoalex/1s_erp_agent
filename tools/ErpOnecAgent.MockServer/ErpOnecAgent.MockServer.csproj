@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ErpOnecAgent.Contracts\ErpOnecAgent.Contracts.csproj" />
+  </ItemGroup>
+</Project>
+

@@ -1,0 +1,696 @@
+openapi: 3.1.0
+info:
+  title: 1C Command API (ErpOnecAgent)
+  version: 1.0.0
+  description: |
+    Контракт HTTP-сервиса 1С для командного контура ERP → 1С.
+    Клиентская сторона — ErpOnecAgent (`OnecCommandClient`, `OnecHealthClient`,
+    `OnecAuthentication`); DTO — `src/ErpOnecAgent.Contracts/OneC/OnecContracts.cs`.
+
+    Файл создан на этапе 0 remediation (24.09.2026; ревизия 2). Статусы — `x-contract-status`:
+
+    - `implemented` — фактические DTO/клиент/mock (as-built);
+    - `implemented-mock-only` — реализовано только в mock; DTO/клиент не типизированы;
+    - `proposed` — предложение этапа 0 (минимальное; обратная совместимость — где
+      доказуема). Локальная реализация (код агента, mock, тесты) авторизована —
+      полный remediation по указанию пользователя. Внешнее развёртывание требует
+      подтверждённого контракта с владельцем 1С. Не считается принятым/согласованным;
+    - `undefined` — не определено исходными документами; локально реализуется только
+      поверх `proposed`.
+
+    Статус «согласовано владельцем» нигде не присваивается: подтверждений владельцев 1С/ERP
+    нет (для ERP см. docs/remediation/erp-integration-inventory.md — Agent API в архиве
+    исходников отсутствует). Требования ТЗ v1.0 отмечены `x-tz-ref`.
+    Решения и открытые вопросы: `docs/remediation/contract-decisions.md`.
+
+    Сериализация (фактическая, System.Text.Json `JsonSerializerDefaults.Web`):
+    - имена свойств — camelCase в порядке объявления record-DTO;
+    - `null` выводится явно только для nullable-членов (`correlationId`, `document`,
+      `error`, `warnings`, `configurationVersion`, `platformVersion`, `time`);
+      `commandId` (Guid), `payloadVersion`/`resultVersion` (int) — не-null;
+    - `DateTimeOffset` сохраняет фактический offset (`2026-08-29T14:00:03+05:00`);
+      для UTC выводится `+00:00`, а не `Z` (примеры UTC ниже — с `+00:00`);
+      при парсинге допустимы `Z` и `±hh:mm`;
+    - GUID — форма `D`, нижний регистр;
+    - `resultVersion` при отсутствии в теле связывается как `1` (default record-параметра);
+    - неизвестные свойства при разборе игнорируются агентом (System.Text.Json);
+      поведение серверов 1С/ERP в этом отношении не проверялось.
+
+    `payloadHash` — base64 (standard alphabet, с padding) от SHA-256 по каноническому
+    JSON payload: компактно, ключи каждого объекта отсортированы Ordinal, строки — по
+    правилам `Utf8JsonWriter` (`PayloadHasher.Compute`,
+    `src/ErpOnecAgent.Domain/Common/PayloadHasher.cs`). Примеры hash в этом файле вычислены
+    по этому алгоритму.
+
+    Поля `payload`, `document`, `details` в DTO типизированы как `JsonElement` —
+    произвольный JSON (не объектные структуры). Наблюдаемые объектные бизнес-формы
+    помечены как `proposed` (напр. `DocumentSummary`) и типами C# не обеспечиваются.
+
+    Аутентификация на стороне клиента: HTTP Basic (DPAPI-секрет, `OnecAuthentication`).
+    Иной механизм — отдельным согласованным изменением.
+
+    Вне области файла: OData 1С (ETL-чтение; `IOneCODataClient`, `ODataPage`).
+  x-contract-status: implemented
+  x-tz-ref: ТЗ v1.0 §18 (контракт HTTP-сервиса 1С), FR-CMD-010..012
+servers:
+  - url: http://1c-server/base/hs/erp-integration/v1
+    description: |
+      Публикация HTTP-сервиса 1С (префикс `hs`). Агент задаёт базовый URL
+      конфигурацией `OneC:CommandApiBaseUrl`; пути операций относительны к нему.
+      ТЗ §18.1 показывает путь без `hs` — относительные пути клиента не зависят от префикса.
+security:
+  - basic: []
+paths:
+  /health:
+    get:
+      operationId: onecHealthCheck
+      summary: Здоровье HTTP-сервиса 1С
+      description: |
+        Проверка доступности расширения и информационной базы (ТЗ §18.2).
+        Клиент (`OnecHealthClient.CheckAsync`) при любом не-2xx или транспортной
+        ошибке возвращает `null` («1С недоступна»); тело ошибок не разбирается.
+      x-contract-status: implemented
+      x-tz-ref: ТЗ §18.2
+      responses:
+        '200':
+          description: Сервис доступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecHealthResponse'
+              example:
+                status: ok
+                application: 1C
+                configurationVersion: '3.1.9.120'
+                platformVersion: '8.3.27.1486'
+                time: '2026-08-29T09:00:00+00:00'
+        default:
+          description: Любой не-2xx — клиент считает 1С недоступной
+  /capabilities:
+    get:
+      operationId: onecGetCapabilities
+      summary: Поддерживаемые типы команд и версии payload
+      description: |
+        Обязателен по ТЗ §18.1, но DTO в `ErpOnecAgent.Contracts` НЕТ и клиент его
+        не вызывает. Схема зафиксирована по фактическому ответу mock
+        (`tools/ErpOnecAgent.MockServer/Program.cs`) как минимальная основа;
+        для внешнего контракта требует подтверждения владельца 1С (CD-1C-5).
+        Игнорирование неизвестных полей проверено для агента (System.Text.Json);
+        для сторонних серверов — не проверялось.
+      x-contract-status: implemented-mock-only
+      x-tz-ref: ТЗ §18.1
+      responses:
+        '200':
+          description: Поддерживаемые возможности
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+              example:
+                commandTypes:
+                  - create_customer_order
+                versions:
+                  - 1
+        '401':
+          description: Не аутентифицирован
+  /commands/execute:
+    post:
+      operationId: onecExecuteCommand
+      summary: Выполнить команду (создать/изменить документ)
+      description: |
+        Основной вызов командного контура (ТЗ §18.3, FR-CMD-010). Тело — DTO
+        `ExecuteCommandRequest`. `requestedAtUtc` заполняется агентом из
+        `CommandEnvelope.CreatedAtUtc` (время создания команды ERP, не время вызова;
+        `OnecCommandClient.ExecuteAsync`).
+
+        Обязательная идемпотентность на стороне 1С (ТЗ §18.5, FR-CMD-011):
+        1. найти `commandId` в журнале;
+        2. успешно выполнен ранее — вернуть сохранённый результат (HTTP 200) при
+           совпадающем `payloadHash`; при ином `payloadHash` — HTTP 409, исходная
+           команда и её результат не изменяются;
+        3. выполняется — вернуть `processing` (HTTP 202 или 200 со status);
+        4. не найден — зарегистрировать `commandId` в одной транзакции с созданием
+           документа либо иным механизмом, исключающим двойное создание;
+        5. бизнес-валидация → создание документа → сохранение `DocumentRef` и
+           результата → ответ.
+
+        Без журнала идемпотентности автоматический повтор POST агентом запрещён
+        (FR-CMD-011). Повтор всегда с исходным `commandId` (FR-CMD-012).
+
+        Классификация ответов клиентом (`OnecCommandClient.SendAsync`, as-built).
+        SendAsync ОБЩИЙ для `POST /commands/execute` и `GET /commands/{commandId}` —
+        классификация идентична для обоих:
+        - 2xx + status `succeeded|completed|created` → успех;
+        - 2xx + status `processing|executing|pending` → выполняется (повтор lookup);
+        - 2xx + status `not_found` → не найдено;
+        - 2xx + status `business_failed|failed|rejected|validation_error` → бизнес-ошибка
+          (автоповтор запрещён, FR-CMD-013);
+        - 2xx + иная status-строка → техническая ошибка `ONEC_UNKNOWN_STATUS`;
+        - HTTP 202 (с телом или без) → выполняется;
+        - HTTP 400|401|403|422 → бизнес-ошибка (автоповтор запрещён);
+        - HTTP 409 → конфликт (`PayloadConflict`, `COMMAND_PAYLOAD_CONFLICT`);
+        - HTTP 404 → не найдено (до парсинга тела);
+        - иные не-2xx (408/429/5xx) → техническая ошибка, повтор допустим
+          (FR-CMD-013, §22.3: перед повтором POST — status lookup).
+
+        Тело 2xx обязательно, КРОМЕ 202 (тело опционально). В 2xx-теле, кроме 202,
+        `status` обязателен: отсутствующий/`null` status не является легитимным ответом —
+        клиент деградирует в сбой/неопределённый исход.
+      x-contract-status: implemented
+      x-tz-ref: ТЗ §18.3, §18.5, §18.6; FR-CMD-010..013
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteCommandRequest'
+            example:
+              commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+              commandType: create_customer_order
+              payloadVersion: 1
+              payloadHash: 74gdidbyqPZeDVf7vDjmq15eEBiJ0qy2GAW5sFmbpoE=
+              correlationId: 9d4e2b18-6c0a-4f5e-8b7d-2e3f4a5b6c7d
+              requestedAtUtc: '2026-08-30T10:00:00+00:00'
+              payload:
+                comment: urgent
+                customer:
+                  inn: '1234567890'
+                  name: ACME
+                items:
+                  - qty: 2
+                    sku: MAT-01
+      responses:
+        '200':
+          description: |
+            Повтор ранее выполненной команды либо возвращение сохранённого результата
+            (ТЗ §18.6). Тело обязательно; status определяет исход.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecCommandResponse'
+              example:
+                commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                status: succeeded
+                document:
+                  type: CustomerOrder
+                  ref: 7a2f6d14-0c3b-4e8a-9f5d-6b1c2d3e4f50
+                  number: '00000184'
+                  date: '2026-08-29T14:00:03+05:00'
+                  posted: false
+                error: null
+                warnings: []
+                resultVersion: 1
+        '201':
+          description: |
+            Документ успешно создан при первичном выполнении (ТЗ §18.6). Тело обязательно;
+            в mock — status `succeeded` (as-built).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecCommandResponse'
+              example:
+                commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                status: succeeded
+                document:
+                  type: CustomerOrder
+                  ref: 7a2f6d14-0c3b-4e8a-9f5d-6b1c2d3e4f50
+                  number: '00000184'
+                  date: '2026-08-29T14:00:03+05:00'
+                  posted: false
+                error: null
+                warnings: []
+                resultVersion: 1
+        '202':
+          description: |
+            Команда зарегистрирована и выполняется (ТЗ §18.6). Тело опционально;
+            клиент классифицирует как «выполняется» независимо от тела. Итог
+            выясняется через GET /commands/{commandId}.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecCommandResponse'
+              example:
+                commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                status: processing
+                document: null
+                error: null
+                warnings: []
+                resultVersion: 1
+        '400':
+          description: |
+            Некорректный запрос (ТЗ §18.6) — бизнес-ошибка, автоповтор запрещён
+            (общая классификация SendAsync).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: BAD_REQUEST
+                  message: Body is not valid JSON.
+                  retryable: false
+        '401':
+          description: Не аутентифицирован — бизнес-ошибка (SendAsync), без автоповтора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Нет прав — бизнес-ошибка (SendAsync, FR-CMD-013), без автоповтора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: |
+            Команда не найдена. Клиент обрабатывает ДО разбора тела (тело не требуется).
+            `not_found` не означает права создать новую команду с новым ID.
+          x-contract-status: implemented
+        '409':
+          description: |
+            Конфликт `commandId`/`payloadHash` (ТЗ §18.5 п.3, FR-CMD-003) —
+            `PayloadConflict` (общая классификация SendAsync). Тело: полный
+            `OnecCommandResponse` либо упрощённое `ErrorEnvelope` (фактура mock).
+            При отсутствии `error.code` клиент подставляет `COMMAND_PAYLOAD_CONFLICT`.
+            Исходная команда и её результат на стороне 1С не изменяются.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: COMMAND_PAYLOAD_CONFLICT
+                  message: Hash differs
+                  retryable: false
+        '422':
+          description: |
+            Бизнес-валидация (ТЗ §18.6) — бизнес-ошибка (SendAsync); `retryable=false`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecCommandResponse'
+              example:
+                commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                status: business_failed
+                document: null
+                error:
+                  code: MATERIAL_NOT_MAPPED
+                  message: Не найдена номенклатура для позиции MAT-01
+                  retryable: false
+                  details: {}
+                warnings: []
+                resultVersion: 1
+        '429':
+          description: Временное ограничение (ТЗ §18.6) — техническая ошибка, повтор с backoff
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          description: Внутренняя ошибка (ТЗ §18.6) — техническая ошибка, повтор с backoff
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: |
+            1С временно недоступна/занята (ТЗ §18.6) — техническая ошибка, повтор с
+            backoff; перед повтором POST — status lookup (§22.3).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /commands/{commandId}:
+    get:
+      operationId: onecGetCommandStatus
+      summary: Статус/результат команды
+      description: |
+        Выясняет результат после timeout или разрыва соединения (ТЗ §18.1, FR-CMD-012).
+        Повторный GET безопасен. Ответ `not_found` (404 или 200 со status `not_found`)
+        НЕ означает, что можно создать новую команду с новым ID — агент повторяет
+        исходную команду с тем же `commandId` после status lookup.
+
+        Классификация ответов — через ТОТ ЖЕ `OnecCommandClient.SendAsync`, что и
+        `POST /commands/execute` (общий метод): 400/401/403/422 → бизнес-ошибка,
+        409 → `PayloadConflict`, 202 → «выполняется» (тело опционально), 404 →
+        `NotFound` (до парсинга тела), иные не-2xx → техническая ошибка lookup.
+        Тело 2xx обязательно, кроме 202; `status` в 2xx-теле обязателен (кроме 202).
+      x-contract-status: implemented
+      x-tz-ref: ТЗ §18.1, §18.5; FR-CMD-011..012
+      parameters:
+        - $ref: '#/components/parameters/CommandId'
+      responses:
+        '200':
+          description: Сохранённый статус/результат команды (выполняется либо финальный исход)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecCommandResponse'
+              examples:
+                succeeded:
+                  summary: Успешный результат
+                  value:
+                    commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                    status: succeeded
+                    document:
+                      type: CustomerOrder
+                      ref: 7a2f6d14-0c3b-4e8a-9f5d-6b1c2d3e4f50
+                      number: '00000184'
+                      date: '2026-08-29T14:00:03+05:00'
+                      posted: false
+                    error: null
+                    warnings: []
+                    resultVersion: 1
+                businessFailed:
+                  summary: Бизнес-ошибка
+                  value:
+                    commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                    status: business_failed
+                    document: null
+                    error:
+                      code: VALIDATION
+                      message: Rejected
+                      retryable: false
+                      details: {}
+                    warnings: []
+                    resultVersion: 1
+                processing:
+                  summary: Ещё выполняется
+                  value:
+                    commandId: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+                    status: processing
+                    document: null
+                    error: null
+                    warnings: []
+                    resultVersion: 1
+        '202':
+          description: Выполняется (общая классификация SendAsync); тело опционально
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OnecCommandResponse'
+        '400':
+          description: Некорректный запрос — бизнес-ошибка (общая классификация SendAsync), без автоповтора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Не аутентифицирован — бизнес-ошибка (SendAsync), без автоповтора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '403':
+          description: Нет прав — бизнес-ошибка (SendAsync), без автоповтора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '404':
+          description: |
+            Команда не зарегистрирована. Клиент обрабатывает без разбора тела
+            (as-built `OnecCommandClient`: 404 → `NotFound` до парсинга).
+          x-contract-status: implemented
+        '409':
+          description: |
+            Конфликт `payloadHash`/состояния — `PayloadConflict` (общая классификация
+            SendAsync). Тело: полный `OnecCommandResponse` либо `ErrorEnvelope`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: Бизнес-валидация — бизнес-ошибка (общая классификация SendAsync), без автоповтора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        default:
+          description: |
+            Иные не-2xx (408/429/5xx и др.) — техническая ошибка lookup, повтор
+            ограничен политикой. Напоминание общей классификации SendAsync (для не
+            перечисленных явно): 400/401/403/422 — бизнес-ошибка; 409 — PayloadConflict;
+            202 — Processing (тело опционально).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+components:
+  securitySchemes:
+    basic:
+      type: http
+      scheme: basic
+      description: |
+        HTTP Basic (`OnecAuthentication`: `Authorization: Basic base64(user:password)`).
+        Учётные данные — DPAPI-секрет по `OneC:CredentialSecretName` (ТЗ §21.4).
+  parameters:
+    CommandId:
+      name: commandId
+      in: path
+      required: true
+      description: |
+        Идентификатор команды, форма `D` в нижнем регистре (клиент форматирует
+        `Guid.ToString("D")`). Серверу следует принимать GUID без учёта регистра.
+      schema:
+        type: string
+        format: uuid
+      example: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+  schemas:
+    ExecuteCommandRequest:
+      type: object
+      description: |
+        DTO `ExecuteCommandRequest` (OnecContracts.cs). Порядок свойств на проводе —
+        порядок объявления record. As-built агент сериализует все свойства; `correlationId`
+        (nullable) выводится как `null` при отсутствии корреляции; `commandId`,
+        `payloadVersion` — не-null. Игнорирование неизвестных свойств проверено для
+        агента (System.Text.Json); для серверов 1С — не проверялось.
+      additionalProperties: true
+      required: [commandId, commandType, payloadVersion, payloadHash, correlationId, requestedAtUtc, payload]
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          description: Глобально уникальный идентификатор команды (ключ идемпотентности)
+          example: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+        commandType:
+          type: string
+          description: Тип команды (allowlist согласуется capabilities/конфигурацией; ТЗ §18.8)
+          example: create_customer_order
+        payloadVersion:
+          type: integer
+          minimum: 1
+          description: Версия payload; неизвестная версия — явный отказ (ТЗ §18.7)
+          example: 1
+        payloadHash:
+          type: string
+          description: |
+            base64(SHA-256(канонический JSON payload)): компактно, ключи объектов по
+            Ordinal, строки по правилам Utf8JsonWriter. Совпадение hash — признак той же
+            команды; расхождение при том же commandId — конфликт (409).
+          example: 74gdidbyqPZeDVf7vDjmq15eEBiJ0qy2GAW5sFmbpoE=
+        correlationId:
+          type: [string, 'null']
+          format: uuid
+          description: Корреляция; при отсутствии — явный `null`
+          example: 9d4e2b18-6c0a-4f5e-8b7d-2e3f4a5b6c7d
+        requestedAtUtc:
+          type: string
+          format: date-time
+          description: |
+            Время создания команды (`CommandEnvelope.CreatedAtUtc`), не время вызова.
+            System.Text.Json сохраняет фактический offset; для UTC выводится `+00:00`
+            (не `Z`); при парсинге допустимы `Z` и `±hh:mm`.
+          example: '2026-08-30T10:00:00+00:00'
+        payload:
+          description: |
+            As-built: `JsonElement` — произвольное JSON-значение (объект, массив, скаляр;
+            null/undefined отклоняется CommandValidator до исполнения; в записи отклонения
+            сохраняется `null`). Наблюдаемая/[PROPOSED] бизнес-форма —
+            объект по спецификации типа команды (пример ниже; типами C# не обеспечена).
+            Агент не интерпретирует содержимое и не передаёт `requestedBy` в 1С.
+            Hash считается по канонической форме значения.
+          example:
+            comment: urgent
+            customer:
+              inn: '1234567890'
+              name: ACME
+            items:
+              - qty: 2
+                sku: MAT-01
+    OnecCommandResponse:
+      type: object
+      description: |
+        DTO `OnecCommandResponse` (OnecContracts.cs). Порядок свойств на проводе
+        (mock/STJ): `commandId, status, document, error, warnings, resultVersion`.
+        Сериализуются все свойства record; `null` допустим только для nullable-членов
+        (`document`, `error`, `warnings`); `commandId` (Guid) и `resultVersion` (int)
+        не-null. `resultVersion` при отсутствии в теле клиент связывает как `1`.
+
+        Для 2xx (кроме 202) `status` обязателен: отсутствующий/`null` status —
+        НЕ легитимный ответ, клиент деградирует в сбой/неопределённый исход. Частичные
+        тела (только `error`) фактически встречаются в не-2xx ответах (mock 409) —
+        см. `ErrorEnvelope`. As-built клиент не сверяет `commandId` ответа с запросом
+        (CD-1C-10).
+
+        Семантика `status` (клиент сравнивает Trim + lower-case):
+
+        | значение status                       | классификация клиента |
+        |---------------------------------------|-----------------------|
+        | `succeeded`, `completed`, `created`   | успех                 |
+        | `processing`, `executing`, `pending`  | выполняется           |
+        | `not_found`                           | не найдено            |
+        | `business_failed`, `failed`, `rejected`, `validation_error` | бизнес-ошибка |
+        | любая иная строка                     | техн. ошибка `ONEC_UNKNOWN_STATUS` |
+
+        Новые серверы должны придерживаться таблицы; получатель обязан уметь деградировать.
+      additionalProperties: true
+      required: [commandId, status]
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          example: 3f1c8a2e-9b7d-4c3a-8f21-1a2b3c4d5e6f
+        status:
+          type: string
+          description: Статус команды; фактический словарь клиента — см. описание схемы
+          example: succeeded
+          x-status-vocabulary: [succeeded, completed, created, processing, executing, pending, not_found, business_failed, failed, rejected, validation_error]
+        document:
+          description: |
+            As-built: `JsonElement?` — произвольное JSON-значение (не объектная структура
+            в DTO). Наблюдаемая/[PROPOSED] объектная бизнес-форма сводки документа
+            (mock, FR-CMD-015) — `DocumentSummary`; типами C# не обеспечена. Агент
+            читает `ref`/`number` без учёта регистра.
+          x-proposed-shape:
+            $ref: '#/components/schemas/DocumentSummary'
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/ApiErrorBody'
+            - type: 'null'
+        warnings:
+          type: [array, 'null']
+          items:
+            type: string
+          description: Предупреждения выполнения; as-built mock всегда отдаёт `[]`
+          example: []
+        resultVersion:
+          type: integer
+          default: 1
+          description: Версия формата результата; при отсутствии в теле клиент подставляет 1
+          example: 1
+    DocumentSummary:
+      type: object
+      x-contract-status: proposed
+      description: |
+        Наблюдаемая/[PROPOSED] объектная бизнес-форма `document` (mock, FR-CMD-015).
+        В DTO поле типизировано как `JsonElement` — форма типами C# не обеспечена;
+        сервер 1С вправе вернуть иное JSON-значение. Неизвестные поля допустимы
+        (проверено для агента).
+      additionalProperties: true
+      properties:
+        type:
+          type: string
+          example: CustomerOrder
+        ref:
+          type: string
+          description: Ссылка/идентификатор документа в 1С
+          example: 7a2f6d14-0c3b-4e8a-9f5d-6b1c2d3e4f50
+        number:
+          type: string
+          example: '00000184'
+        date:
+          type: string
+          format: date-time
+          description: Дата документа; сохраняет фактический offset 1С (passthrough)
+          example: '2026-08-29T14:00:03+05:00'
+        posted:
+          type: boolean
+          example: false
+    ApiErrorBody:
+      type: object
+      description: DTO `ApiErrorBody` (OnecContracts.cs) — тело ошибки результата
+      additionalProperties: true
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          description: Стабильный машинный код (напр. `COMMAND_PAYLOAD_CONFLICT`, `MATERIAL_NOT_MAPPED`)
+          example: MATERIAL_NOT_MAPPED
+        message:
+          type: string
+          example: Не найдена номенклатура для позиции MAT-01
+        retryable:
+          type: boolean
+          description: Признак допустимости автоматического повтора (FR-CMD-013)
+          example: false
+        details:
+          description: |
+            As-built: `JsonElement?` — произвольное JSON-значение (в ошибках агента
+            фактически `{}`). Необязательно (встречается без него).
+          example: {}
+    ErrorEnvelope:
+      type: object
+      description: |
+        Упрощённое тело ошибки, которое фактически отдаёт mock на 409
+        (`{"error": {"code", "message", "retryable"}}` без остальных членов
+        `OnecCommandResponse`). Клиент разбирает тело как `OnecCommandResponse`
+        (частичное тело допустимо на не-2xx; при JsonException на не-2xx тело
+        игнорируется).
+      additionalProperties: true
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiErrorBody'
+    OnecHealthResponse:
+      type: object
+      description: DTO `OnecHealthResponse` (OnecContracts.cs); ТЗ §18.2
+      additionalProperties: true
+      required: [status, application]
+      properties:
+        status:
+          type: string
+          description: Агрегированный статус; mock/ТЗ используют `ok`
+          example: ok
+        application:
+          type: string
+          example: 1C
+        configurationVersion:
+          type: [string, 'null']
+          example: '3.1.9.120'
+        platformVersion:
+          type: [string, 'null']
+          example: '8.3.27.1486'
+        time:
+          type: [string, 'null']
+          format: date-time
+          description: Время сервера 1С (для сверки часов); фактический offset
+          example: '2026-08-29T09:00:00+00:00'
+    CapabilitiesResponse:
+      type: object
+      description: |
+        Схемы в DTO агента нет (x-contract-status: proposed). Зафиксирована по факту mock
+        (`{commandTypes, versions}`) как минимальная обратно совместимая основа; для
+        внешнего контракта требует подтверждения владельца 1С (CD-1C-5). Локально —
+        использовать как есть. Поля добавлять только необязательными (ТЗ §30.2).
+      additionalProperties: true
+      x-contract-status: proposed
+      properties:
+        commandTypes:
+          type: array
+          items:
+            type: string
+          description: Поддерживаемые типы команд
+          example: [create_customer_order]
+        versions:
+          type: array
+          items:
+            type: integer
+          description: Поддерживаемые версии payload
+          example: [1]
+        payloadHashAlgorithm:
+          type: string
+          x-contract-status: proposed
+          description: |
+            Необязательное уточнение алгоритма hash ([PROPOSED]; для агента неизвестные
+            поля игнорируются, для сторонних серверов — не проверено)
+          example: sha256-base64-canonical-json-v1

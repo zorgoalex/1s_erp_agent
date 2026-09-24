@@ -1,0 +1,10 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="ERP — агент интеграции с 1С" Manufacturer="ERP Integration" Version="1.0.0" UpgradeCode="7A42B82D-70F1-45E4-B8E0-04E013058216" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer ErpOnecAgent version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder"><Directory Id="INSTALLFOLDER" Name="ErpOnecAgent" /></StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder"><Directory Id="DATADIR" Name="ErpOnecAgent" /></StandardDirectory>
+    <!-- Production CI harvests signed self-contained publish output into INSTALLFOLDER. ProgramData is NeverOverwrite and retained on uninstall. -->
+    <Feature Id="Main" Title="ErpOnecAgent" Level="1" />
+  </Package>
+</Wix>

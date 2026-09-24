@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ErpOnecAgent</AssemblyName>
+    <RootNamespace>ErpOnecAgent.Service</RootNamespace>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ErpOnecAgent.Application\ErpOnecAgent.Application.csproj" />
+    <ProjectReference Include="..\ErpOnecAgent.Domain\ErpOnecAgent.Domain.csproj" />
+    <ProjectReference Include="..\ErpOnecAgent.Contracts\ErpOnecAgent.Contracts.csproj" />
+    <ProjectReference Include="..\ErpOnecAgent.Infrastructure\ErpOnecAgent.Infrastructure.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Settings.Configuration" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
+  </ItemGroup>
+</Project>

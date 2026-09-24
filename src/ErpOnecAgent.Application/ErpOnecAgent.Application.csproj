@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\ErpOnecAgent.Domain\ErpOnecAgent.Domain.csproj" />
+    <ProjectReference Include="..\ErpOnecAgent.Contracts\ErpOnecAgent.Contracts.csproj" />
+  </ItemGroup>
+</Project>
+
