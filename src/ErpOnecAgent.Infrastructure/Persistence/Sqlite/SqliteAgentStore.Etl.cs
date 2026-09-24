@@ -89,7 +89,11 @@ public sealed partial class SqliteAgentStore
         var batches = new List<EtlBatch>();
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT batch_id,run_id,entity_name,schema_version,file_path,status,row_count,watermark_from_json,watermark_to_json,sha256,compressed_size,uncompressed_size,attempt_count,created_at_utc FROM etl_batches WHERE status='acknowledged' AND acknowledged_at_utc < $before;";
+        // Only batches of a fully succeeded run are retention-eligible. Acknowledged batches of
+        // an unfinished run (extraction still running, or run-completion not yet accepted by ERP)
+        // and of any other terminal outcome (failed/partial/cancelled) keep their spool file as
+        // watermark and audit evidence until a separate manual policy resolves them.
+        command.CommandText = "SELECT batch_id,run_id,entity_name,schema_version,file_path,status,row_count,watermark_from_json,watermark_to_json,sha256,compressed_size,uncompressed_size,attempt_count,created_at_utc FROM etl_batches WHERE status='acknowledged' AND acknowledged_at_utc < $before AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=etl_batches.run_id AND r.status='succeeded');";
         Add(command, "$before", beforeUtc.ToUniversalTime().ToString("O"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) batches.Add(new EtlBatch(Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), reader.GetString(2), reader.GetInt32(3), reader.GetString(4), ParseBatchStatus(reader.GetString(5)), reader.GetInt32(6), DeserializeCursor(NullableString(reader, 7)), DeserializeCursor(NullableString(reader, 8)), reader.GetString(9), reader.GetInt64(10), reader.GetInt64(11), reader.GetInt32(12), ParseDate(reader.GetString(13))));
@@ -100,36 +104,87 @@ public sealed partial class SqliteAgentStore
     {
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE etl_batches SET status='deleted' WHERE batch_id=$id AND status='acknowledged';";
+        // Same parent guard independently of the selection path: a batch row can never enter the
+        // purgeable 'deleted' state while its run has not succeeded.
+        command.CommandText = "UPDATE etl_batches SET status='deleted' WHERE batch_id=$id AND status='acknowledged' AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=etl_batches.run_id AND r.status='succeeded');";
         Add(command, "$id", batchId.ToString("D")); await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<ErpOnecAgent.Application.Abstractions.EtlRunCompletion>> GetRunsReadyToCompleteAsync(CancellationToken cancellationToken)
     {
         var completions = new List<ErpOnecAgent.Application.Abstractions.EtlRunCompletion>();
-        var readyRuns = new List<(Guid RunId, long RowsRead, int BatchCount)>();
+        var candidates = new List<(Guid RunId, long RowsRead, int BatchesCreated, long BatchesAcknowledged, string? EntitiesJson)>();
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        // Readiness screening and watermark collection share ONE read transaction so the run
+        // manifest, the batch rows and the collected cursors are a single consistent snapshot.
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         await using (var runs = connection.CreateCommand())
         {
-            runs.CommandText = "SELECT run_id,rows_read,batches_created FROM etl_runs r WHERE status='uploading' AND NOT EXISTS (SELECT 1 FROM etl_batches b WHERE b.run_id=r.run_id AND b.status <> 'acknowledged');";
+            runs.Transaction = transaction;
+            runs.CommandText = "SELECT run_id,rows_read,batches_created,batches_acknowledged,requested_entities_json FROM etl_runs WHERE status='uploading';";
             await using var reader = await runs.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) readyRuns.Add((Guid.Parse(reader.GetString(0)), reader.GetInt64(1), reader.GetInt32(2)));
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) candidates.Add((Guid.Parse(reader.GetString(0)), reader.GetInt64(1), reader.GetInt32(2), reader.GetInt64(3), NullableString(reader, 4)));
         }
-        foreach (var ready in readyRuns)
+        foreach (var candidate in candidates)
         {
+            // Fail closed: an unprovable run is left 'uploading' for a later manual policy and is
+            // never completed. The manifest must be an explicit non-empty set of unique entity
+            // names, the created/acknowledged counters must match the batch rows exactly, every
+            // batch must be acknowledged, and the covered entities must equal the requested set.
+            var expected = ParseRequestedEntities(candidate.EntitiesJson);
+            if (expected is null || candidate.BatchesCreated <= 0 || candidate.BatchesAcknowledged != candidate.BatchesCreated) continue;
             var watermarks = new Dictionary<string, EtlCursor>(StringComparer.Ordinal);
-            await using var watermarkCommand = connection.CreateCommand();
-            watermarkCommand.CommandText = "SELECT entity_name,watermark_to_json FROM etl_batches WHERE run_id=$id AND status='acknowledged' ORDER BY created_at_utc;";
-            Add(watermarkCommand, "$id", ready.RunId.ToString("D"));
-            await using var watermarkReader = await watermarkCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await watermarkReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            var actual = new HashSet<string>(StringComparer.Ordinal);
+            var batchRows = 0L;
+            var blocked = false;
+            await using (var batches = connection.CreateCommand())
             {
-                var cursor = DeserializeCursor(NullableString(watermarkReader, 1));
-                if (cursor is not null) watermarks[watermarkReader.GetString(0)] = cursor;
+                batches.Transaction = transaction;
+                // Provisional final-cursor selection keeps the pre-existing created_at order with
+                // last writer per entity. created_at ties are not guaranteed safe; the durable
+                // final-cursor ordering design is deferred to A05b and not invented here.
+                batches.CommandText = "SELECT entity_name,status,watermark_to_json FROM etl_batches WHERE run_id=$id ORDER BY created_at_utc;";
+                Add(batches, "$id", candidate.RunId.ToString("D"));
+                await using var reader = await batches.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    batchRows++;
+                    if (!string.Equals(reader.GetString(1), "acknowledged", StringComparison.Ordinal)) { blocked = true; break; }
+                    EtlCursor? cursor;
+                    try { cursor = DeserializeCursor(NullableString(reader, 2)); }
+                    catch (JsonException) { blocked = true; break; }
+                    if (cursor is null) { blocked = true; break; }
+                    var entity = reader.GetString(0);
+                    actual.Add(entity);
+                    watermarks[entity] = cursor;
+                }
             }
-            completions.Add(new(ready.RunId, watermarks, ready.RowsRead, ready.BatchCount));
+            if (blocked || batchRows != candidate.BatchesCreated || !actual.SetEquals(expected)) continue;
+            completions.Add(new(candidate.RunId, watermarks, candidate.RowsRead, candidate.BatchesCreated));
         }
         return completions;
+    }
+
+    private static HashSet<string>? ParseRequestedEntities(string? entitiesJson)
+    {
+        if (string.IsNullOrWhiteSpace(entitiesJson)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(entitiesJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return null;
+            var entities = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.String) return null;
+                var entity = element.GetString();
+                if (string.IsNullOrWhiteSpace(entity) || !entities.Add(entity)) return null;
+            }
+            return entities.Count > 0 ? entities : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     public async Task<EtlCursor?> GetCommittedWatermarkAsync(string entityName, CancellationToken cancellationToken)
@@ -154,7 +209,11 @@ public sealed partial class SqliteAgentStore
     {
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "UPDATE etl_runs SET status=$status,finished_at_utc=$now,last_error=$error,error_count=CASE WHEN $error IS NULL THEN error_count ELSE error_count+1 END WHERE run_id=$id;";
+        // Retention eligibility must stay monotonic: a run that already succeeded is never
+        // reopened, and a run may enter 'succeeded' only from a non-terminal state so a resolved
+        // (failed/cancelled/partial) run cannot silently become retention-eligible. Other
+        // terminal-state transitions are still unguarded; the full run state machine is deferred.
+        command.CommandText = "UPDATE etl_runs SET status=$status,finished_at_utc=$now,last_error=$error,error_count=CASE WHEN $error IS NULL THEN error_count ELSE error_count+1 END WHERE run_id=$id AND status <> 'succeeded' AND ($status <> 'succeeded' OR status IN ('pending','running','paused','uploading','completing'));";
         Add(command, "$status", ToDb(status)); Add(command, "$now", UtcNow()); Add(command, "$error", errorMessage); Add(command, "$id", runId.ToString("D"));
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }

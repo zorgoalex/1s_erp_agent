@@ -190,6 +190,10 @@ public sealed class SqliteStoreTests : IAsyncLifetime
         await _store.AcknowledgeBatchAsync(batch.BatchId, DateTimeOffset.UtcNow, CancellationToken.None);
         var completion = Assert.Single(await _store.GetRunsReadyToCompleteAsync(CancellationToken.None));
         Assert.Equal(cursor, completion.Watermarks["clients"]);
+        // Retention releases acknowledged batches only after the parent run has succeeded.
+        Assert.Empty(await _store.GetAcknowledgedBatchesAsync(DateTimeOffset.UtcNow.AddSeconds(1), CancellationToken.None));
+        foreach (var watermark in completion.Watermarks) await _store.CommitWatermarkAsync(watermark.Key, watermark.Value, completion.RunId, CancellationToken.None);
+        await _store.CompleteEtlRunAsync(completion.RunId, EtlRunStatus.Succeeded, null, CancellationToken.None);
         Assert.Single(await _store.GetAcknowledgedBatchesAsync(DateTimeOffset.UtcNow.AddSeconds(1), CancellationToken.None));
         await spool.DeleteAcknowledgedAsync(batch, CancellationToken.None); await _store.MarkBatchDeletedAsync(batch.BatchId, CancellationToken.None);
         Assert.False(File.Exists(batch.FilePath));
