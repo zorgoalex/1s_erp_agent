@@ -81,7 +81,13 @@ public enum EtlEntityBeginRejection
     /// <summary>The supplied definition is not a valid typed entity definition or its EntityCode differs from the requested entity.</summary>
     EntityDefinitionInvalid,
     /// <summary>The run is associated with an etl_job whose mode or configuration version no longer equals the run's durable identity.</summary>
-    JobInconsistent
+    JobInconsistent,
+    /// <summary>The supplied extraction claim is stale, foreign, or absent — the run's live extraction fence does not match.</summary>
+    ExtractionClaimLost,
+    /// <summary>The run's manifest does not equal its bindings and active ownership rows at the bound epochs (missing, foreign, released, wrong-epoch, or extra ownership state).</summary>
+    OwnershipSetMismatch,
+    /// <summary>The run has no etl_jobs row; O1 has no frozen identity source for a jobless run (scheduled identity is O3).</summary>
+    JobMissing
 }
 
 public abstract record EtlEntityBeginOutcome
@@ -96,7 +102,11 @@ public enum EtlBatchRegistrationRejection
     /// <summary>The run is missing, not running, or already sealed/terminal.</summary>
     RunNotAcceptingBatches,
     /// <summary>No entity row in 'extracting' status matches the batch entity.</summary>
-    EntityNotExtracting
+    EntityNotExtracting,
+    /// <summary>The supplied extraction claim is stale, foreign, or absent — the run's live extraction fence does not match.</summary>
+    ExtractionClaimLost,
+    /// <summary>The run's manifest does not equal its bindings and active ownership rows at the bound epochs.</summary>
+    OwnershipSetMismatch
 }
 
 public abstract record EtlBatchRegistrationOutcome
@@ -113,7 +123,11 @@ public enum EtlEntityCompletionRejection
     /// <summary>No entity row in 'extracting' status exists for the entity.</summary>
     EntityNotExtracting,
     /// <summary>The declared expected batch count does not equal the durable per-entity batch counter.</summary>
-    BatchCountMismatch
+    BatchCountMismatch,
+    /// <summary>The supplied extraction claim is stale, foreign, or absent — the run's live extraction fence does not match.</summary>
+    ExtractionClaimLost,
+    /// <summary>The run's manifest does not equal its bindings and active ownership rows at the bound epochs.</summary>
+    OwnershipSetMismatch
 }
 
 public abstract record EtlEntityCompletionOutcome
@@ -136,7 +150,11 @@ public enum EtlRunSealRejection
     /// <summary>A stored final watermark is malformed or has no non-NULL component.</summary>
     FinalWatermarkInvalid,
     /// <summary>expected_batch_count is below 1 or does not equal the actual batch rows; run/entity counters inconsistent.</summary>
-    ExpectedBatchCountMismatch
+    ExpectedBatchCountMismatch,
+    /// <summary>The supplied extraction claim is stale, foreign, or absent — the run's live extraction fence does not match.</summary>
+    ExtractionClaimLost,
+    /// <summary>The run's manifest does not equal its bindings and active ownership rows at the bound epochs.</summary>
+    OwnershipSetMismatch
 }
 
 public abstract record EtlRunSealOutcome
@@ -149,7 +167,9 @@ public abstract record EtlRunSealOutcome
 public enum EtlRunTerminationRejection
 {
     /// <summary>The run is missing or no longer 'running' (sealed, completing, or terminal).</summary>
-    RunNotRunning
+    RunNotRunning,
+    /// <summary>The supplied extraction claim is stale, foreign, or absent — a stale claim can never terminate a newer execution.</summary>
+    ExtractionClaimLost
 }
 
 public abstract record EtlRunTerminationOutcome

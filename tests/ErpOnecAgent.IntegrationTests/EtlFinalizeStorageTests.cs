@@ -23,7 +23,9 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
 {
     private const string SourceNamespace = "onec-infobase-a";
     private const string OtherNamespace = "onec-infobase-b";
-    private const string QueryMode = "incremental";
+    // O1: extraction requires a claimed durable job — job modes are bounded to
+    // 'bootstrap_full'/'entity_reload', so the default run/request mode is bootstrap_full.
+    private const string QueryMode = "bootstrap_full";
     private static readonly TimeSpan GateTimeout = TimeSpan.FromSeconds(15);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
@@ -33,8 +35,12 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     private static readonly EtlCursor FinalOrders = new(DateTimeOffset.Parse("2026-09-19T09:58:00.0000000+00:00", CultureInfo.InvariantCulture), "O8");
 
     private readonly SqliteTestDatabase _database = new();
+    private readonly Dictionary<Guid, Guid> _extractionClaims = new();
     private SqliteConnectionFactory _factory = null!;
     private SqliteAgentStore _store = null!;
+
+    // The live extraction claim minted by the committed job claim for this run.
+    private Guid ClaimOf(Guid runId) => _extractionClaims[runId];
 
     public async Task InitializeAsync()
     {
@@ -55,7 +61,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None);
 
         var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(outcome);
         Assert.False(begun.Base.BaseRowPresent);
@@ -83,7 +89,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var cursorJson = CursorJson(CursorX);
         await SeedWatermarkAsync("clients", cursorJson, generation: 7, fingerprint: Fingerprint("clients"));
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None);
 
         var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(outcome);
         Assert.True(begun.Base.BaseRowPresent);
@@ -105,7 +111,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await SeedWatermarkAsync("clients", null, generation: 3, fingerprint: null);
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.DomainUnknown, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         var entity = await EntityRowAsync(runId, "clients");
@@ -129,7 +135,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         // Same committed cursor text, but the stored fingerprint belongs to another source.
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 2, fingerprint: Fingerprint("clients", OtherNamespace));
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.DomainChanged, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         var entity = await EntityRowAsync(runId, "clients");
@@ -144,7 +150,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients", sourceNamespace: "  "), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", sourceNamespace: "  "), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.SourceNamespaceMissing, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM etl_run_entities"));
@@ -161,7 +167,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
 
         await Assert.ThrowsAnyAsync<ArgumentException>(() =>
-            _store.BeginEtlEntityExtractionAsync(runId, Request("clients", definitionJson: definitionJson), CancellationToken.None));
+            _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", definitionJson: definitionJson), CancellationToken.None));
 
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM etl_run_entities"));
     }
@@ -170,12 +176,12 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Begin_on_duplicate_entity_or_non_running_run_rejects()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
 
-        var duplicate = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None);
+        var duplicate = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None);
         Assert.Equal(EtlEntityBeginRejection.RunNotAcceptingEntities, Assert.IsType<EtlEntityBeginOutcome.Rejected>(duplicate).Reason);
 
-        var missing = await _store.BeginEtlEntityExtractionAsync(Guid.NewGuid(), Request("clients"), CancellationToken.None);
+        var missing = await _store.BeginEtlEntityExtractionAsync(Guid.NewGuid(), Guid.NewGuid(), Request("clients"), CancellationToken.None);
         Assert.Equal(EtlEntityBeginRejection.RunNotAcceptingEntities, Assert.IsType<EtlEntityBeginOutcome.Rejected>(missing).Reason);
         Assert.Equal(1, await ScalarAsync("SELECT COUNT(*) FROM etl_run_entities"));
     }
@@ -184,27 +190,28 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Begin_on_job_associated_run_enforces_frozen_definition()
     {
         var (runId, entities) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
 
         var matching = JsonSerializer.Serialize(entities[0], JsonOptions);
-        var begun = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients", definitionJson: matching, queryMode: "entity_reload"), CancellationToken.None);
+        var begun = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", definitionJson: matching, queryMode: "entity_reload"), CancellationToken.None);
         Assert.IsType<EtlEntityBeginOutcome.Begun>(begun);
 
         var other = new EtlEntityDefinition("clients", "Catalog_Other", "Ref_Key", "UpdatedAt", "DeletionMark", ["Ref_Key"], "incremental", 500, 10);
-        var mismatch = await _store.BeginEtlEntityExtractionAsync(runId, Request("clients", definitionJson: JsonSerializer.Serialize(other, JsonOptions), queryMode: "entity_reload"), CancellationToken.None);
+        var mismatch = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", definitionJson: JsonSerializer.Serialize(other, JsonOptions), queryMode: "entity_reload"), CancellationToken.None);
         // Second begin on the same entity is rejected by the entity-existence guard anyway;
         // use a fresh job run for the mismatch case below.
         Assert.Equal(EtlEntityBeginRejection.RunNotAcceptingEntities, Assert.IsType<EtlEntityBeginOutcome.Rejected>(mismatch).Reason);
 
+        // The first run still owns 'clients' — release it (attested manual resolution)
+        // so the second job can claim the same entity.
+        await ReleaseOwnershipAsync();
         var (runId2, _) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId2.ToString("D")));
-        var mismatched = await _store.BeginEtlEntityExtractionAsync(runId2, Request("clients", definitionJson: JsonSerializer.Serialize(other, JsonOptions), queryMode: "entity_reload"), CancellationToken.None);
+        var mismatched = await _store.BeginEtlEntityExtractionAsync(runId2, ClaimOf(runId2), Request("clients", definitionJson: JsonSerializer.Serialize(other, JsonOptions), queryMode: "entity_reload"), CancellationToken.None);
         Assert.Equal(EtlEntityBeginRejection.JobDefinitionMismatch, Assert.IsType<EtlEntityBeginOutcome.Rejected>(mismatched).Reason);
         Assert.Equal(0, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId2:D}'"));
 
         // An entity outside the frozen job selection can never be appended to its run —
         // the requested-set membership guard fires before the job definition comparison.
-        var foreign = await _store.BeginEtlEntityExtractionAsync(runId2, Request("orders", definitionJson: DefinitionJson("orders"), queryMode: "entity_reload"), CancellationToken.None);
+        var foreign = await _store.BeginEtlEntityExtractionAsync(runId2, ClaimOf(runId2), Request("orders", definitionJson: DefinitionJson("orders"), queryMode: "entity_reload"), CancellationToken.None);
         Assert.Equal(EtlEntityBeginRejection.EntityNotInManifest, Assert.IsType<EtlEntityBeginOutcome.Rejected>(foreign).Reason);
     }
 
@@ -214,9 +221,9 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Guarded_register_commits_batch_and_entity_run_counters_atomically()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
 
-        var outcome = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 25), CancellationToken.None);
+        var outcome = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 25), ClaimOf(runId), CancellationToken.None);
 
         Assert.IsType<EtlBatchRegistrationOutcome.Registered>(outcome);
         var entity = await EntityRowAsync(runId, "clients");
@@ -233,7 +240,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
 
-        var afterDone = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), CancellationToken.None);
+        var afterDone = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), ClaimOf(runId), CancellationToken.None);
         Assert.Equal(EtlBatchRegistrationRejection.EntityNotExtracting, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(afterDone).Reason);
 
         var entity = await EntityRowAsync(runId, "clients");
@@ -242,15 +249,15 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_batches WHERE run_id='{runId:D}'"));
 
         // After seal registration is fenced by the run state.
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
-        var afterSeal = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), CancellationToken.None);
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        var afterSeal = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), ClaimOf(runId), CancellationToken.None);
         Assert.Equal(EtlBatchRegistrationRejection.RunNotAcceptingBatches, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(afterSeal).Reason);
         Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_batches WHERE run_id='{runId:D}'"));
 
         // After claim ('completing') registration is equally fenced.
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow.AddMinutes(1), 8, CancellationToken.None));
-        var completing = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), CancellationToken.None);
+        var completing = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), ClaimOf(runId), CancellationToken.None);
         Assert.Equal(EtlBatchRegistrationRejection.RunNotAcceptingBatches, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(completing).Reason);
         Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_batches WHERE run_id='{runId:D}'"));
         Assert.NotNull(claim.Claim.CompletePayloadJson);
@@ -260,11 +267,11 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Guarded_register_after_done_before_seal_is_rejected()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 1, CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 1, CancellationToken.None));
 
-        var late = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), CancellationToken.None);
+        var late = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), ClaimOf(runId), CancellationToken.None);
 
         Assert.Equal(EtlBatchRegistrationRejection.EntityNotExtracting, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(late).Reason);
         Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_batches WHERE run_id='{runId:D}'"));
@@ -274,11 +281,11 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Guarded_register_for_unknown_entity_or_negative_rows_rejects()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
 
-        var unknown = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "orders", 1), CancellationToken.None);
+        var unknown = await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "orders", 1), ClaimOf(runId), CancellationToken.None);
         Assert.Equal(EtlBatchRegistrationRejection.EntityNotExtracting, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(unknown).Reason);
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", -1), CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", -1), ClaimOf(runId), CancellationToken.None));
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM etl_batches"));
     }
 
@@ -288,10 +295,10 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Complete_freezes_final_and_expected_count()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
 
-        var outcome = await _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 1, CancellationToken.None);
+        var outcome = await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 1, CancellationToken.None);
 
         Assert.IsType<EtlEntityCompletionOutcome.Completed>(outcome);
         var entity = await EntityRowAsync(runId, "clients");
@@ -312,10 +319,10 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Complete_with_invalid_final_rejects_before_write(string finalJson)
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
 
-        await Assert.ThrowsAsync<ArgumentException>(() => _store.CompleteEtlEntityExtractionAsync(runId, "clients", finalJson, 1, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", finalJson, 1, CancellationToken.None));
 
         var entity = await EntityRowAsync(runId, "clients");
         Assert.Equal("extracting", entity!.Status);
@@ -330,10 +337,10 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Complete_with_valid_component_shapes_succeeds(string finalJson)
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
 
-        var outcome = await _store.CompleteEtlEntityExtractionAsync(runId, "clients", finalJson, 1, CancellationToken.None);
+        var outcome = await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", finalJson, 1, CancellationToken.None);
 
         Assert.IsType<EtlEntityCompletionOutcome.Completed>(outcome);
         Assert.Equal(finalJson, (await EntityRowAsync(runId, "clients"))!.FinalWatermarkJson);
@@ -343,14 +350,14 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Complete_with_wrong_count_or_state_rejects()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
 
-        var mismatch = await _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 2, CancellationToken.None);
+        var mismatch = await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 2, CancellationToken.None);
         Assert.Equal(EtlEntityCompletionRejection.BatchCountMismatch, Assert.IsType<EtlEntityCompletionOutcome.Rejected>(mismatch).Reason);
-        var unknown = await _store.CompleteEtlEntityExtractionAsync(runId, "orders", CursorJson(FinalOrders), 1, CancellationToken.None);
+        var unknown = await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "orders", CursorJson(FinalOrders), 1, CancellationToken.None);
         Assert.Equal(EtlEntityCompletionRejection.EntityNotExtracting, Assert.IsType<EtlEntityCompletionOutcome.Rejected>(unknown).Reason);
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 0, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 0, CancellationToken.None));
 
         var entity = await EntityRowAsync(runId, "clients");
         Assert.Equal("extracting", entity!.Status);
@@ -361,11 +368,11 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Zero_row_entity_with_explicit_empty_batch_is_valid()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 0), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 1, CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 0), ClaimOf(runId), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 1, CancellationToken.None));
 
-        var seal = await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None);
+        var seal = await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None);
 
         var sealedOutcome = Assert.IsType<EtlRunSealOutcome.Sealed>(seal);
         Assert.Equal(1, sealedOutcome.EntityCount);
@@ -381,7 +388,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
         await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
 
-        var outcome = await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None);
+        var outcome = await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None);
 
         var sealedOutcome = Assert.IsType<EtlRunSealOutcome.Sealed>(outcome);
         Assert.Equal(2, sealedOutcome.EntityCount);
@@ -406,17 +413,22 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     [InlineData("not-json")]
     public async Task Seal_with_malformed_manifest_refuses(string manifest)
     {
-        var runId = Guid.NewGuid();
-        await InsertRunAsync(runId, manifest);
-        // The saved manifest is part of run identity: capture itself refuses an
-        // unprovable manifest before any entity row exists.
-        Assert.Equal(EtlEntityBeginRejection.RunManifestInvalid,
-            Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None)).Reason);
+        // O1: an invalid manifest can never be claimed — it is corrupted behind the API
+        // on a claimed, owned run instead. The typed-manifest requirement lives INSIDE
+        // the ownership predicate, so every extraction/ seal mutation fails closed with
+        // OwnershipSetMismatch and zero writes even under the live claim.
+        var runId = await NewRunAsync("clients");
+        await ExecuteSqlAsync("UPDATE etl_runs SET requested_entities_json=$manifest WHERE run_id=$run;",
+            ("$manifest", manifest), ("$run", runId.ToString("D")));
 
-        var outcome = await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None);
+        Assert.Equal(EtlEntityBeginRejection.OwnershipSetMismatch,
+            Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None)).Reason);
 
-        Assert.Equal(EtlRunSealRejection.ManifestInvalid, Assert.IsType<EtlRunSealOutcome.Rejected>(outcome).Reason);
+        var outcome = await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None);
+
+        Assert.Equal(EtlRunSealRejection.OwnershipSetMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(outcome).Reason);
         Assert.Equal("running", await RunStatusAsync(runId));
+        Assert.Equal(0, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId:D}'"));
     }
 
     [Fact]
@@ -424,39 +436,46 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var missing = await NewRunAsync("clients", "orders");
         await BeginExtractCompleteAsync(missing, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.Equal(EtlRunSealRejection.EntitySetMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(missing, CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunSealRejection.EntitySetMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(missing, ClaimOf(missing), CancellationToken.None)).Reason);
 
         // An entity outside the saved manifest is refused at capture — the extra row can
         // only exist via corruption behind the API, which the seal still catches.
+        // 'missing' still owns {clients,orders}: release it (attested manual resolution)
+        // so 'extra' can claim {clients} — 'missing' is never touched again.
+        await ReleaseOwnershipAsync();
         var extra = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(extra, "clients", CursorJson(FinalClients), batchRows: 5);
         Assert.Equal(EtlEntityBeginRejection.EntityNotInManifest,
-            Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(extra, Request("orders"), CancellationToken.None)).Reason);
+            Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(extra, ClaimOf(extra), Request("orders"), CancellationToken.None)).Reason);
         await ExecuteSqlAsync("""
             INSERT INTO etl_run_entities(run_id,entity_name,entity_definition_json,domain_fingerprint,status,base_row_present,domain_status,created_at_utc,updated_at_utc,row_version)
             VALUES($run,'orders','{}','x','extracting',0,'absent',$now,$now,1);
             """, ("$run", extra.ToString("D")), ("$now", Now()));
-        Assert.Equal(EtlRunSealRejection.EntitySetMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(extra, CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunSealRejection.EntitySetMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(extra, ClaimOf(extra), CancellationToken.None)).Reason);
         Assert.Equal("running", await RunStatusAsync(extra));
     }
 
     [Fact]
     public async Task Seal_with_non_done_entity_or_invalid_stored_final_or_count_mismatch_refuses()
     {
+        // Each successive claimed run re-acquires 'clients' after the previous run's
+        // ownership is manually released — a live owner would defer the claim.
         var notDone = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(notDone, Request("clients"), CancellationToken.None));
-        Assert.Equal(EtlRunSealRejection.EntityNotDone, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(notDone, CancellationToken.None)).Reason);
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(notDone, ClaimOf(notDone), Request("clients"), CancellationToken.None));
+        Assert.Equal(EtlRunSealRejection.EntityNotDone, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(notDone, ClaimOf(notDone), CancellationToken.None)).Reason);
 
+        await ReleaseOwnershipAsync();
         var badFinal = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(badFinal, "clients", CursorJson(FinalClients), batchRows: 5);
         // A malformed stored value can never satisfy the recheck — even one written behind the API.
         await ExecuteSqlAsync("UPDATE etl_run_entities SET final_watermark_json='{}' WHERE run_id=$run;", ("$run", badFinal.ToString("D")));
-        Assert.Equal(EtlRunSealRejection.FinalWatermarkInvalid, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(badFinal, CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunSealRejection.FinalWatermarkInvalid, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(badFinal, ClaimOf(badFinal), CancellationToken.None)).Reason);
 
+        await ReleaseOwnershipAsync();
         var countOff = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(countOff, "clients", CursorJson(FinalClients), batchRows: 5);
         await ExecuteSqlAsync("UPDATE etl_run_entities SET expected_batch_count=3 WHERE run_id=$run;", ("$run", countOff.ToString("D")));
-        Assert.Equal(EtlRunSealRejection.ExpectedBatchCountMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(countOff, CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunSealRejection.ExpectedBatchCountMismatch, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(countOff, ClaimOf(countOff), CancellationToken.None)).Reason);
         Assert.Equal("running", await RunStatusAsync(countOff));
     }
 
@@ -465,22 +484,22 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients", "orders");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("orders"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("orders"), CancellationToken.None));
 
-        var sealedOutcome = Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        var sealedOutcome = Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         Assert.Equal(EtlRunSealRejection.EntityNotDone, sealedOutcome.Reason);
 
         // Complete orders then seal for real, then every mutation API is fenced.
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "orders", 2), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, "orders", CursorJson(FinalOrders), 1, CancellationToken.None));
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "orders", 2), ClaimOf(runId), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "orders", CursorJson(FinalOrders), 1, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
 
-        Assert.Equal(EtlEntityBeginRejection.RunNotAcceptingEntities, Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None)).Reason);
-        Assert.Equal(EtlBatchRegistrationRejection.RunNotAcceptingBatches, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 1), CancellationToken.None)).Reason);
-        Assert.Equal(EtlEntityCompletionRejection.EntityNotExtracting, Assert.IsType<EtlEntityCompletionOutcome.Rejected>(await _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 1, CancellationToken.None)).Reason);
-        Assert.Equal(EtlRunSealRejection.RunNotRunningOrAlreadySealed, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None)).Reason);
-        Assert.Equal(EtlRunTerminationRejection.RunNotRunning, Assert.IsType<EtlRunTerminationOutcome.Rejected>(await _store.FailEtlRunAsync(runId, "x", CancellationToken.None)).Reason);
-        Assert.Equal(EtlRunTerminationRejection.RunNotRunning, Assert.IsType<EtlRunTerminationOutcome.Rejected>(await _store.BlockEtlRunAsync(runId, "X", "x", CancellationToken.None)).Reason);
+        Assert.Equal(EtlEntityBeginRejection.RunNotAcceptingEntities, Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None)).Reason);
+        Assert.Equal(EtlBatchRegistrationRejection.RunNotAcceptingBatches, Assert.IsType<EtlBatchRegistrationOutcome.Rejected>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 1), ClaimOf(runId), CancellationToken.None)).Reason);
+        Assert.Equal(EtlEntityCompletionRejection.EntityNotExtracting, Assert.IsType<EtlEntityCompletionOutcome.Rejected>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 1, CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunSealRejection.RunNotRunningOrAlreadySealed, Assert.IsType<EtlRunSealOutcome.Rejected>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunTerminationRejection.RunNotRunning, Assert.IsType<EtlRunTerminationOutcome.Rejected>(await _store.FailEtlRunAsync(runId, ClaimOf(runId), "x", CancellationToken.None)).Reason);
+        Assert.Equal(EtlRunTerminationRejection.RunNotRunning, Assert.IsType<EtlRunTerminationOutcome.Rejected>(await _store.BlockEtlRunAsync(runId, ClaimOf(runId), "X", "x", CancellationToken.None)).Reason);
         Assert.Equal("uploading", await RunStatusAsync(runId));
     }
 
@@ -490,11 +509,10 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Fail_fences_run_entities_batches_and_blocks_job()
     {
         var (runId, _) = await AcceptJobRunAsync("bootstrap_full");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients", queryMode: "bootstrap_full"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", queryMode: "bootstrap_full"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
 
-        var outcome = await _store.FailEtlRunAsync(runId, "extraction blew up", CancellationToken.None);
+        var outcome = await _store.FailEtlRunAsync(runId, ClaimOf(runId), "extraction blew up", CancellationToken.None);
 
         Assert.IsType<EtlRunTerminationOutcome.Applied>(outcome);
         Assert.Equal("failed", await RunStatusAsync(runId));
@@ -510,10 +528,9 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Block_records_conflict_and_never_finishes_job()
     {
         var (runId, _) = await AcceptJobRunAsync("bootstrap_full");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients", queryMode: "bootstrap_full"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", queryMode: "bootstrap_full"), CancellationToken.None));
 
-        var outcome = await _store.BlockEtlRunAsync(runId, "DOMAIN_UNKNOWN", "base row has no domain evidence", CancellationToken.None);
+        var outcome = await _store.BlockEtlRunAsync(runId, ClaimOf(runId), "DOMAIN_UNKNOWN", "base row has no domain evidence", CancellationToken.None);
 
         Assert.IsType<EtlRunTerminationOutcome.Applied>(outcome);
         var run = await RunRowAsync(runId);
@@ -530,7 +547,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients", "orders");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
         await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
 
         var due = await _store.GetDueRunCompletionsAsync(10, DateTimeOffset.UtcNow, CancellationToken.None);
@@ -567,7 +584,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
 
         var outcome = await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None);
 
@@ -584,7 +601,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -634,7 +651,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
 
         var storeA = new SqliteAgentStore(_factory, new SqliteMigrator(_factory));
@@ -659,12 +676,11 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var singleJob = await AcceptJobRunAsync("entity_reload");
         var singleRun = singleJob.RunId;
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", singleRun.ToString("D")));
         var defJson = JsonSerializer.Serialize(singleJob.Entities[0], JsonOptions);
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(singleRun, Request("clients", definitionJson: defJson, queryMode: "entity_reload"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(singleRun, "clients", 5), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(singleRun, "clients", CursorJson(FinalClients), 1, CancellationToken.None));
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(singleRun, CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(singleRun, ClaimOf(singleRun), Request("clients", definitionJson: defJson, queryMode: "entity_reload"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(singleRun, "clients", 5), ClaimOf(singleRun), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(singleRun, ClaimOf(singleRun), "clients", CursorJson(FinalClients), 1, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(singleRun, ClaimOf(singleRun), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(singleRun);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(singleRun, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -693,7 +709,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 4, fingerprint: Fingerprint("clients"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
         await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -718,7 +734,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         await SeedWatermarkAsync("orders", CursorJson(CursorX), generation: 2, fingerprint: Fingerprint("orders"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
         await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -749,7 +765,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 1, fingerprint: Fingerprint("clients"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -773,7 +789,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 1, fingerprint: Fingerprint("clients"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -784,14 +800,17 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         Assert.Equal("GENERATION_MISMATCH", blocked.Code);
 
         // And the inverse: a final byte-identical to the captured base still commits —
-        // generation must advance exactly once for the new finalize.
+        // generation must advance exactly once for the new finalize. The blocked run
+        // retains 'clients' ownership (blocks never release), so it is manually released
+        // before the second run claims.
+        await ReleaseOwnershipAsync();
         var runId2 = await NewRunAsync("clients");
-        var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId2, Request("clients"), CancellationToken.None));
+        var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId2, ClaimOf(runId2), Request("clients"), CancellationToken.None));
         Assert.Equal(2, begun.Base.ExpectedBaseGeneration); // foreign writer moved X to gen 2
         Assert.Equal(CursorJson(CursorX), begun.Base.CommittedCursorJson);
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId2, "clients", 3), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId2, "clients", CursorJson(CursorX), 1, CancellationToken.None));
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId2, CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId2, "clients", 3), ClaimOf(runId2), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId2, ClaimOf(runId2), "clients", CursorJson(CursorX), 1, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId2, ClaimOf(runId2), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId2);
         var claim2 = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId2, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         Assert.IsType<EtlRunFinalizeOutcome.Finalized>(await _store.FinalizeEtlRunAsync(runId2, claim2.Claim.ClaimId, CancellationToken.None));
@@ -806,7 +825,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         // Absent capture, row created before finalize: guarded INSERT refuses to overwrite.
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await ExecuteSqlAsync("INSERT INTO watermarks(entity_name,committed_cursor_json,generation,domain_fingerprint,updated_at_utc) VALUES('clients',$c,9,$fp,$now);",
@@ -820,7 +839,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId2 = await NewRunAsync("orders");
         await SeedWatermarkAsync("orders", CursorJson(CursorX), generation: 2, fingerprint: Fingerprint("orders"));
         await BeginExtractCompleteAsync(runId2, "orders", CursorJson(FinalOrders), batchRows: 4);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId2, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId2, ClaimOf(runId2), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId2);
         var claim2 = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId2, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await ExecuteSqlAsync("DELETE FROM watermarks WHERE entity_name='orders';", []);
@@ -836,7 +855,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 1, fingerprint: Fingerprint("clients"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await ExecuteSqlAsync("UPDATE watermarks SET domain_fingerprint='foreign-domain' WHERE entity_name='clients';", []);
@@ -854,7 +873,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         // Final is "older" than the captured base — no MAX/comparison participates.
         var older = new EtlCursor(CursorX.UpdatedAtUtc!.Value.AddHours(-5), "A0");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(older), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -870,7 +889,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(await _store.MarkRunCompletionRetryAsync(runId, first.Claim.ClaimId, "boom", DateTimeOffset.UtcNow.AddSeconds(-1), 8, CancellationToken.None));
@@ -901,7 +920,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         await SeedWatermarkAsync("orders", CursorJson(CursorX), generation: 1, fingerprint: Fingerprint("orders"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
         await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -930,13 +949,13 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Durable_final_wins_over_batch_timestamp_order()
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
         // Two batches with identical created_at_utc — ties cannot order a final.
         var same = DateTimeOffset.Parse("2026-09-19T10:00:01.0000000+00:00", CultureInfo.InvariantCulture);
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5, watermarkTo: CursorY, createdAtUtc: same), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5, watermarkTo: CursorX, createdAtUtc: same), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, "clients", CursorJson(FinalClients), 2, CancellationToken.None));
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5, watermarkTo: CursorY, createdAtUtc: same), ClaimOf(runId), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5, watermarkTo: CursorX, createdAtUtc: same), ClaimOf(runId), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 2, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -953,7 +972,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -984,7 +1003,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
 
         // A sealed run whose persisted evidence no longer matches its own seal must never
@@ -1006,9 +1025,8 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Attempts_exhausted_blocks_run_and_job_preserving_payload()
     {
         var (runId, _) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5, definitionJson: DefinitionJson("clients"), queryMode: "entity_reload");
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 1, CancellationToken.None));
 
@@ -1030,7 +1048,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "dead-owner", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -1056,9 +1074,8 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Recovery_blocks_interrupted_running_runs_and_fences_pending_batches()
     {
         var (runId, _) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients", queryMode: "entity_reload"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", queryMode: "entity_reload"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
         var pendingRun = await NewPendingRunAsync();
 
         var recovered = await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
@@ -1091,10 +1108,10 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Complete_with_non_iso_timestamp_or_empty_source_rejects_before_write(string finalJson)
     {
         var runId = await NewRunAsync("clients");
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request("clients"), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 5), ClaimOf(runId), CancellationToken.None));
 
-        await Assert.ThrowsAsync<ArgumentException>(() => _store.CompleteEtlEntityExtractionAsync(runId, "clients", finalJson, 1, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", finalJson, 1, CancellationToken.None));
 
         var entity = await EntityRowAsync(runId, "clients");
         Assert.Equal("extracting", entity!.Status);
@@ -1111,7 +1128,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         await ExecuteSqlAsync("UPDATE etl_run_entities SET final_watermark_json=$final WHERE run_id=$run;",
             ("$final", "{\"updatedAtUtc\":\"09/25/2026\",\"sourceId\":null}"), ("$run", runId.ToString("D")));
 
-        var outcome = await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None);
+        var outcome = await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None);
 
         Assert.Equal(EtlRunSealRejection.FinalWatermarkInvalid, Assert.IsType<EtlRunSealOutcome.Rejected>(outcome).Reason);
         Assert.Equal("running", await RunStatusAsync(runId));
@@ -1122,7 +1139,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         Assert.IsType<EtlRunFinalizeOutcome.Finalized>(await _store.FinalizeEtlRunAsync(runId, claim.Claim.ClaimId, CancellationToken.None));
@@ -1137,10 +1154,10 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     [Fact]
     public async Task Begin_rejects_query_mode_different_from_the_saved_run_mode()
     {
-        var runId = await NewRunAsync("clients"); // saved mode 'incremental'
+        var runId = await NewRunAsync("clients"); // saved mode 'bootstrap_full'
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId,
-            new EtlEntityExtractionRequest("clients", DefinitionJson("clients"), SourceNamespace, "bootstrap_full", null), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId),
+            new EtlEntityExtractionRequest("clients", DefinitionJson("clients"), SourceNamespace, "entity_reload", null), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.RunModeMismatch, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM etl_run_entities"));
@@ -1149,12 +1166,13 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     [Fact]
     public async Task Begin_rejects_unsupported_saved_run_mode()
     {
-        var runId = Guid.NewGuid();
-        await ExecuteSqlAsync(
-            "INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,started_at_utc,created_at_utc,updated_at_utc,row_version) VALUES($run,'reconcile_keys','[\"clients\"]','running',$now,$now,$now,1);",
-            ("$run", runId.ToString("D")), ("$now", Now()));
+        // O1: a run only reaches 'running' through the claim, so the unsupported saved
+        // mode is corrupted behind the API on a claimed, owned run — the live claim and
+        // ownership fence still pass, then the saved-mode guard rejects.
+        var runId = await NewRunAsync("clients");
+        await ExecuteSqlAsync("UPDATE etl_runs SET mode='reconcile_keys' WHERE run_id=$run;", ("$run", runId.ToString("D")));
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId,
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId),
             new EtlEntityExtractionRequest("clients", DefinitionJson("clients"), SourceNamespace, "reconcile_keys", null), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.RunModeMismatch, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
@@ -1166,7 +1184,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, Request("orders"), CancellationToken.None);
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("orders"), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.EntityNotInManifest, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM etl_run_entities"));
@@ -1184,7 +1202,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         ];
         foreach (var definitionJson in invalid)
         {
-            var outcome = await _store.BeginEtlEntityExtractionAsync(runId,
+            var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId),
                 new EtlEntityExtractionRequest("clients", definitionJson, SourceNamespace, QueryMode, null), CancellationToken.None);
             Assert.Equal(EtlEntityBeginRejection.EntityDefinitionInvalid, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         }
@@ -1195,21 +1213,21 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Begin_rejects_when_associated_job_identity_is_inconsistent()
     {
         var (runId, entities) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
         // Durable identity drift behind the API: the job's frozen mode no longer equals the run's.
         await ExecuteSqlAsync("UPDATE etl_jobs SET mode='bootstrap_full' WHERE run_id=$run;", ("$run", runId.ToString("D")));
 
-        var outcome = await _store.BeginEtlEntityExtractionAsync(runId,
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId),
             new EtlEntityExtractionRequest("clients", JsonSerializer.Serialize(entities[0], JsonOptions), SourceNamespace, "entity_reload", null), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.JobInconsistent, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM etl_run_entities"));
 
+        // The first run still owns 'clients' — release it so the second job can claim.
+        await ReleaseOwnershipAsync();
         var (runId2, entities2) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId2.ToString("D")));
         await ExecuteSqlAsync("UPDATE etl_jobs SET configuration_version=configuration_version+1 WHERE run_id=$run;", ("$run", runId2.ToString("D")));
 
-        var outcome2 = await _store.BeginEtlEntityExtractionAsync(runId2,
+        var outcome2 = await _store.BeginEtlEntityExtractionAsync(runId2, ClaimOf(runId2),
             new EtlEntityExtractionRequest("clients", JsonSerializer.Serialize(entities2[0], JsonOptions), SourceNamespace, "entity_reload", null), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.JobInconsistent, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome2).Reason);
@@ -1231,7 +1249,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         Assert.Equal(1, (await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None)).ClaimsReleased);
@@ -1254,7 +1272,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
@@ -1274,7 +1292,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients", "orders");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
         await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
@@ -1295,7 +1313,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
@@ -1315,7 +1333,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 4, fingerprint: Fingerprint("clients"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
@@ -1336,7 +1354,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
 
         Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 2, CancellationToken.None));
@@ -1366,10 +1384,9 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Fault_at_final_job_update_rolls_back_watermarks_run_and_job_atomically()
     {
         var (runId, entities) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5,
             definitionJson: JsonSerializer.Serialize(entities[0], JsonOptions), queryMode: "entity_reload");
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -1382,7 +1399,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var run = await RunRowAsync(runId);
         Assert.Equal("completing", run.Status);
         Assert.Equal(claim.Claim.ClaimId.ToString("D"), run.CompletionClaimId);
-        Assert.Equal("pending", await ScalarStringAsync($"SELECT status FROM etl_jobs WHERE run_id='{runId:D}'"));
+        Assert.Equal("running", await ScalarStringAsync($"SELECT status FROM etl_jobs WHERE run_id='{runId:D}'"));
 
         await ExecuteSqlAsync("DROP TRIGGER fail_job_finish;", []);
         Assert.IsType<EtlRunFinalizeOutcome.Finalized>(await _store.FinalizeEtlRunAsync(runId, claim.Claim.ClaimId, CancellationToken.None));
@@ -1395,12 +1412,11 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Job_run_finalize_conflict_blocks_the_job_and_rolls_back_watermarks()
     {
         var (runId, entities) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
         var defJson = JsonSerializer.Serialize(entities[0], JsonOptions);
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 3,
             fingerprint: EtlDomainFingerprint.Compute(SourceNamespace, "clients", defJson, "entity_reload"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5, definitionJson: defJson, queryMode: "entity_reload");
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -1425,10 +1441,9 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     public async Task Reclaim_after_recovery_with_lost_payload_blocks_and_never_regenerates()
     {
         var (runId, entities) = await AcceptJobRunAsync("entity_reload");
-        await ExecuteSqlAsync("UPDATE etl_runs SET status='running', started_at_utc=$now WHERE run_id=$run;", ("$now", Now()), ("$run", runId.ToString("D")));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5,
             definitionJson: JsonSerializer.Serialize(entities[0], JsonOptions), queryMode: "entity_reload");
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -1456,7 +1471,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
 
         // A schema-valid body planted behind the API before ANY claim: a first claim can
@@ -1479,7 +1494,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var claim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
 
@@ -1500,7 +1515,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     {
         var runId = await NewRunAsync("clients");
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(
@@ -1528,7 +1543,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         var runId = await NewRunAsync("clients");
         await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 4, fingerprint: Fingerprint("clients"));
         await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
-        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, CancellationToken.None));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
         await AcknowledgeAllBatchesAsync(runId);
         Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
         await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
@@ -1567,10 +1582,24 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         new(Guid.NewGuid(), runId, entity, 1, $"spool/{runId:N}-{entity}-{Guid.NewGuid():N}.gz", EtlBatchStatus.Ready, rowCount,
             null, watermarkTo ?? FinalClients, "hash-" + Guid.NewGuid().ToString("N"), 1000, 4000, 0, createdAtUtc ?? DateTimeOffset.UtcNow);
 
+    // A pending run + pending durable job with a consistent frozen identity, claimed
+    // through the real O1 claim transaction: run becomes 'running' with a fresh
+    // extraction claim and manifest ownership/bindings. Returns the run id.
     private async Task<Guid> NewRunAsync(params string[] entities)
     {
         var runId = Guid.NewGuid();
-        await _store.CreateEtlRunAsync(new EtlRun(runId, "incremental", entities, EtlRunStatus.Running), CancellationToken.None);
+        var jobId = Guid.NewGuid();
+        var manifest = JsonSerializer.Serialize(entities, JsonOptions);
+        var definitions = JsonSerializer.Serialize(entities.Select(e => MakeEntities().Single(x => x.EntityCode == e)).ToArray(), JsonOptions);
+        await ExecuteSqlAsync(
+            "INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,configuration_version,created_at_utc,updated_at_utc,row_version) VALUES($run,$mode,$manifest,'pending',7,$now,$now,1);",
+            ("$run", runId.ToString("D")), ("$mode", QueryMode), ("$manifest", manifest), ("$now", Now()));
+        await ExecuteSqlAsync(
+            "INSERT INTO etl_jobs(job_id,command_id,run_id,mode,entities_json,configuration_version,status,command_payload_hash,acceptance_result_json,created_at_utc,updated_at_utc,row_version) VALUES($job,$cmd,$run,$mode,$defs,7,'pending','hash','{}',$now,$now,1);",
+            ("$job", jobId.ToString("D")), ("$cmd", Guid.NewGuid().ToString("D")), ("$run", runId.ToString("D")), ("$mode", QueryMode), ("$defs", definitions), ("$now", Now()));
+        var claimed = Assert.IsType<EtlJobClaimOutcome.Claimed>(
+            await _store.TryClaimEtlJobAsync(jobId, "test-dispatcher", DateTimeOffset.UtcNow.AddMinutes(5), DateTimeOffset.UtcNow, CancellationToken.None));
+        _extractionClaims[runId] = claimed.Claim.ExtractionClaimId;
         return runId;
     }
 
@@ -1583,14 +1612,9 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         return runId;
     }
 
-    private async Task InsertRunAsync(Guid runId, string requestedEntitiesJson)
-    {
-        await ExecuteSqlAsync(
-            "INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,started_at_utc,created_at_utc,updated_at_utc,row_version) VALUES($run,'incremental',$entities,'running',$now,$now,$now,1);",
-            ("$run", runId.ToString("D")), ("$entities", requestedEntitiesJson), ("$now", Now()));
-    }
-
-    // Accepts a real durable job via the v5 API and returns its pending run + frozen entities.
+    // Accepts a real durable job via the v5 API, then claims it through the real O1
+    // claim transaction: the run is 'running' with a fresh extraction claim and full
+    // manifest ownership. Returns the run id + frozen entities.
     private async Task<(Guid RunId, EtlEntityDefinition[] Entities)> AcceptJobRunAsync(string mode)
     {
         var entities = mode == "entity_reload" ? [MakeEntities()[0]] : MakeEntities();
@@ -1605,14 +1629,27 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         Assert.NotNull(claim);
         var outcome = await _store.AcceptEtlJobAndCompleteCommandAsync(command.CommandId, owner, new EtlJobAcceptanceRequest(mode, entities, 7), CancellationToken.None);
         var applied = Assert.IsType<EtlJobAcceptanceOutcome.Applied>(outcome);
+        var claimed = Assert.IsType<EtlJobClaimOutcome.Claimed>(
+            await _store.TryClaimEtlJobAsync(applied.Job.JobId, "test-dispatcher", DateTimeOffset.UtcNow.AddMinutes(5), DateTimeOffset.UtcNow, CancellationToken.None));
+        _extractionClaims[applied.Job.RunId] = claimed.Claim.ExtractionClaimId;
         return (applied.Job.RunId, entities);
+    }
+
+    // Test-side attested manual resolution: releases the active ownership rows so a
+    // later run can re-acquire the entities (the prior run keeps its bindings as
+    // evidence and every subsequent ownership-gated call on it fails closed).
+    private async Task ReleaseOwnershipAsync()
+    {
+        await ExecuteSqlAsync(
+            "UPDATE etl_entity_ownership SET released_at_utc=$now, release_reason='manual_release', updated_at_utc=$now WHERE released_at_utc IS NULL;",
+            ("$now", Now()));
     }
 
     private async Task BeginExtractCompleteAsync(Guid runId, string entity, string finalJson, int batchRows, string? definitionJson = null, string queryMode = QueryMode)
     {
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, Request(entity, definitionJson, queryMode: queryMode), CancellationToken.None));
-        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, entity, batchRows), CancellationToken.None));
-        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, entity, finalJson, 1, CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request(entity, definitionJson, queryMode: queryMode), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, entity, batchRows), ClaimOf(runId), CancellationToken.None));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), entity, finalJson, 1, CancellationToken.None));
     }
 
     private async Task SeedWatermarkAsync(string entity, string? cursorJson, long generation, string? fingerprint)

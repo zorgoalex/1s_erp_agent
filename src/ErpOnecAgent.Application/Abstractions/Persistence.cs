@@ -111,6 +111,38 @@ public interface IAgentStore
     /// </summary>
     Task<EtlJobAcceptanceOutcome> AcceptEtlJobAndCompleteCommandAsync(Guid commandId, string claimOwner, EtlJobAcceptanceRequest request, CancellationToken cancellationToken);
 
+    // --- O1 dark storage APIs: durable per-entity ownership + the run extraction
+    // claim fence (isolated new path; NOT wired into workers, recovery, or the ERP
+    // client — see EtlOwnership.cs header). O1 alone is not a safe production state.
+
+    /// <summary>
+    /// One-transaction fair claim of a durable manual ETL job. The guarded probe write
+    /// serializes claimants on the job row; inside the transaction the store verifies the
+    /// frozen job identity (run pending, mode/configuration_version agree, frozen
+    /// entities_json manifest equals the run's requested_entities_json — violations block
+    /// job+run JOB_MANIFEST_INCONSISTENT), quarantines provably-never-started elders with
+    /// invalid manifests (unproven elders defer the claimant elder_manifest_invalid),
+    /// enforces the elder-overlap reservation (queued_overlap), then under a SAVEPOINT
+    /// acquires ownership of EVERY manifest entity and writes the immutable epoch
+    /// bindings — any conflict rolls the partial acquisition back and defers busy_entity.
+    /// On success the run becomes 'running' and a fresh GUID extraction claim is minted —
+    /// the fence every extraction mutation requires. claim_attempt_count counts committed
+    /// claims only. Ownership is retained through failure/restart and released only
+    /// inside the successful finalize commit.
+    /// </summary>
+    Task<EtlJobClaimOutcome> TryClaimEtlJobAsync(Guid jobId, string ownerId, DateTimeOffset deferUntilUtc, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Enumerates dispatchable manual ETL jobs: pending (or deferred-and-due) jobs whose
+    /// pending run has no elder-overlap reservation and whose manifest entities are all
+    /// acquirable — both predicates applied in SQL BEFORE LIMIT, ranked by run
+    /// (created_at_utc, run_id), so a busy/deferred head never hides disjoint work and the
+    /// enumerator can never bypass the in-transaction claim authority. Quarantine
+    /// diagnostics for corrupt pending runs are surfaced even when no candidate is
+    /// eligible.
+    /// </summary>
+    Task<EtlJobDispatchPage> GetDispatchableEtlJobsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
     Task CreateEtlRunAsync(EtlRun run, CancellationToken cancellationToken);
     Task RegisterBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
     Task MarkEtlRunExtractedAsync(Guid runId, CancellationToken cancellationToken);
@@ -130,51 +162,65 @@ public interface IAgentStore
 
     /// <summary>
     /// Atomically captures the entity's expected watermark base BEFORE extraction in one
-    /// transaction: row presence, generation, raw committed cursor text, and stored domain
-    /// fingerprint — then classifies the domain fail-closed (absent|same proceed;
-    /// changed|unknown write a 'failed' entity row and reject; a missing source namespace
-    /// or a definition conflicting with the run's frozen etl_job definition rejects with
-    /// zero writes). The returned base is the exact committed cursor the query must use —
+    /// transaction — under the run's live extraction claim fence (the fresh GUID minted by
+    /// the committed job claim; stale/foreign/missing claims reject with zero writes) and
+    /// the exact ownership gate (the run's valid manifest must equal its immutable epoch
+    /// bindings AND its active ownership rows — a released/re-acquired row fails closed
+    /// even for the same owner). Then: row presence, generation, raw committed cursor
+    /// text, and stored domain fingerprint — classifying the domain fail-closed
+    /// (absent|same proceed; changed|unknown write a 'failed' entity row and reject; a
+    /// missing source namespace or a definition conflicting with the run's frozen etl_job
+    /// definition rejects with zero writes). A run without an etl_jobs row is rejected
+    /// outright — O1 has no frozen identity source for jobless runs (scheduled identity
+    /// is O3). The returned base is the exact committed cursor the query must use —
     /// recorded base and query base are identical by construction.
     /// </summary>
-    Task<EtlEntityBeginOutcome> BeginEtlEntityExtractionAsync(Guid runId, EtlEntityExtractionRequest request, CancellationToken cancellationToken);
+    Task<EtlEntityBeginOutcome> BeginEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, EtlEntityExtractionRequest request, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Guarded batch registration for the new path only: inserts the batch and bumps the
-    /// entity and run counters in one transaction, but only while the run is 'running' and
-    /// unsealed and the entity row is still 'extracting'. A late batch after done/seal/
-    /// completing is rejected and moves no counters. The legacy RegisterBatchAsync is
-    /// unchanged and still unguarded.
+    /// Guarded batch registration for the new path only — under the run's live extraction
+    /// claim fence and exact ownership gate: inserts the batch and bumps the entity and
+    /// run counters in one transaction, but only while the run is 'running', unsealed,
+    /// claim-matched and exactly owned, and the entity row is still 'extracting'. A late
+    /// batch after done/seal/completing, a stale claim, or a broken ownership set is
+    /// rejected and moves no counters. The legacy RegisterBatchAsync is unchanged and
+    /// still unguarded.
     /// </summary>
-    Task<EtlBatchRegistrationOutcome> RegisterGuardedEtlBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
+    Task<EtlBatchRegistrationOutcome> RegisterGuardedEtlBatchAsync(EtlBatch batch, Guid extractionClaimId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Durably completes one extracting entity with an explicit typed final cursor (valid
-    /// JSON object, at least one non-NULL component — never order-derived) and the
-    /// expected batch count, which must equal the durable per-entity batch counter.
-    /// Entity metadata and counts freeze after this.
+    /// Durably completes one extracting entity — under the run's live extraction claim
+    /// fence and exact ownership gate — with an explicit typed final cursor (valid JSON
+    /// object, at least one non-NULL component — never order-derived) and the expected
+    /// batch count, which must equal the durable per-entity batch counter. Entity
+    /// metadata and counts freeze after this.
     /// </summary>
-    Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken);
+    Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Seals extraction output in one transaction: the validated requested manifest must
-    /// equal the entity-row set exactly, every entity must be 'done' with a valid
-    /// non-empty final, and per-entity/run counters must match the actual batch rows.
-    /// On success the run becomes 'uploading' with frozen seal counts; afterwards every
-    /// new-path mutation API is fenced.
+    /// Seals extraction output in one transaction — under the run's live extraction claim
+    /// fence and exact ownership gate: the validated requested manifest must equal the
+    /// entity-row set exactly, every entity must be 'done' with a valid non-empty final,
+    /// and per-entity/run counters must match the actual batch rows. On success the run
+    /// becomes 'uploading' with frozen seal counts and the extraction claim is cleared —
+    /// the extraction fence ends at seal; afterwards every new-path mutation API is
+    /// fenced.
     /// </summary>
-    Task<EtlRunSealOutcome> SealEtlRunExtractionAsync(Guid runId, CancellationToken cancellationToken);
+    Task<EtlRunSealOutcome> SealEtlRunExtractionAsync(Guid runId, Guid extractionClaimId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// fail_run only: guarded 'running' → 'failed'; still-extracting entities fail;
-    /// pending batches (creating/ready/retry_waiting/uploading) are fenced to dead_letter;
-    /// the job becomes 'blocked', never 'finished'. A SQL status flip can never cancel an
-    /// HTTP upload already in flight or recall remote effects.
+    /// fail_run only: guarded 'running' + live-extraction-claim → 'failed'; a stale or
+    /// foreign claim can never terminate a newer execution. Termination may preserve or
+    /// block a run whose ownership evidence is corrupted — it never releases ownership.
+    /// Still-extracting entities fail; pending batches (creating/ready/retry_waiting/
+    /// uploading) are fenced to dead_letter; the job becomes 'blocked', never 'finished'.
+    /// A SQL status flip can never cancel an HTTP upload already in flight or recall
+    /// remote effects.
     /// </summary>
-    Task<EtlRunTerminationOutcome> FailEtlRunAsync(Guid runId, string errorMessage, CancellationToken cancellationToken);
+    Task<EtlRunTerminationOutcome> FailEtlRunAsync(Guid runId, Guid extractionClaimId, string errorMessage, CancellationToken cancellationToken);
 
-    /// <summary>Same shape as FailEtlRunAsync to 'blocked' with a conflict code (domain/seal/claim violations, legacy quarantine).</summary>
-    Task<EtlRunTerminationOutcome> BlockEtlRunAsync(Guid runId, string code, string message, CancellationToken cancellationToken);
+    /// <summary>Same shape as FailEtlRunAsync to 'blocked' with a conflict code (domain/seal/claim violations, legacy quarantine), under the live extraction claim.</summary>
+    Task<EtlRunTerminationOutcome> BlockEtlRunAsync(Guid runId, Guid extractionClaimId, string code, string message, CancellationToken cancellationToken);
 
     /// <summary>Runs due for a completion attempt: sealed 'uploading' runs, or 'completing' runs with a released claim whose retry is due.</summary>
     Task<IReadOnlyList<EtlRunCompletionCandidate>> GetDueRunCompletionsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
@@ -182,7 +228,10 @@ public interface IAgentStore
     /// <summary>
     /// One-transaction claim: verifies the full readiness invariant in-tx (sealed, exact
     /// manifest/entity set, all entities done with valid finals, exact acknowledged batch
-    /// counts, no corrupt state), then mints a NEW GUID claim identity, bumps the bounded
+    /// counts, no corrupt state — and the exact three-way ownership equality: valid
+    /// manifest == immutable epoch bindings == active ownership rows at the bound
+    /// positive epochs, both directions, or the run commits 'blocked'
+    /// OWNERSHIP_SET_MISMATCH), then mints a NEW GUID claim identity, bumps the bounded
     /// attempt counter, and writes the immutable complete payload on first claim only.
     /// A legacy or corrupted 'uploading' run commits 'blocked' with evidence instead of
     /// being claimed; a transient not-yet-acknowledged run rolls back untouched.
@@ -195,11 +244,16 @@ public interface IAgentStore
     Task<EtlRunClaimOutcome> TryClaimRunCompletionAsync(Guid runId, string ownerId, DateTimeOffset nextAttemptAtUtc, int maxAttempts, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Atomic finalize under the exact claim identity: re-verifies the seal, then applies
-    /// every entity's presence+generation+cursor+domain CAS inside one transaction —
-    /// all watermarks + succeeded run + finished job commit together, or any single
-    /// mismatch rolls back all watermark writes and commits blocked run + conflict +
-    /// blocked job. A stale claim loses silently with zero writes.
+    /// Atomic finalize under the exact claim identity: re-verifies the seal AND the exact
+    /// three-way ownership equality (mismatch commits blocked OWNERSHIP_SET_MISMATCH),
+    /// then applies every entity's presence+generation+cursor+domain CAS inside one
+    /// savepoint together with the epoch-bound ownership release — the release must change
+    /// exactly sealed_entity_count rows or every watermark write AND the partial release
+    /// roll back to the savepoint and one commit writes blocked run +
+    /// OWNERSHIP_RELEASE_MISMATCH + blocked job. All watermarks + succeeded run +
+    /// finished job + exactly-manifest ownership release commit together; a stale claim
+    /// loses silently with zero writes; a SQL/fault exception rolls the whole transaction
+    /// back preserving the completing claim for a fenced retry.
     /// </summary>
     Task<EtlRunFinalizeOutcome> FinalizeEtlRunAsync(Guid runId, Guid claimId, CancellationToken cancellationToken);
 
@@ -215,8 +269,11 @@ public interface IAgentStore
     /// Explicit dead-process recovery — startup-only, exclusive-host precondition, NOT
     /// used by RecoverAsync and never a live/time-based takeover: releases every
     /// 'completing' claim (payload and evidence preserved), blocks 'running' runs
-    /// INTERRUPTED_NO_CHECKPOINT, marks their extracting entities failed, fences their
-    /// pending batches to dead_letter, and blocks their jobs. 'pending' runs untouched.
+    /// INTERRUPTED_NO_CHECKPOINT and clears their dead extraction claims, marks their
+    /// extracting entities failed, fences their pending batches to dead_letter, and
+    /// blocks their jobs — ownership rows and bindings are RETAINED in all cases (they
+    /// are the evidence of exactly what the interrupted run owned). 'pending' runs
+    /// untouched.
     /// </summary>
     Task<EtlRecoveryResult> RecoverInterruptedEtlRunsAsync(CancellationToken cancellationToken);
 

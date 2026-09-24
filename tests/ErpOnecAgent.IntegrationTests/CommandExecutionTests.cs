@@ -878,7 +878,7 @@ public sealed class CommandExecutionTests : IAsyncLifetime
         Assert.Equal(3, await CountAsync(factory, "SELECT COUNT(*) FROM command_attempts"));
         Assert.Equal("post", await StringAsync(factory, "SELECT attempt_kind FROM command_attempts LIMIT 1"));
         Assert.Equal(migration001Checksum, await StringAsync(factory, "SELECT checksum FROM schema_migrations WHERE version=1"));
-        Assert.Equal(6, await CountAsync(factory, "SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(7, await CountAsync(factory, "SELECT COUNT(*) FROM schema_migrations"));
     }
 
     private static async Task<long> CountAsync(SqliteConnectionFactory factory, string sql)

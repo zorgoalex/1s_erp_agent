@@ -16,8 +16,9 @@ namespace ErpOnecAgent.Infrastructure.Persistence.Sqlite;
 public sealed partial class SqliteAgentStore
 {
     /// <inheritdoc cref="IAgentStore.BeginEtlEntityExtractionAsync"/>
-    public async Task<EtlEntityBeginOutcome> BeginEtlEntityExtractionAsync(Guid runId, EtlEntityExtractionRequest request, CancellationToken cancellationToken)
+    public async Task<EtlEntityBeginOutcome> BeginEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, EtlEntityExtractionRequest request, CancellationToken cancellationToken)
     {
+        if (extractionClaimId == Guid.Empty) throw new ArgumentException("An extraction claim identity is required.", nameof(extractionClaimId));
         ValidateExtractionRequest(request);
         // A missing source namespace means no domain fingerprint can be computed — the
         // caller blocks the run; nothing is captured against an unidentifiable domain.
@@ -29,16 +30,24 @@ public sealed partial class SqliteAgentStore
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var now = UtcNow();
+        var claimText = extractionClaimId.ToString("D");
 
         // Write-first fence: serializes concurrent extraction writers of this run and
-        // proves the run is still mutable (running + unsealed) in one statement.
-        var fence = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_runs SET row_version=row_version+1, updated_at_utc=$now WHERE run_id=$run AND status='running' AND sealed_at_utc IS NULL;",
-            cancellationToken, ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+        // proves in one statement that the run is still mutable (running + unsealed),
+        // holds the LIVE extraction claim, and owns its exact manifest set at the bound
+        // epochs. A stale/foreign/missing claim or a broken ownership set changes zero
+        // rows and rolls back the row_version bump.
+        var fence = await ExecuteAsync(connection, transaction, $"""
+            UPDATE etl_runs AS r SET row_version=row_version+1, updated_at_utc=$now
+            WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL AND r.extraction_claim_id=$claim
+              AND {RunOwnershipSetPredicate};
+            """,
+            cancellationToken, ("$now", now), ("$run", runId.ToString("D")), ("$claim", claimText)).ConfigureAwait(false);
         if (fence == 0)
         {
+            var fenceRejection = await ClassifyRunFenceRejectionAsync(connection, transaction, runId, claimText, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.RunNotAcceptingEntities);
+            return new EtlEntityBeginOutcome.Rejected(fenceRejection);
         }
 
         var entityExists = await ScalarLongAsync(connection, transaction,
@@ -117,18 +126,22 @@ public sealed partial class SqliteAgentStore
                 jobEntitiesJson = reader.GetString(2);
             }
         }
-        if (jobEntitiesJson is not null)
+        // O1: there is no frozen identity source for a jobless run — Begin rejects any
+        // run without an etl_jobs row outright until O3 lands resolved_entities_json.
+        if (jobEntitiesJson is null)
         {
-            if (!string.Equals(jobMode, runMode, StringComparison.Ordinal) || jobConfigurationVersion != runConfigurationVersion)
-            {
-                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-                return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobInconsistent);
-            }
-            if (!FrozenDefinitionMatches(jobEntitiesJson, request.EntityName, request.EntityDefinitionJson))
-            {
-                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-                return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobDefinitionMismatch);
-            }
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobMissing);
+        }
+        if (!string.Equals(jobMode, runMode, StringComparison.Ordinal) || jobConfigurationVersion != runConfigurationVersion)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobInconsistent);
+        }
+        if (!FrozenDefinitionMatches(jobEntitiesJson, request.EntityName, request.EntityDefinitionJson))
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobDefinitionMismatch);
         }
 
         // Capture the base atomically BEFORE extraction: raw committed cursor bytes,
@@ -186,27 +199,35 @@ public sealed partial class SqliteAgentStore
     }
 
     /// <inheritdoc cref="IAgentStore.RegisterGuardedEtlBatchAsync"/>
-    public async Task<EtlBatchRegistrationOutcome> RegisterGuardedEtlBatchAsync(EtlBatch batch, CancellationToken cancellationToken)
+    public async Task<EtlBatchRegistrationOutcome> RegisterGuardedEtlBatchAsync(EtlBatch batch, Guid extractionClaimId, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(batch);
+        if (extractionClaimId == Guid.Empty) throw new ArgumentException("An extraction claim identity is required.", nameof(extractionClaimId));
         if (string.IsNullOrWhiteSpace(batch.EntityName)) throw new ArgumentException("Batch entity name is required.", nameof(batch));
         if (batch.RowCount < 0) throw new ArgumentOutOfRangeException(nameof(batch), "Batch row count cannot be negative.");
 
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var now = UtcNow();
+        var claimText = extractionClaimId.ToString("D");
 
-        // Guarded counter bump first: only a 'running' unsealed run with this entity
-        // still 'extracting' accepts a batch; the update also serializes writers.
-        var guarded = await ExecuteAsync(connection, transaction, """
+        // Guarded counter bump first: only a 'running' unsealed run holding the live
+        // extraction claim AND its exact bound ownership set with this entity still
+        // 'extracting' accepts a batch; the update also serializes writers. The touched
+        // entity itself must be a manifest member with an epoch-bound active ownership
+        // row — a stray injected 'extracting' row for an unowned entity can never accept
+        // a write. A stale claim or a broken ownership set rejects with zero writes.
+        var guarded = await ExecuteAsync(connection, transaction, $"""
             UPDATE etl_run_entities SET batches_created=batches_created+1, rows_read=rows_read+$rows, updated_at_utc=$now, row_version=row_version+1
             WHERE run_id=$run AND entity_name=$entity AND status='extracting'
-              AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL);
+              AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL
+                          AND r.extraction_claim_id=$claim AND {RunOwnershipSetPredicate}
+                          AND {EntityOwnershipPredicate});
             """, cancellationToken,
-            ("$rows", batch.RowCount), ("$now", now), ("$run", batch.RunId.ToString("D")), ("$entity", batch.EntityName)).ConfigureAwait(false);
+            ("$rows", batch.RowCount), ("$now", now), ("$run", batch.RunId.ToString("D")), ("$entity", batch.EntityName), ("$claim", claimText)).ConfigureAwait(false);
         if (guarded == 0)
         {
-            var rejection = await ClassifyBatchRejectionAsync(connection, transaction, batch.RunId, batch.EntityName, cancellationToken).ConfigureAwait(false);
+            var rejection = await ClassifyBatchRejectionAsync(connection, transaction, batch.RunId, batch.EntityName, claimText, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             return new EtlBatchRegistrationOutcome.Rejected(rejection);
         }
@@ -225,8 +246,9 @@ public sealed partial class SqliteAgentStore
     }
 
     /// <inheritdoc cref="IAgentStore.CompleteEtlEntityExtractionAsync"/>
-    public async Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken)
+    public async Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken)
     {
+        if (extractionClaimId == Guid.Empty) throw new ArgumentException("An extraction claim identity is required.", nameof(extractionClaimId));
         if (string.IsNullOrWhiteSpace(entityName)) throw new ArgumentException("Entity name is required.", nameof(entityName));
         if (!IsValidCursorJson(finalWatermarkJson, requireMeaningfulComponent: true))
             throw new ArgumentException("The final watermark must be a cursor JSON object with at least one non-NULL component.", nameof(finalWatermarkJson));
@@ -235,17 +257,20 @@ public sealed partial class SqliteAgentStore
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var now = UtcNow();
+        var claimText = extractionClaimId.ToString("D");
 
-        var guarded = await ExecuteAsync(connection, transaction, """
+        var guarded = await ExecuteAsync(connection, transaction, $"""
             UPDATE etl_run_entities SET status='done', final_watermark_json=$final, expected_batch_count=$expected, updated_at_utc=$now, row_version=row_version+1
             WHERE run_id=$run AND entity_name=$entity AND status='extracting' AND batches_created=$expected
-              AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL);
+              AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL
+                          AND r.extraction_claim_id=$claim AND {RunOwnershipSetPredicate}
+                          AND {EntityOwnershipPredicate});
             """, cancellationToken,
             ("$final", finalWatermarkJson), ("$expected", expectedBatchCount), ("$now", now),
-            ("$run", runId.ToString("D")), ("$entity", entityName)).ConfigureAwait(false);
+            ("$run", runId.ToString("D")), ("$entity", entityName), ("$claim", claimText)).ConfigureAwait(false);
         if (guarded == 0)
         {
-            var rejection = await ClassifyEntityCompletionRejectionAsync(connection, transaction, runId, entityName, expectedBatchCount, cancellationToken).ConfigureAwait(false);
+            var rejection = await ClassifyEntityCompletionRejectionAsync(connection, transaction, runId, entityName, expectedBatchCount, claimText, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             return new EtlEntityCompletionOutcome.Rejected(rejection);
         }
@@ -255,19 +280,28 @@ public sealed partial class SqliteAgentStore
     }
 
     /// <inheritdoc cref="IAgentStore.SealEtlRunExtractionAsync"/>
-    public async Task<EtlRunSealOutcome> SealEtlRunExtractionAsync(Guid runId, CancellationToken cancellationToken)
+    public async Task<EtlRunSealOutcome> SealEtlRunExtractionAsync(Guid runId, Guid extractionClaimId, CancellationToken cancellationToken)
     {
+        if (extractionClaimId == Guid.Empty) throw new ArgumentException("An extraction claim identity is required.", nameof(extractionClaimId));
+
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var now = UtcNow();
+        var claimText = extractionClaimId.ToString("D");
 
-        var fence = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_runs SET row_version=row_version+1, updated_at_utc=$now WHERE run_id=$run AND status='running' AND sealed_at_utc IS NULL;",
-            cancellationToken, ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+        // Same write-first fence as every extraction mutation: live claim + exact
+        // ownership set — a stale claim or broken ownership rejects with zero writes.
+        var fence = await ExecuteAsync(connection, transaction, $"""
+            UPDATE etl_runs AS r SET row_version=row_version+1, updated_at_utc=$now
+            WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL AND r.extraction_claim_id=$claim
+              AND {RunOwnershipSetPredicate};
+            """,
+            cancellationToken, ("$now", now), ("$run", runId.ToString("D")), ("$claim", claimText)).ConfigureAwait(false);
         if (fence == 0)
         {
+            var fenceRejection = await ClassifySealFenceRejectionAsync(connection, transaction, runId, claimText, cancellationToken).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlRunSealOutcome.Rejected(EtlRunSealRejection.RunNotRunningOrAlreadySealed);
+            return new EtlRunSealOutcome.Rejected(fenceRejection);
         }
 
         var run = await ReadRunRowAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
@@ -306,8 +340,10 @@ public sealed partial class SqliteAgentStore
             return new EtlRunSealOutcome.Rejected(EtlRunSealRejection.ExpectedBatchCountMismatch);
         }
 
+        // The extraction fence ends at seal: the claim columns are cleared in the same
+        // success commit — a post-seal mutation under the old claim can never write.
         await ExecuteAsync(connection, transaction,
-            "UPDATE etl_runs SET status='uploading', sealed_at_utc=$now, sealed_entity_count=$entities, sealed_expected_batch_count=$batches, updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run;",
+            "UPDATE etl_runs SET status='uploading', sealed_at_utc=$now, sealed_entity_count=$entities, sealed_expected_batch_count=$batches, extraction_claim_id=NULL, extraction_claim_owner_id=NULL, extraction_claim_acquired_at_utc=NULL, updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run;",
             cancellationToken,
             ("$now", now), ("$entities", entities.Count), ("$batches", expectedTotal), ("$run", runId.ToString("D"))).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -315,14 +351,14 @@ public sealed partial class SqliteAgentStore
     }
 
     /// <inheritdoc cref="IAgentStore.FailEtlRunAsync"/>
-    public Task<EtlRunTerminationOutcome> FailEtlRunAsync(Guid runId, string errorMessage, CancellationToken cancellationToken) =>
-        TerminateRunAsync(runId, "failed", null, string.IsNullOrWhiteSpace(errorMessage) ? "run failed" : errorMessage, "RUN_FAILED", cancellationToken);
+    public Task<EtlRunTerminationOutcome> FailEtlRunAsync(Guid runId, Guid extractionClaimId, string errorMessage, CancellationToken cancellationToken) =>
+        TerminateRunAsync(runId, extractionClaimId, "failed", null, string.IsNullOrWhiteSpace(errorMessage) ? "run failed" : errorMessage, "RUN_FAILED", cancellationToken);
 
     /// <inheritdoc cref="IAgentStore.BlockEtlRunAsync"/>
-    public Task<EtlRunTerminationOutcome> BlockEtlRunAsync(Guid runId, string code, string message, CancellationToken cancellationToken)
+    public Task<EtlRunTerminationOutcome> BlockEtlRunAsync(Guid runId, Guid extractionClaimId, string code, string message, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(code)) throw new ArgumentException("A conflict code is required.", nameof(code));
-        return TerminateRunAsync(runId, "blocked", code, string.IsNullOrWhiteSpace(message) ? code : message, "RUN_BLOCKED", cancellationToken);
+        return TerminateRunAsync(runId, extractionClaimId, "blocked", code, string.IsNullOrWhiteSpace(message) ? code : message, "RUN_BLOCKED", cancellationToken);
     }
 
     /// <inheritdoc cref="IAgentStore.GetDueRunCompletionsAsync"/>
@@ -432,13 +468,14 @@ public sealed partial class SqliteAgentStore
             if (reclaimReadiness != ClaimReadiness.Ready)
             {
                 // The payload exists only because a prior claim proved readiness — any
-                // gap now (regressed ACKs, missing entities, corrupt bases) is a seal
-                // violation, not a transient wait: block and preserve, never a new
-                // admissible claim.
-                const string regressed = "Completion reclaim found seal evidence that no longer satisfies readiness; the run is preserved for manual resolution.";
-                await CommitBlockedRunAsync(connection, transaction, runId, "SEAL_VIOLATED", regressed, now, cancellationToken).ConfigureAwait(false);
+                // gap now (regressed ACKs, missing entities, corrupt bases, broken
+                // ownership) is a violation, not a transient wait: block and preserve,
+                // never a new admissible claim.
+                var regressedCode = reclaimReadiness == ClaimReadiness.OwnershipMismatch ? "OWNERSHIP_SET_MISMATCH" : "SEAL_VIOLATED";
+                var regressed = $"Completion reclaim found seal/ownership evidence that no longer satisfies readiness ({regressedCode}); the run is preserved for manual resolution.";
+                await CommitBlockedRunAsync(connection, transaction, runId, regressedCode, regressed, now, cancellationToken).ConfigureAwait(false);
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-                return new EtlRunClaimOutcome.Blocked("SEAL_VIOLATED", regressed);
+                return new EtlRunClaimOutcome.Blocked(regressedCode, regressed);
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -460,6 +497,13 @@ public sealed partial class SqliteAgentStore
             await CommitBlockedRunAsync(connection, transaction, runId, "SEAL_VIOLATED", message, now, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new EtlRunClaimOutcome.Blocked("SEAL_VIOLATED", message);
+        }
+        if (readiness == ClaimReadiness.OwnershipMismatch)
+        {
+            const string message = "The run's manifest no longer equals its ownership bindings and active ownership rows at the bound epochs; the run is preserved for manual resolution.";
+            await CommitBlockedRunAsync(connection, transaction, runId, "OWNERSHIP_SET_MISMATCH", message, now, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlRunClaimOutcome.Blocked("OWNERSHIP_SET_MISMATCH", message);
         }
         if (readiness == ClaimReadiness.Transient)
         {
@@ -506,18 +550,22 @@ public sealed partial class SqliteAgentStore
 
         var run = await ReadRunRowAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
         var entities = await ReadEntityRowsAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
-        var sealOk = await VerifyFinalSealAsync(connection, transaction, runId, run!, cancellationToken).ConfigureAwait(false);
-        if (!sealOk)
+        var sealViolation = await VerifyFinalSealAsync(connection, transaction, runId, run!, cancellationToken).ConfigureAwait(false);
+        if (sealViolation is not null)
         {
-            const string violation = "Seal evidence failed the in-transaction finalize recheck; the run is preserved for manual resolution.";
-            await CommitBlockedRunAsync(connection, transaction, runId, "SEAL_VIOLATED", violation, now, cancellationToken).ConfigureAwait(false);
+            var violationMessage = sealViolation == "OWNERSHIP_SET_MISMATCH"
+                ? "The run's manifest no longer equals its ownership bindings and active ownership rows at the bound epochs; the run is preserved for manual resolution."
+                : "Seal evidence failed the in-transaction finalize recheck; the run is preserved for manual resolution.";
+            await CommitBlockedRunAsync(connection, transaction, runId, sealViolation, violationMessage, now, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlRunFinalizeOutcome.Blocked("SEAL_VIOLATED", violation);
+            return new EtlRunFinalizeOutcome.Blocked(sealViolation, violationMessage);
         }
 
-        // Presence+generation+cursor+domain CAS per entity inside a savepoint: any single
-        // mismatch rolls back every watermark change, then one commit writes the blocked
-        // run + conflict + blocked job — never a two-transaction gap.
+        // Presence+generation+cursor+domain CAS per entity AND the epoch-bound ownership
+        // release inside ONE savepoint: any single mismatch — including a release count
+        // that differs from the sealed entity count — rolls back every watermark change
+        // AND the partial release, then one commit writes the blocked run + conflict +
+        // blocked job — never a two-transaction gap.
         await ExecuteAsync(connection, transaction, "SAVEPOINT etl_finalize_cas;", cancellationToken).ConfigureAwait(false);
         string? conflictCode = null;
         string? conflictEntity = null;
@@ -558,17 +606,46 @@ public sealed partial class SqliteAgentStore
 
         if (conflictCode is null)
         {
+            // Hard release is part of the same savepoint: the epoch-bound update can
+            // never free a re-acquired (ABA) or foreign row, and it must change EXACTLY
+            // the sealed entity count — a short count is a controlled mismatch, not a
+            // partial commit.
+            var released = await ExecuteAsync(connection, transaction, """
+                UPDATE etl_entity_ownership AS o SET released_at_utc=$now, release_reason='finalized', updated_at_utc=$now, row_version=row_version+1
+                WHERE o.released_at_utc IS NULL
+                  AND EXISTS (SELECT 1 FROM etl_run_ownership_bindings b
+                              WHERE b.run_id=$run AND b.entity_name=o.entity_name
+                                AND o.owner_run_id=$run AND o.ownership_epoch=b.expected_epoch);
+                """, cancellationToken,
+                ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+            if (released != (int)run!.SealedEntityCount!.Value)
+            {
+                conflictCode = "OWNERSHIP_RELEASE_MISMATCH";
+            }
+        }
+
+        if (conflictCode is null)
+        {
             await ExecuteAsync(connection, transaction, "RELEASE SAVEPOINT etl_finalize_cas;", cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(connection, transaction, """
+            // Expected-one transitions are checked before commit: a zero-row guard loss
+            // here means durable state moved inside the transaction boundary — the whole
+            // transaction rolls back and the completing claim is preserved for a fenced
+            // retry rather than committing a half-applied success.
+            var succeeded = await ExecuteAsync(connection, transaction, """
                 UPDATE etl_runs SET status='succeeded', finished_at_utc=$now, completion_acknowledged_at_utc=$now,
                     completion_claim_owner_id=NULL, completion_claim_acquired_at_utc=NULL, next_completion_attempt_at_utc=NULL,
                     updated_at_utc=$now, row_version=row_version+1
                 WHERE run_id=$run AND status='completing' AND completion_claim_id=$claim;
                 """, cancellationToken,
                 ("$now", now), ("$run", runId.ToString("D")), ("$claim", claimId.ToString("D"))).ConfigureAwait(false);
-            await ExecuteAsync(connection, transaction,
+            if (succeeded != 1) throw new InvalidOperationException($"ETL run {runId:D} lost its completing claim mid-transaction.");
+            var jobExpected = await ScalarLongAsync(connection, transaction,
+                "SELECT COUNT(*) FROM etl_jobs WHERE run_id=$run AND status NOT IN ('finished','cancelled');",
+                cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
+            var finished = await ExecuteAsync(connection, transaction,
                 "UPDATE etl_jobs SET status='finished', updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status NOT IN ('finished','cancelled');",
                 cancellationToken, ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+            if (finished != jobExpected) throw new InvalidOperationException($"ETL job for run {runId:D} left the finishable state mid-transaction.");
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new EtlRunFinalizeOutcome.Finalized();
         }
@@ -643,9 +720,16 @@ public sealed partial class SqliteAgentStore
         var claims = await ExecuteAsync(connection, transaction,
             "UPDATE etl_runs SET completion_claim_id=NULL, completion_claim_owner_id=NULL, completion_claim_acquired_at_utc=NULL, updated_at_utc=$now, row_version=row_version+1 WHERE status='completing' AND completion_claim_id IS NOT NULL;",
             cancellationToken, ("$now", now)).ConfigureAwait(false);
+        // Dead extraction claims die with the interrupted run — cleared inside the same
+        // block write and counted as released claims. Ownership rows and bindings are
+        // RETAINED: they are the evidence of exactly what the interrupted run owned.
+        var extractionClaims = await ScalarLongAsync(connection, transaction,
+            "SELECT COUNT(*) FROM etl_runs WHERE status='running' AND extraction_claim_id IS NOT NULL;",
+            cancellationToken).ConfigureAwait(false);
         var runs = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_runs SET status='blocked', finalize_conflict_code='INTERRUPTED_NO_CHECKPOINT', finalize_conflict_message='Extraction interrupted before seal; manual resolution or A04 resume required.', finished_at_utc=$now, updated_at_utc=$now, row_version=row_version+1 WHERE status='running';",
+            "UPDATE etl_runs SET status='blocked', finalize_conflict_code='INTERRUPTED_NO_CHECKPOINT', finalize_conflict_message='Extraction interrupted before seal; manual resolution or A04 resume required.', finished_at_utc=$now, extraction_claim_id=NULL, extraction_claim_owner_id=NULL, extraction_claim_acquired_at_utc=NULL, updated_at_utc=$now, row_version=row_version+1 WHERE status='running';",
             cancellationToken, ("$now", now)).ConfigureAwait(false);
+        claims += (int)extractionClaims;
         var entities = await ExecuteAsync(connection, transaction,
             "UPDATE etl_run_entities SET status='failed', last_error='RUN_INTERRUPTED', updated_at_utc=$now, row_version=row_version+1 WHERE status='extracting' AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code='INTERRUPTED_NO_CHECKPOINT');",
             cancellationToken, ("$now", now)).ConfigureAwait(false);
@@ -661,7 +745,7 @@ public sealed partial class SqliteAgentStore
 
     // ---------- shared internals ----------
 
-    private enum ClaimReadiness { Ready, Transient, Legacy, Violated }
+    private enum ClaimReadiness { Ready, Transient, Legacy, Violated, OwnershipMismatch }
 
     private sealed record RunRow(
         string Status,
@@ -744,22 +828,87 @@ public sealed partial class SqliteAgentStore
         return null;
     }
 
-    private static async Task<EtlBatchRegistrationRejection> ClassifyBatchRejectionAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string entityName, CancellationToken cancellationToken)
+    // Why a write-first fence rejected: the run is not mutable (missing/not running/
+    // sealed), the live extraction claim differs/absent, or the exact ownership set no
+    // longer holds — the ownership predicate is RE-EVALUATED here, never assumed, so an
+    // entity-level miss is not misreported as an ownership failure. Passed means every
+    // fence term held; the guarded write could then only have failed on the entity arm.
+    // All classification reads happen inside the rejected transaction — nothing was
+    // written.
+    private enum FenceFailure { NotMutable, ClaimLost, OwnershipMismatch, Passed }
+
+    private static async Task<FenceFailure> ClassifyRunFenceAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string claimText, CancellationToken cancellationToken)
     {
-        var runMutable = await ScalarLongAsync(connection, transaction,
-            "SELECT COUNT(*) FROM etl_runs WHERE run_id=$run AND status='running' AND sealed_at_utc IS NULL;",
-            cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
-        if (runMutable == 0) return EtlBatchRegistrationRejection.RunNotAcceptingBatches;
+        string? status = null;
+        string? sealedAt = null;
+        string? liveClaim = null;
+        await using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = "SELECT status,sealed_at_utc,extraction_claim_id FROM etl_runs WHERE run_id=$run;";
+            Add(read, "$run", runId.ToString("D"));
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                status = reader.GetString(0);
+                sealedAt = NullableString(reader, 1);
+                liveClaim = NullableString(reader, 2);
+            }
+        }
+        if (!string.Equals(status, "running", StringComparison.Ordinal) || sealedAt is not null)
+            return FenceFailure.NotMutable;
+        if (!string.Equals(liveClaim, claimText, StringComparison.Ordinal))
+            return FenceFailure.ClaimLost;
+        return await RunOwnershipSetHoldsAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false)
+            ? FenceFailure.Passed
+            : FenceFailure.OwnershipMismatch;
+    }
+
+    private static async Task<EtlEntityBeginRejection> ClassifyRunFenceRejectionAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string claimText, CancellationToken cancellationToken) =>
+        await ClassifyRunFenceAsync(connection, transaction, runId, claimText, cancellationToken).ConfigureAwait(false) switch
+        {
+            FenceFailure.NotMutable => EtlEntityBeginRejection.RunNotAcceptingEntities,
+            FenceFailure.ClaimLost => EtlEntityBeginRejection.ExtractionClaimLost,
+            // Passed is unreachable here — the begin fence IS status+claim+ownership — but
+            // a rejected write with every term holding is evidence-level, never success.
+            _ => EtlEntityBeginRejection.OwnershipSetMismatch,
+        };
+
+    private static async Task<EtlRunSealRejection> ClassifySealFenceRejectionAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string claimText, CancellationToken cancellationToken) =>
+        await ClassifyRunFenceAsync(connection, transaction, runId, claimText, cancellationToken).ConfigureAwait(false) switch
+        {
+            FenceFailure.NotMutable => EtlRunSealRejection.RunNotRunningOrAlreadySealed,
+            FenceFailure.ClaimLost => EtlRunSealRejection.ExtractionClaimLost,
+            _ => EtlRunSealRejection.OwnershipSetMismatch,
+        };
+
+    private static async Task<EtlBatchRegistrationRejection> ClassifyBatchRejectionAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string entityName, string claimText, CancellationToken cancellationToken)
+    {
+        var fence = await ClassifyRunFenceAsync(connection, transaction, runId, claimText, cancellationToken).ConfigureAwait(false);
+        if (fence == FenceFailure.NotMutable) return EtlBatchRegistrationRejection.RunNotAcceptingBatches;
+        if (fence == FenceFailure.ClaimLost) return EtlBatchRegistrationRejection.ExtractionClaimLost;
+        if (fence == FenceFailure.OwnershipMismatch) return EtlBatchRegistrationRejection.OwnershipSetMismatch;
         var entityStatus = await ScalarStringAsync(connection, transaction,
             "SELECT status FROM etl_run_entities WHERE run_id=$run AND entity_name=$entity;",
             cancellationToken, ("$run", runId.ToString("D")), ("$entity", entityName)).ConfigureAwait(false);
-        return string.Equals(entityStatus, "extracting", StringComparison.Ordinal)
-            ? EtlBatchRegistrationRejection.RunNotAcceptingBatches
-            : EtlBatchRegistrationRejection.EntityNotExtracting;
+        if (!string.Equals(entityStatus, "extracting", StringComparison.Ordinal)
+            || !await EntityOwnershipHoldsAsync(connection, transaction, runId, entityName, cancellationToken).ConfigureAwait(false))
+            return EtlBatchRegistrationRejection.EntityNotExtracting;
+        return EtlBatchRegistrationRejection.RunNotAcceptingBatches;
     }
 
-    private static async Task<EtlEntityCompletionRejection> ClassifyEntityCompletionRejectionAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string entityName, int expectedBatchCount, CancellationToken cancellationToken)
+    // The touched entity must itself be a manifest member with an epoch-bound active
+    // ownership row for this run — a stray injected 'extracting' row is not a
+    // legitimate extraction target even while the run's full ownership set holds.
+    private static async Task<bool> EntityOwnershipHoldsAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string entityName, CancellationToken cancellationToken) =>
+        await ScalarLongAsync(connection, transaction,
+            "SELECT COUNT(*) FROM etl_entity_ownership eo JOIN etl_run_ownership_bindings eb ON eb.run_id = eo.owner_run_id AND eb.entity_name = eo.entity_name WHERE eo.entity_name=$entity AND eo.owner_run_id=$run AND eo.released_at_utc IS NULL AND eb.expected_epoch > 0 AND eo.ownership_epoch = eb.expected_epoch;",
+            cancellationToken, ("$run", runId.ToString("D")), ("$entity", entityName)).ConfigureAwait(false) == 1;
+
+    private static async Task<EtlEntityCompletionRejection> ClassifyEntityCompletionRejectionAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string entityName, int expectedBatchCount, string claimText, CancellationToken cancellationToken)
     {
+        // Entity state outranks run/claim/ownership classification — same precedence the
+        // pre-O1 classifier used (a 'done' entity on a sealed run is EntityNotExtracting).
         string? entityStatus = null;
         long? entityBatches = null;
         await using (var read = connection.CreateCommand())
@@ -775,29 +924,46 @@ public sealed partial class SqliteAgentStore
             }
         }
         if (!string.Equals(entityStatus, "extracting", StringComparison.Ordinal)) return EtlEntityCompletionRejection.EntityNotExtracting;
-        var runMutable = await ScalarLongAsync(connection, transaction,
-            "SELECT COUNT(*) FROM etl_runs WHERE run_id=$run AND status='running' AND sealed_at_utc IS NULL;",
-            cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
-        if (runMutable == 0) return EtlEntityCompletionRejection.RunNotAcceptingEntities;
+        var fence = await ClassifyRunFenceAsync(connection, transaction, runId, claimText, cancellationToken).ConfigureAwait(false);
+        if (fence == FenceFailure.NotMutable) return EtlEntityCompletionRejection.RunNotAcceptingEntities;
+        if (fence == FenceFailure.ClaimLost) return EtlEntityCompletionRejection.ExtractionClaimLost;
+        if (fence == FenceFailure.OwnershipMismatch) return EtlEntityCompletionRejection.OwnershipSetMismatch;
+        if (!await EntityOwnershipHoldsAsync(connection, transaction, runId, entityName, cancellationToken).ConfigureAwait(false))
+            return EtlEntityCompletionRejection.EntityNotExtracting;
         return entityBatches == expectedBatchCount ? EtlEntityCompletionRejection.RunNotAcceptingEntities : EtlEntityCompletionRejection.BatchCountMismatch;
     }
 
-    private async Task<EtlRunTerminationOutcome> TerminateRunAsync(Guid runId, string status, string? conflictCode, string message, string batchError, CancellationToken cancellationToken)
+    private async Task<EtlRunTerminationOutcome> TerminateRunAsync(Guid runId, Guid extractionClaimId, string status, string? conflictCode, string message, string batchError, CancellationToken cancellationToken)
     {
+        if (extractionClaimId == Guid.Empty) throw new ArgumentException("An extraction claim identity is required.", nameof(extractionClaimId));
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
         var now = UtcNow();
-        // Guarded on 'running': fail/block can never mutate a sealed, completing, or
-        // terminal run. Fencing pending batches bounds FUTURE local dispatch only — a
-        // batch mid-POST can still land at ERP; the status flip cannot recall it.
+        var claimText = extractionClaimId.ToString("D");
+        // Guarded on 'running' AND the live extraction claim: fail/block can never
+        // mutate a sealed, completing, or terminal run, and a stale/foreign claim can
+        // never terminate a newer execution. The ownership set is deliberately NOT
+        // part of this gate — termination with the current claim preserves/blocks a
+        // run whose ownership evidence is corrupted; it never releases ownership.
+        // Fencing pending batches bounds FUTURE local dispatch only — a batch mid-POST
+        // can still land at ERP; the status flip cannot recall it.
         var changed = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_runs SET status=$status, finished_at_utc=$now, last_error=$message, error_count=error_count+1, finalize_conflict_code=$code, finalize_conflict_message=$message, updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status='running';",
+            "UPDATE etl_runs SET status=$status, finished_at_utc=$now, last_error=$message, error_count=error_count+1, finalize_conflict_code=$code, finalize_conflict_message=$message, extraction_claim_id=NULL, extraction_claim_owner_id=NULL, extraction_claim_acquired_at_utc=NULL, updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status='running' AND extraction_claim_id=$claim;",
             cancellationToken,
-            ("$status", status), ("$now", now), ("$message", message), ("$code", conflictCode), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+            ("$status", status), ("$now", now), ("$message", message), ("$code", conflictCode), ("$run", runId.ToString("D")), ("$claim", claimText)).ConfigureAwait(false);
         if (changed == 0)
         {
+            // Zero writes either way: distinguish a stale/foreign/absent claim on a
+            // still-running run from a run that is not running at all.
+            var stillRunning = await ScalarLongAsync(connection, transaction,
+                "SELECT COUNT(*) FROM etl_runs WHERE run_id=$run AND status='running' AND extraction_claim_id IS NOT NULL AND extraction_claim_id <> $claim;",
+                cancellationToken, ("$run", runId.ToString("D")), ("$claim", claimText)).ConfigureAwait(false);
+            var claimCleared = await ScalarLongAsync(connection, transaction,
+                "SELECT COUNT(*) FROM etl_runs WHERE run_id=$run AND status='running' AND extraction_claim_id IS NULL;",
+                cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlRunTerminationOutcome.Rejected(EtlRunTerminationRejection.RunNotRunning);
+            return new EtlRunTerminationOutcome.Rejected(
+                stillRunning != 0 || claimCleared != 0 ? EtlRunTerminationRejection.ExtractionClaimLost : EtlRunTerminationRejection.RunNotRunning);
         }
 
         await ExecuteAsync(connection, transaction,
@@ -848,6 +1014,16 @@ public sealed partial class SqliteAgentStore
         if (run.SealedExpectedBatchCount != expectedTotal) return ClaimReadiness.Violated;
         if (run.RowsRead != rowsTotal) return ClaimReadiness.Violated;
 
+        // Completion/finalize require the exact three-way ownership equality in the same
+        // transaction BEFORE the transient in-flight check: a run whose manifest no
+        // longer equals its bindings/active ownership rows at the bound positive epochs
+        // is corrupt durable evidence — it must block OWNERSHIP_SET_MISMATCH (and its
+        // still-pending batches are dead-lettered by the block), never wait as
+        // 'transient' while broken. Missing, extra, released, foreign or wrong-epoch
+        // ownership is a violation — never silently released or adopted.
+        if (!await RunOwnershipSetHoldsAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false))
+            return ClaimReadiness.OwnershipMismatch;
+
         var nonAcknowledged = await ScalarLongAsync(connection, transaction,
             "SELECT COUNT(*) FROM etl_batches WHERE run_id=$run AND status <> 'acknowledged';",
             cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
@@ -865,15 +1041,22 @@ public sealed partial class SqliteAgentStore
         return ClaimReadiness.Ready;
     }
 
-    private static async Task<bool> VerifyFinalSealAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, RunRow run, CancellationToken cancellationToken)
+    // Returns NULL when the seal+ownership evidence is intact, otherwise the durable
+    // conflict code to block with (SEAL_VIOLATED or OWNERSHIP_SET_MISMATCH).
+    private static async Task<string?> VerifyFinalSealAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, RunRow run, CancellationToken cancellationToken)
     {
         // The immutable payload must still be the exact stored body for THIS run — the
         // claim fence alone never proves the payload was not replaced behind the API.
-        if (run.CompletePayloadJson is null || !IsValidCompletePayload(run.CompletePayloadJson, runId, run)) return false;
+        if (run.CompletePayloadJson is null || !IsValidCompletePayload(run.CompletePayloadJson, runId, run)) return "SEAL_VIOLATED";
         var readiness = await VerifyClaimReadinessAsync(connection, transaction, runId, run, cancellationToken).ConfigureAwait(false);
         // A transient gap at finalize means the acknowledged evidence changed after the
         // claim — that is a violation of the claimed state, not a reason to wait.
-        return readiness == ClaimReadiness.Ready;
+        return readiness switch
+        {
+            ClaimReadiness.Ready => null,
+            ClaimReadiness.OwnershipMismatch => "OWNERSHIP_SET_MISMATCH",
+            _ => "SEAL_VIOLATED",
+        };
     }
 
     // Classification after a lost claim write: only a released, due 'completing' run
@@ -1001,6 +1184,7 @@ public sealed partial class SqliteAgentStore
             UPDATE etl_runs SET status='blocked', finished_at_utc=$now, last_error=$message,
                 finalize_conflict_code=$code, finalize_conflict_message=$message,
                 completion_claim_id=NULL, completion_claim_owner_id=NULL, completion_claim_acquired_at_utc=NULL,
+                extraction_claim_id=NULL, extraction_claim_owner_id=NULL, extraction_claim_acquired_at_utc=NULL,
                 updated_at_utc=$now, row_version=row_version+1
             WHERE run_id=$run;
             """, cancellationToken,
@@ -1008,6 +1192,13 @@ public sealed partial class SqliteAgentStore
         await ExecuteAsync(connection, transaction,
             "UPDATE etl_jobs SET status='blocked', updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status NOT IN ('finished','cancelled','blocked');",
             cancellationToken, ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+        // Fence FUTURE batch dispatch: any batch still pre-acknowledgement becomes
+        // dead_letter inside the same commit. This claims nothing and cannot recall an
+        // in-flight HTTP upload — it only guarantees no new local send is dispatched
+        // for a blocked run. Ownership rows/bindings are retained.
+        await ExecuteAsync(connection, transaction,
+            "UPDATE etl_batches SET status='dead_letter', last_error=$error WHERE run_id=$run AND status IN ('creating','ready','retry_waiting','uploading');",
+            cancellationToken, ("$error", code), ("$run", runId.ToString("D"))).ConfigureAwait(false);
     }
 
     private static async Task<string> ClassifyCasConflictAsync(SqliteConnection connection, SqliteTransaction transaction, EntityRow entity, CancellationToken cancellationToken)
