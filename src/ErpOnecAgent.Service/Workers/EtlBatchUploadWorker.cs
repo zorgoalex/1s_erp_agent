@@ -44,7 +44,7 @@ public sealed class EtlBatchUploadWorker(IAgentStore store, ISpoolStore spool, I
         {
             await using var content = await spool.OpenReadAsync(batch, cancellationToken).ConfigureAwait(false);
             var acknowledgement = await erp.UploadBatchAsync(batch, content, cancellationToken).ConfigureAwait(false);
-            if (acknowledgement.BatchId != batch.BatchId || !acknowledgement.ChecksumValid || acknowledgement.RowsAccepted != batch.RowCount)
+            if (acknowledgement.BatchId != batch.BatchId || !string.Equals(acknowledgement.Status, "acknowledged", StringComparison.Ordinal) || !acknowledgement.ChecksumValid || acknowledgement.RowsAccepted != batch.RowCount)
                 throw new InvalidDataException("ERP ETL acknowledgement does not match the uploaded batch.");
             await store.AcknowledgeBatchAsync(batch.BatchId, acknowledgement.AcknowledgedAtUtc, cancellationToken).ConfigureAwait(false);
             logger.LogInformation("ETL_BATCH_ACKNOWLEDGED BatchId={BatchId} Rows={Rows}", batch.BatchId, batch.RowCount);
