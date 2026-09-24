@@ -2,19 +2,31 @@ using ErpOnecAgent.Domain.Agent;
 
 namespace ErpOnecAgent.Service.Runtime;
 
+/// <param name="CompatibilityRejected">
+/// A07b B6: latched only by an EXPLICIT ERP compatibility rejection (accepted:false or a parsed
+/// minimumAgentVersion above the running binary). It denies new-work admission
+/// (<see cref="CanLeaseCommands"/>/<see cref="CanExecuteCommands"/>) and extraction
+/// (<see cref="CanExtract"/>) but never gates resolution of already-sent work, result delivery, or
+/// batch upload/run completion — those stay governed by readiness alone. Cleared only by a later
+/// accepted version-compatible handshake; unknown before the first handshake keeps the baseline
+/// admitted-work policy. In-memory only: the latch is intentionally not durable across restart.
+/// </param>
 public sealed record AgentModeSnapshot(
     bool IsReady,
     bool LocalEtlPaused,
     AgentMode RemoteMode,
     bool HandshakeMaintenance,
+    bool CompatibilityRejected,
     AgentMode EffectiveMode)
 {
     public bool CanLeaseCommands => IsReady
         && !HandshakeMaintenance
+        && !CompatibilityRejected
         && RemoteMode is not (AgentMode.PauseCommands or AgentMode.Drain or AgentMode.Maintenance or AgentMode.Disabled);
 
     public bool CanExecuteCommands => IsReady
         && !HandshakeMaintenance
+        && !CompatibilityRejected
         && RemoteMode is not (AgentMode.PauseCommands or AgentMode.Maintenance or AgentMode.Disabled);
 
     /// <summary>
@@ -29,6 +41,7 @@ public sealed record AgentModeSnapshot(
     public bool CanExtract => IsReady
         && !LocalEtlPaused
         && !HandshakeMaintenance
+        && !CompatibilityRejected
         && RemoteMode is not (AgentMode.PauseEtl or AgentMode.Maintenance or AgentMode.Disabled);
 
     public bool CanDeliverResults => IsReady;
@@ -43,6 +56,7 @@ public sealed class AgentRuntimeState
     private bool _localEtlPaused;
     private AgentMode _remoteMode = AgentMode.Normal;
     private bool _handshakeMaintenance;
+    private bool _compatibilityRejected;
     private bool _ready;
 
     public AgentMode Mode => Snapshot.EffectiveMode;
@@ -111,6 +125,34 @@ public sealed class AgentRuntimeState
         }
     }
 
+    /// <summary>
+    /// A07b B6: publishes one accepted, version-compatible handshake response coherently — clears
+    /// the compatibility rejection and applies THIS response's maintenance flag under the same
+    /// lock, so no snapshot ever shows a transient lifting of all restrictions. The local ETL
+    /// pause and remote mode inputs are never touched.
+    /// </summary>
+    public void ApplyCompatibleHandshake(bool maintenanceMode)
+    {
+        lock (_modeGate)
+        {
+            _compatibilityRejected = false;
+            _handshakeMaintenance = maintenanceMode;
+        }
+    }
+
+    /// <summary>
+    /// A07b B6: latches an explicit ERP compatibility rejection (accepted:false or a parsed
+    /// minimumAgentVersion above the running binary). Other mode inputs are untouched; the latch
+    /// is cleared only by <see cref="ApplyCompatibleHandshake"/>.
+    /// </summary>
+    public void LatchCompatibilityRejection()
+    {
+        lock (_modeGate)
+        {
+            _compatibilityRejected = true;
+        }
+    }
+
     public void CompleteBootstrap()
     {
         lock (_modeGate)
@@ -135,7 +177,7 @@ public sealed class AgentRuntimeState
     private AgentModeSnapshot CreateSnapshot()
     {
         var effectiveMode = ComposeEffectiveMode();
-        return new(_ready, _localEtlPaused, _remoteMode, _handshakeMaintenance, effectiveMode);
+        return new(_ready, _localEtlPaused, _remoteMode, _handshakeMaintenance, _compatibilityRejected, effectiveMode);
     }
 
     private AgentMode ComposeEffectiveMode()

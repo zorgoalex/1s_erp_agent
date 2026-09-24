@@ -29,7 +29,10 @@ public sealed class HeartbeatWorker(
             }
             try
             {
-                await sessions.GetSessionAsync(stoppingToken).ConfigureAwait(false);
+                // A07b B6 (TZ §30.2): the heartbeat request carries agentId and no sessionId, so it
+                // must never wait on the handshake — an explicit compatibility rejection or a hung
+                // GetSessionAsync would otherwise suppress the only signal ERP has to observe the
+                // incompatible agent. Compatibility state itself arrives via the session/config path.
                 var queues = await store.GetQueueMetricsAsync(stoppingToken).ConfigureAwait(false);
                 var metrics = await metricsCollector.CaptureAsync(stoppingToken).ConfigureAwait(false);
                 DateTimeOffset? certificateExpiry = null;
@@ -53,7 +56,12 @@ public sealed class HeartbeatWorker(
 
     private static string GetHealthState(AgentRuntimeState state, AgentMetrics metrics, StorageOptions storage)
     {
-        if (state.EffectiveMode is Domain.Agent.AgentMode.Maintenance or Domain.Agent.AgentMode.Disabled) return "maintenance";
+        var snapshot = state.Snapshot;
+        // incompatible_version outranks maintenance/storage/degraded: while an explicit rejection
+        // is latched it is the only signal that explains why admission is off and why the operator
+        // must act (TZ §30.2); the other states become observable again after a compatible handshake.
+        if (snapshot.CompatibilityRejected) return "incompatible_version";
+        if (snapshot.EffectiveMode is Domain.Agent.AgentMode.Maintenance or Domain.Agent.AgentMode.Disabled) return "maintenance";
         if (metrics.SqliteSizeBytes >= storage.MaxSqliteBytes || metrics.SpoolSizeBytes >= storage.MaxSpoolBytes || metrics.DiskFreeBytes <= storage.MinimumReservedBytesForCommands) return "storage_critical";
         if (!state.OnecCommandApiAvailable && !state.OnecODataAvailable) return "offline_onec";
         if (!state.OnecCommandApiAvailable || !state.OnecODataAvailable) return "degraded";
