@@ -48,10 +48,18 @@ public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, Sq
         cancellationToken.ThrowIfCancellationRequested();
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? throw new InvalidOperationException("Backup path has no directory."));
         await using var source = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
-        var builder = new SqliteConnectionStringBuilder { DataSource = destinationPath, Mode = SqliteOpenMode.ReadWriteCreate };
+        // Unpooled: a pooled connection would keep the backup file open, so it could not be
+        // verified, renamed or rotated away later in the same process.
+        var builder = new SqliteConnectionStringBuilder { DataSource = destinationPath, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false };
         await using var destination = new SqliteConnection(builder.ToString());
         await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
         source.BackupDatabase(destination);
+        // The copy inherits the WAL flag from page 1. As a rollback-journal file it is one
+        // self-contained file: a read-only verify creates no -wal/-shm sidecars, and rename and
+        // rotation move everything. A restored copy is switched back to WAL by the migrator.
+        await using var journal = destination.CreateCommand();
+        journal.CommandText = "PRAGMA journal_mode=DELETE;";
+        await journal.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task RunMaintenanceAsync(CancellationToken cancellationToken)
