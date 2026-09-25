@@ -23,6 +23,7 @@ public sealed class MigrationChecksumCatalogTests
     private const string V6Crlf = "1634CFEB915BB7530F911104267575AF158F3446D828297D775FAA8693D3166A";
     private const string V7Published = "8F4DBACBEE7C66603AD296C53182E8E108F680B7DA37FF5612345204D58B8658";
     private const string V9Published = "C9A69671C4DE9471C03E073E6796D4F9C5C3BB18F03583FF3AE1B30964A9ED07";
+    private const string V10Published = "AED834B63AC9051690F9DEFDD253A0BD003B026416BDF93934C536AC464DFE20";
 
     [Fact]
     public void Cataloged_resource_variants_resolve_to_canonical_published_checksum()
@@ -32,6 +33,7 @@ public sealed class MigrationChecksumCatalogTests
         Assert.Equal(V1Published, MigrationChecksumCatalog.ResolveRecordedChecksum(1, "001_initial.sql", V1Published));
         Assert.Equal(V7Published, MigrationChecksumCatalog.ResolveRecordedChecksum(7, "007_etl_ownership.sql", V7Published));
         Assert.Equal(V9Published, MigrationChecksumCatalog.ResolveRecordedChecksum(9, "009_etl_scheduled_runs.sql", V9Published));
+        Assert.Equal(V10Published, MigrationChecksumCatalog.ResolveRecordedChecksum(10, "010_etl_run_resolutions.sql", V10Published));
     }
 
     [Fact]
@@ -52,7 +54,7 @@ public sealed class MigrationChecksumCatalogTests
     public void Unlisted_version_uses_raw_resource_checksum()
     {
         var raw = Hash("future-migration");
-        Assert.Equal(raw, MigrationChecksumCatalog.ResolveRecordedChecksum(10, "010_future.sql", raw));
+        Assert.Equal(raw, MigrationChecksumCatalog.ResolveRecordedChecksum(11, "011_future.sql", raw));
     }
 
     [Fact]
@@ -85,8 +87,8 @@ public sealed class MigrationChecksumCatalogTests
     public void Stored_checksum_for_unlisted_version_must_equal_raw_resource_checksum()
     {
         var raw = Hash("future-migration");
-        Assert.True(MigrationChecksumCatalog.IsAcceptedStoredChecksum(10, "010_future.sql", raw, raw));
-        Assert.False(MigrationChecksumCatalog.IsAcceptedStoredChecksum(10, "010_future.sql", raw, V2Published));
+        Assert.True(MigrationChecksumCatalog.IsAcceptedStoredChecksum(11, "011_future.sql", raw, raw));
+        Assert.False(MigrationChecksumCatalog.IsAcceptedStoredChecksum(11, "011_future.sql", raw, V2Published));
     }
 
     [Fact]
@@ -94,13 +96,13 @@ public sealed class MigrationChecksumCatalogTests
     {
         // The cataloged approved hashes must be exactly the hashes this build's
         // embedded resources produce — and vice versa, every embedded migration
-        // 001-009 must be cataloged and approved.
+        // 001-010 must be cataloged and approved.
         var assembly = typeof(SqliteMigrator).Assembly;
         var resources = assembly.GetManifestResourceNames()
             .Where(static name => name.Contains(".Persistence.Migrations.", StringComparison.Ordinal) && name.EndsWith(".sql", StringComparison.Ordinal))
             .OrderBy(static name => name, StringComparer.Ordinal)
             .ToArray();
-        Assert.Equal(9, resources.Length);
+        Assert.Equal(10, resources.Length);
 
         foreach (var resource in resources)
         {

@@ -173,6 +173,21 @@ public interface IAgentStore
     /// </summary>
     Task<IReadOnlyList<EtlDueScheduledRun>> GetDueScheduledRunsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// R1 (§8): attested manual resolution of a failed or blocked ETL run. Durable
+    /// preconditions are verified in the transaction: the run is failed/blocked, no send
+    /// attempt of its batches is 'admitted', no batch is 'uploading', no extraction or
+    /// completion claim is live, and its job is not pending/deferred/running. A legacy
+    /// ledger-less send whose batch a block already dead-lettered is not durably visible —
+    /// until cutover it rests on the workers-quiesced attestation. The request
+    /// must attest that workers were stopped and drained and state the remote verification
+    /// (invalid requests throw <see cref="ArgumentException"/>). One commit writes the
+    /// immutable resolution record and resolved_at_utc, fences remaining pre-acknowledgement
+    /// batches and releases the run's epoch-bound ownership ('manual_release'); watermarks
+    /// and the job's blocked status are untouched. A resolved run releases its schedule key.
+    /// </summary>
+    Task<EtlRunResolutionOutcome> ResolveEtlRunAsync(EtlRunResolutionRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
     Task CreateEtlRunAsync(EtlRun run, CancellationToken cancellationToken);
     Task RegisterBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
     Task MarkEtlRunExtractedAsync(Guid runId, CancellationToken cancellationToken);

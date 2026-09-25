@@ -28,7 +28,7 @@ public sealed class MigrationChecksumPortabilityTests : IAsyncLifetime
         "001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql",
         "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql",
         "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql",
-        "009_etl_scheduled_runs.sql"
+        "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql"
     ];
 
     // SHA-256 of the published git-blob (LF) bytes for each migration, from
@@ -43,7 +43,8 @@ public sealed class MigrationChecksumPortabilityTests : IAsyncLifetime
         "D1B20CE29BC87A9F962BD9842E5C2D613704540326D5F10AA2796CC85EBA6FB3",
         "8F4DBACBEE7C66603AD296C53182E8E108F680B7DA37FF5612345204D58B8658",
         "2984DC879A62064E03F76CA1F2369DEF62DDBD21C2231F382F5583EFB1C2F373",
-        "C9A69671C4DE9471C03E073E6796D4F9C5C3BB18F03583FF3AE1B30964A9ED07"
+        "C9A69671C4DE9471C03E073E6796D4F9C5C3BB18F03583FF3AE1B30964A9ED07",
+        "AED834B63AC9051690F9DEFDD253A0BD003B026416BDF93934C536AC464DFE20"
     ];
 
     // SHA-256 of the historical CRLF checkout bytes for the four migrations that
@@ -94,16 +95,18 @@ public sealed class MigrationChecksumPortabilityTests : IAsyncLifetime
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(9, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
-        // Existing LF ledger rows retained unchanged; only the v7-v9 rows were appended.
+        Assert.Equal(10, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        // Existing LF ledger rows retained unchanged; only the v7-v10 rows were appended.
         Assert.Equal(ledgerBefore, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=6 ORDER BY version;"));
-        Assert.Equal(ledgerBefore.Count + 3, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(ledgerBefore.Count + 4, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal(PublishedLfChecksums[6], await ChecksumForVersionAsync(7));
         Assert.Equal(PublishedLfChecksums[7], await ChecksumForVersionAsync(8));
         Assert.Equal(PublishedLfChecksums[8], await ChecksumForVersionAsync(9));
+        Assert.Equal(PublishedLfChecksums[9], await ChecksumForVersionAsync(10));
         Assert.Equal("007_etl_ownership.sql", await NameForVersionAsync(7));
         Assert.Equal("008_etl_send_attempts.sql", await NameForVersionAsync(8));
         Assert.Equal("009_etl_scheduled_runs.sql", await NameForVersionAsync(9));
+        Assert.Equal("010_etl_run_resolutions.sql", await NameForVersionAsync(10));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(jobsBefore, await SnapshotRowsAsync("SELECT job_id,status FROM etl_jobs ORDER BY job_id;"));
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM etl_jobs WHERE status='pending'"));
@@ -137,16 +140,17 @@ public sealed class MigrationChecksumPortabilityTests : IAsyncLifetime
         Assert.Equal(PublishedLfChecksums[6], await ChecksumForVersionAsync(7));
         Assert.Equal(PublishedLfChecksums[7], await ChecksumForVersionAsync(8));
         Assert.Equal(PublishedLfChecksums[8], await ChecksumForVersionAsync(9));
+        Assert.Equal(PublishedLfChecksums[9], await ChecksumForVersionAsync(10));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
     }
 
     [Fact]
-    public async Task Fresh_apply_records_canonical_published_checksums_for_001_009()
+    public async Task Fresh_apply_records_canonical_published_checksums_for_001_010()
     {
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(9, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
-        for (var version = 1; version <= 9; version++)
+        Assert.Equal(10, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        for (var version = 1; version <= 10; version++)
         {
             Assert.Equal(PublishedLfChecksums[version - 1], await ChecksumForVersionAsync(version));
             Assert.Equal(Names[version - 1], await NameForVersionAsync(version));
@@ -232,12 +236,12 @@ public sealed class MigrationChecksumPortabilityTests : IAsyncLifetime
     }
 
     [Fact]
-    public void Migration_resource_bytes_001_through_009_are_sha256_pinned_to_the_published_catalog()
+    public void Migration_resource_bytes_001_through_010_are_sha256_pinned_to_the_published_catalog()
     {
         // Every shipped migration file is immutable — its raw bytes hash to the published
         // canonical LF checksum, or (only for 002/003/005/006) to the known historical
-        // CRLF variant of a pre-.gitattributes checkout. 008 and 009 have no CRLF variant
-        // and must be byte-exact LF in every checkout.
+        // CRLF variant of a pre-.gitattributes checkout. 008, 009 and 010 have no CRLF
+        // variant and must be byte-exact LF in every checkout.
         for (var index = 0; index < Names.Length; index++)
         {
             var version = index + 1;
@@ -247,6 +251,7 @@ public sealed class MigrationChecksumPortabilityTests : IAsyncLifetime
         }
         Assert.Equal(PublishedLfChecksums[7], _resourceChecksums[7]);
         Assert.Equal(PublishedLfChecksums[8], _resourceChecksums[8]);
+        Assert.Equal(PublishedLfChecksums[9], _resourceChecksums[9]);
     }
 
     private async Task SeedLedgerAsync(int throughVersion, Func<int, string> checksumFor)

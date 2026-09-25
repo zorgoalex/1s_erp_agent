@@ -8,19 +8,21 @@ using Xunit;
 namespace ErpOnecAgent.IntegrationTests;
 
 /// <summary>
-/// Migration 009 (etl_runs.schedule_key + etl_runs.resolved_entities_json +
-/// ux_etl_runs_schedule_active) on a populated REAL v8 database: every pre-existing
-/// row survives byte-identical — including the live 'admitted' send attempt fencing
-/// an in-flight 'uploading' batch, the blocked run with retained ownership evidence,
-/// and released/finalized ownership — while the new run columns take NULL on every
-/// existing row and the partial unique index arrives enforcing exactly one active or
-/// unresolved run per schedule key. Checksums 1-9 are recorded canonically and an
-/// idempotent rerun is a no-op.
+/// Migration 010 (etl_run_resolutions — the immutable attested-resolution record
+/// table, design §8 slice R1) on a populated REAL v9 database: every pre-existing
+/// row survives byte-identical — including the scheduled runs (pending / running /
+/// blocked-unresolved / succeeded) holding their schedule keys and frozen resolved
+/// definitions, the failed and blocked manual runs with retained ownership and
+/// bindings, the live 'admitted' send attempt fencing an in-flight 'uploading'
+/// batch, and released/finalized ownership — while etl_run_resolutions is created
+/// EMPTY with its full CHECK domain (decision set, workers_quiesced=1, prior_status
+/// failed|blocked, non-blank attestations, non-negative counts) and the FK to
+/// etl_runs. Checksums 1-10 are recorded canonically and an idempotent rerun is a
+/// no-op.
 /// </summary>
-public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
+public sealed class EtlRunResolutionsMigrationTests : IAsyncLifetime
 {
-    private const string RunColumnsV8 = "run_id,mode,requested_entities_json,status,started_at_utc,finished_at_utc,rows_read,batches_created,batches_acknowledged,error_count,last_error,configuration_version,created_at_utc,updated_at_utc,row_version,sealed_at_utc,sealed_entity_count,sealed_expected_batch_count,completion_claim_id,completion_claim_owner_id,completion_claim_acquired_at_utc,completion_attempt_count,completion_max_attempts,next_completion_attempt_at_utc,complete_payload_json,completion_acknowledged_at_utc,finalize_conflict_code,finalize_conflict_message,resolved_at_utc,extraction_claim_id,extraction_claim_owner_id,extraction_claim_acquired_at_utc";
-    private const string BatchColumnsV8 = "batch_id,run_id,entity_name,schema_version,file_path,status,row_count,watermark_from_json,watermark_to_json,sha256,compressed_size,uncompressed_size,attempt_count,next_attempt_at_utc,created_at_utc,acknowledged_at_utc,last_error,send_attempt_id,upload_max_attempts,quarantine_code,row_version";
+    private const string RunColumnsV9 = "run_id,mode,requested_entities_json,status,started_at_utc,finished_at_utc,rows_read,batches_created,batches_acknowledged,error_count,last_error,configuration_version,created_at_utc,updated_at_utc,row_version,sealed_at_utc,sealed_entity_count,sealed_expected_batch_count,completion_claim_id,completion_claim_owner_id,completion_claim_acquired_at_utc,completion_attempt_count,completion_max_attempts,next_completion_attempt_at_utc,complete_payload_json,completion_acknowledged_at_utc,finalize_conflict_code,finalize_conflict_message,resolved_at_utc,extraction_claim_id,extraction_claim_owner_id,extraction_claim_acquired_at_utc,schedule_key,resolved_entities_json";
 
     private readonly SqliteTestDatabase _database = new();
     private SqliteConnectionFactory _factory = null!;
@@ -39,18 +41,18 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
         _factory = _database.CreateFactory(Path.Combine("data", "agent.db"));
         _migrator = new SqliteMigrator(_factory);
 
-        // Seed an actual v8 database: 001-008 schema + correct v1-v8 ledger rows + the
-        // populated v8 fixture (ledgered sends, in-flight admitted attempt, retained
-        // ownership, quarantine codes).
+        // Seed an actual v9 database: 001-009 schema + correct v1-v9 ledger rows + the
+        // populated v9 fixture (scheduled runs in every key-holding position, failed
+        // and blocked runs with retained ownership, ledgered send evidence).
         await using (var connection = await _factory.OpenAsync(CancellationToken.None))
         {
             await ExecuteAsync(connection, "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at_utc TEXT NOT NULL);");
-            for (var index = 0; index < 8; index++)
+            for (var index = 0; index < 9; index++)
             {
                 await ExecuteAsync(connection, _migrationSql[index]);
                 await InsertLedgerAsync(connection, index + 1, names[index], _migrationSql[index]);
             }
-            await ExecuteAsync(connection, await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Fixtures", "v8-populated", "populated-v8.sql")));
+            await ExecuteAsync(connection, await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Fixtures", "v9-populated", "populated-v9.sql")));
         }
         await SqliteTestDatabase.ClearPoolAsync(_factory);
     }
@@ -61,15 +63,15 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Populated_v8_database_upgrades_additively_preserving_every_row_and_evidence()
+    public async Task Populated_v9_database_upgrades_additively_preserving_every_row_and_evidence()
     {
         var commandsBefore = await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;");
         var attemptsBefore = await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;");
         var outboxBefore = await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;");
         var jobsBefore = await SnapshotRowsAsync("SELECT * FROM etl_jobs ORDER BY job_id;");
-        var runsBefore = await SnapshotRowsAsync($"SELECT {RunColumnsV8} FROM etl_runs ORDER BY run_id;");
+        var runsBefore = await SnapshotRowsAsync($"SELECT {RunColumnsV9} FROM etl_runs ORDER BY run_id;");
         var entitiesBefore = await SnapshotRowsAsync("SELECT * FROM etl_run_entities ORDER BY run_id, entity_name;");
-        var batchesBefore = await SnapshotRowsAsync($"SELECT {BatchColumnsV8} FROM etl_batches ORDER BY batch_id;");
+        var batchesBefore = await SnapshotRowsAsync("SELECT * FROM etl_batches ORDER BY batch_id;");
         var sendAttemptsBefore = await SnapshotRowsAsync("SELECT * FROM etl_batch_send_attempts ORDER BY attempt_id;");
         var ownershipBefore = await SnapshotRowsAsync("SELECT * FROM etl_entity_ownership ORDER BY entity_name;");
         var bindingsBefore = await SnapshotRowsAsync("SELECT * FROM etl_run_ownership_bindings ORDER BY run_id, entity_name;");
@@ -77,21 +79,22 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
         var stateBefore = await SnapshotRowsAsync("SELECT * FROM agent_state ORDER BY key;");
         var snapshotsBefore = await SnapshotRowsAsync("SELECT * FROM config_snapshots ORDER BY config_version;");
         var conflictsBefore = await SnapshotRowsAsync("SELECT * FROM command_payload_conflicts ORDER BY event_id;");
-        var ledgerBefore = await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=8 ORDER BY version;");
+        var ledgerBefore = await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=9 ORDER BY version;");
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
         Assert.Equal(10, SqliteMigrator.CurrentSchemaVersion);
         Assert.Equal(10, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
-        // Every pre-existing row in every table survives byte-identical — the live
-        // 'admitted' attempt row, the in-flight 'uploading' batch, retained ownership.
+        // Every pre-existing row in every table survives byte-identical — the scheduled
+        // runs with their keys and frozen identity, the unresolved failed/blocked runs,
+        // the live 'admitted' attempt row, retained + released ownership, bindings.
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(attemptsBefore, await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;"));
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
         Assert.Equal(jobsBefore, await SnapshotRowsAsync("SELECT * FROM etl_jobs ORDER BY job_id;"));
-        Assert.Equal(runsBefore, await SnapshotRowsAsync($"SELECT {RunColumnsV8} FROM etl_runs ORDER BY run_id;"));
+        Assert.Equal(runsBefore, await SnapshotRowsAsync($"SELECT {RunColumnsV9} FROM etl_runs ORDER BY run_id;"));
         Assert.Equal(entitiesBefore, await SnapshotRowsAsync("SELECT * FROM etl_run_entities ORDER BY run_id, entity_name;"));
-        Assert.Equal(batchesBefore, await SnapshotRowsAsync($"SELECT {BatchColumnsV8} FROM etl_batches ORDER BY batch_id;"));
+        Assert.Equal(batchesBefore, await SnapshotRowsAsync("SELECT * FROM etl_batches ORDER BY batch_id;"));
         Assert.Equal(sendAttemptsBefore, await SnapshotRowsAsync("SELECT * FROM etl_batch_send_attempts ORDER BY attempt_id;"));
         Assert.Equal(ownershipBefore, await SnapshotRowsAsync("SELECT * FROM etl_entity_ownership ORDER BY entity_name;"));
         Assert.Equal(bindingsBefore, await SnapshotRowsAsync("SELECT * FROM etl_run_ownership_bindings ORDER BY run_id, entity_name;"));
@@ -99,16 +102,18 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
         Assert.Equal(stateBefore, await SnapshotRowsAsync("SELECT * FROM agent_state ORDER BY key;"));
         Assert.Equal(snapshotsBefore, await SnapshotRowsAsync("SELECT * FROM config_snapshots ORDER BY config_version;"));
         Assert.Equal(conflictsBefore, await SnapshotRowsAsync("SELECT * FROM command_payload_conflicts ORDER BY event_id;"));
-        Assert.Equal(ledgerBefore, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=8 ORDER BY version;"));
+        Assert.Equal(ledgerBefore, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=9 ORDER BY version;"));
 
-        // Additive run columns take NULL on every pre-existing row — no row is
-        // retroactively attributed to a schedule or a frozen resolved definition set.
-        Assert.Equal(6, await CountAsync("SELECT COUNT(*) FROM etl_runs"));
-        Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE schedule_key IS NOT NULL OR resolved_entities_json IS NOT NULL"));
-
-        // The partial unique index exists — UNIQUE and partial, exactly as declared.
-        Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='ux_etl_runs_schedule_active'"));
-        Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM pragma_index_list('etl_runs') WHERE name='ux_etl_runs_schedule_active' AND \"unique\"=1 AND partial=1"));
+        // The resolutions table exists and is EMPTY — no pre-010 run is ever
+        // retroactively attributed a resolution, even the failed/blocked ones.
+        Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='etl_run_resolutions'"));
+        Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM etl_run_resolutions"));
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM etl_runs"));
+        Assert.Equal(4, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE schedule_key IS NOT NULL"));
+        Assert.Equal(4, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE resolved_entities_json IS NOT NULL"));
+        // The unresolved failed/blocked runs still hold no resolution marker.
+        Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE status IN ('failed','blocked') AND resolved_at_utc IS NOT NULL"));
+        Assert.Equal(4, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE status IN ('failed','blocked')"));
 
         // Checksums 1-10 recorded canonically — independent of the checkout's line endings.
         for (var version = 1; version <= 10; version++)
@@ -121,53 +126,69 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Apply_is_idempotent_on_a_populated_v9_database()
+    public async Task Apply_is_idempotent_on_a_populated_v10_database()
     {
         await _migrator.ApplyAsync(CancellationToken.None);
         var runsAfterFirst = await SnapshotRowsAsync("SELECT * FROM etl_runs ORDER BY run_id;");
+        var resolutionsAfterFirst = await SnapshotRowsAsync("SELECT * FROM etl_run_resolutions ORDER BY run_id;");
         var ledgerAfterFirst = await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;");
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
         Assert.Equal(runsAfterFirst, await SnapshotRowsAsync("SELECT * FROM etl_runs ORDER BY run_id;"));
+        Assert.Equal(resolutionsAfterFirst, await SnapshotRowsAsync("SELECT * FROM etl_run_resolutions ORDER BY run_id;"));
         Assert.Equal(ledgerAfterFirst, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
         Assert.Equal(10, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     [Fact]
-    public async Task Schedule_active_index_holds_exactly_one_active_or_unresolved_run_per_key()
+    public async Task Resolutions_table_enforces_its_check_domain_and_run_fk()
     {
         await _migrator.ApplyAsync(CancellationToken.None);
-        var now = DateTimeOffset.UtcNow.ToString("O");
+        var run = "00000000-0000-0000-0000-0000000000f5"; // the unresolved 'failed' run
+        var now = "2026-09-26T00:00:00.0000000+00:00";
 
-        // Two pending runs with the same schedule key: the second insert is rejected.
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000f1", "sched-a", "pending");
-        await Assert.ThrowsAsync<SqliteException>(() => InsertRunAsync("00000000-0000-0000-0000-0000000000f2", "sched-a", "pending"));
+        // decision outside the bounded set.
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-bad-decision", run, now, "op", "pause", "verified at ERP", 1, "failed", 0, 0));
+        // the operator attestation of quiescence is mandatory.
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-not-quiesced", run, now, "op", "abandon", "verified at ERP", 0, "failed", 0, 0));
+        // only failed/blocked runs can ever carry a resolution.
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-bad-prior", run, now, "op", "abandon", "verified at ERP", 1, "running", 0, 0));
+        // blank attestations are rejected.
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-blank-op", run, now, "   ", "abandon", "verified at ERP", 1, "failed", 0, 0));
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-blank-remote", run, now, "op", "abandon", "", 1, "failed", 0, 0));
+        // negative counts are rejected.
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-neg-ownership", run, now, "op", "abandon", "verified at ERP", 1, "failed", -1, 0));
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-neg-batches", run, now, "op", "abandon", "verified at ERP", 1, "failed", 0, -1));
+        // A resolution for a run that does not exist violates the FK.
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-missing-run", "00000000-0000-0000-0000-0000000000ff", now, "op", "abandon", "verified at ERP", 1, "failed", 0, 0));
 
-        // A succeeded run releases the key: pending over the same key is admitted.
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000f3", "sched-b", "succeeded");
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000f4", "sched-b", "pending");
+        // A valid row is accepted.
+        await InsertResolutionAsync("r-valid", run, now, "operator-1", "abandon", "verified at ERP", 1, "failed", 0, 0);
+        Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM etl_run_resolutions"));
 
-        // An unresolved failed run still holds the key.
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000f5", "sched-c", "failed");
-        await Assert.ThrowsAsync<SqliteException>(() => InsertRunAsync("00000000-0000-0000-0000-0000000000f6", "sched-c", "pending"));
-
-        // Resolving the failed run releases the key.
-        await ExecuteSqlAsync("UPDATE etl_runs SET resolved_at_utc=$now WHERE run_id='00000000-0000-0000-0000-0000000000f5';", ("$now", now));
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000f7", "sched-c", "pending");
-
-        // An unresolved blocked run still holds the key; a NULL key is never indexed.
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000f8", "sched-d", "blocked");
-        await Assert.ThrowsAsync<SqliteException>(() => InsertRunAsync("00000000-0000-0000-0000-0000000000f9", "sched-d", "running"));
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000fa", null, "pending");
-        await InsertRunAsync("00000000-0000-0000-0000-0000000000fb", null, "pending");
+        // One immutable record per resolved run (PK) and per resolution id (UNIQUE).
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-other", run, now, "op", "retry", "verified at ERP", 1, "failed", 0, 0));
+        await Assert.ThrowsAsync<SqliteException>(() => InsertResolutionAsync("r-valid", "00000000-0000-0000-0000-0000000000f6", now, "op", "retry", "verified at ERP", 1, "blocked", 0, 0));
+        Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM etl_run_resolutions"));
     }
 
-    private async Task InsertRunAsync(string runId, string? scheduleKey, string status)
+    private async Task InsertResolutionAsync(string resolutionId, string runId, string resolvedAtUtc, string operatorId, string decision, string remoteVerification, int workersQuiesced, string priorStatus, int ownershipReleased, int batchesFenced)
     {
-        await ExecuteSqlAsync(
-            "INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,created_at_utc,updated_at_utc,schedule_key) VALUES($run,'incremental','[\"clients\"]',$status,$now,$now,$key);",
-            ("$run", runId), ("$status", status), ("$key", scheduleKey), ("$now", DateTimeOffset.UtcNow.ToString("O")));
+        await using var connection = await _factory.OpenAsync(CancellationToken.None);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO etl_run_resolutions(run_id,resolution_id,resolved_at_utc,operator_id,decision,remote_verification,workers_quiesced,prior_status,ownership_released,batches_fenced) VALUES($run,$res,$at,$op,$decision,$remote,$quiesced,$prior,$released,$fenced);";
+        command.Parameters.AddWithValue("$run", runId);
+        command.Parameters.AddWithValue("$res", resolutionId);
+        command.Parameters.AddWithValue("$at", resolvedAtUtc);
+        command.Parameters.AddWithValue("$op", operatorId);
+        command.Parameters.AddWithValue("$decision", decision);
+        command.Parameters.AddWithValue("$remote", remoteVerification);
+        command.Parameters.AddWithValue("$quiesced", workersQuiesced);
+        command.Parameters.AddWithValue("$prior", priorStatus);
+        command.Parameters.AddWithValue("$released", ownershipReleased);
+        command.Parameters.AddWithValue("$fenced", batchesFenced);
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
     private async Task<long> CountAsync(string sql)

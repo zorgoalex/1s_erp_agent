@@ -32,7 +32,7 @@ public sealed class EtlOwnershipMigrationTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql"];
+        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql"];
         _migrationSql = new string[names.Length];
         for (var index = 0; index < names.Length; index++)
         {
@@ -79,8 +79,8 @@ public sealed class EtlOwnershipMigrationTests : IAsyncLifetime
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(9, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(9, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(10, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(10, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(attemptsBefore, await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;"));
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
@@ -93,7 +93,7 @@ public sealed class EtlOwnershipMigrationTests : IAsyncLifetime
         Assert.Equal(snapshotsBefore, await SnapshotRowsAsync("SELECT * FROM config_snapshots ORDER BY config_version;"));
         Assert.Equal(conflictsBefore, await SnapshotRowsAsync("SELECT * FROM command_payload_conflicts ORDER BY event_id;"));
         Assert.Equal(ledgerBefore, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=6 ORDER BY version;"));
-        for (var version = 1; version <= 9; version++)
+        for (var version = 1; version <= 10; version++)
         {
             Assert.Equal(Checksum(_migrationSql[version - 1]), await ChecksumForVersionAsync(version));
         }
@@ -119,7 +119,7 @@ public sealed class EtlOwnershipMigrationTests : IAsyncLifetime
         Assert.Equal(bindingsAfterFirstRun, await SnapshotRowsAsync("SELECT * FROM etl_run_ownership_bindings ORDER BY run_id,entity_name;"));
         Assert.Equal(runsAfterFirstRun, await SnapshotRowsAsync("SELECT * FROM etl_runs ORDER BY run_id;"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
-        Assert.Equal(9, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(10, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     private static string Checksum(string sql) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sql)));
