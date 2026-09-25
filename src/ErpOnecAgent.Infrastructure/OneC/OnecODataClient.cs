@@ -3,13 +3,21 @@ using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ErpOnecAgent.Application.Abstractions;
+using ErpOnecAgent.Application.Configuration;
 using ErpOnecAgent.Application.Etl;
 using ErpOnecAgent.Domain.Etl;
+using Microsoft.Extensions.Options;
 
 namespace ErpOnecAgent.Infrastructure.OneC;
 
-public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentication authentication) : IOnecODataClient
+// A10: every page body is read through a byte-bounded stream (after decompression) and every
+// record's JSON text is bounded, so a huge or runaway response fails the read with
+// InvalidDataException instead of exhausting memory. The run then fails closed.
+public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentication authentication, IOptions<EtlOptions>? etlOptions = null) : IOnecODataClient
 {
+    private readonly long _maxPageBytes = etlOptions?.Value.MaxODataPageBytes ?? new EtlOptions().MaxODataPageBytes;
+    private readonly int _maxRowBytes = etlOptions?.Value.MaxODataRowBytes ?? new EtlOptions().MaxODataRowBytes;
+
     [GeneratedRegex("^[\\p{L}\\p{N}_.$-]+$", RegexOptions.CultureInvariant)]
     private static partial Regex IdentifierPattern();
 
@@ -30,10 +38,18 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
             await authentication.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
             using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            if (response.Content.Headers.ContentLength is { } declared && declared > _maxPageBytes)
+                throw new InvalidDataException($"OData page declares {declared} bytes, over the {_maxPageBytes}-byte limit.");
+            await using var raw = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using var stream = new BoundedReadStream(raw, _maxPageBytes);
             using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
             var values = FindResultsArray(document.RootElement);
-            foreach (var value in values.EnumerateArray()) yield return value.Clone();
+            foreach (var value in values.EnumerateArray())
+            {
+                if (System.Runtime.InteropServices.JsonMarshal.GetRawUtf8Value(value).Length > _maxRowBytes)
+                    throw new InvalidDataException($"An OData record of '{entity.EntityCode}' exceeds the {_maxRowBytes}-byte row limit.");
+                yield return value.Clone();
+            }
             var continuation = ResolveContinuation(document.RootElement, currentUri);
             if (continuation is not null)
             {
@@ -161,5 +177,42 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
         if (entity.PageSize is < 1 or > 10_000) throw new InvalidDataException($"Invalid page size for entity '{entity.EntityCode}'.");
         if (entity.ODataVersion is < 3 or > 4) throw new InvalidDataException($"Unsupported OData version for entity '{entity.EntityCode}'.");
         if (entity.UpdatedAtField is not null && entity.UpdatedAtEdmType is not ("Edm.DateTime" or "Edm.DateTimeOffset")) throw new InvalidDataException($"Unsupported updated-at EDM type for entity '{entity.EntityCode}'.");
+    }
+}
+
+/// <summary>A10: a read-only stream wrapper that throws once more than <c>limit</c> bytes are read.</summary>
+internal sealed class BoundedReadStream(Stream inner, long limit) : Stream
+{
+    private long _read;
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => _read; set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    public override int Read(byte[] buffer, int offset, int count) => Count(inner.Read(buffer, offset, count));
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+        Count(await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false));
+
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+        ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+    private int Count(int read)
+    {
+        _read += read;
+        if (_read > limit) throw new InvalidDataException($"OData page exceeds the {limit}-byte limit.");
+        return read;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) inner.Dispose();
+        base.Dispose(disposing);
     }
 }

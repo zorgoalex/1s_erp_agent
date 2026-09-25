@@ -18,6 +18,8 @@ public sealed class HeartbeatWorker(
     IOptions<StorageOptions> storageOptions,
     ILogger<HeartbeatWorker> logger) : BackgroundService
 {
+    private int? _lastCertificateWarning;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -36,7 +38,14 @@ public sealed class HeartbeatWorker(
                 var queues = await store.GetQueueMetricsAsync(stoppingToken).ConfigureAwait(false);
                 var metrics = await metricsCollector.CaptureAsync(stoppingToken).ConfigureAwait(false);
                 DateTimeOffset? certificateExpiry = null;
-                if (erpOptions.Value.RequireClientCertificate) { using var certificate = CertificateLoader.LoadClientCertificate(erpOptions.Value.ClientCertificateThumbprint); certificateExpiry = certificate.NotAfter.ToUniversalTime(); }
+                if (erpOptions.Value.RequireClientCertificate)
+                {
+                    // Expiry is read before the validity-checked load, which throws for an
+                    // expired certificate and would otherwise hide CERTIFICATE_EXPIRED.
+                    if (CertificateLoader.TryReadNotAfter(erpOptions.Value.ClientCertificateThumbprint) is { } notAfter) WarnCertificateExpiry(notAfter);
+                    using var certificate = CertificateLoader.LoadClientCertificate(erpOptions.Value.ClientCertificateThumbprint);
+                    certificateExpiry = certificate.NotAfter.ToUniversalTime();
+                }
                 var healthState = GetHealthState(state, metrics, storageOptions.Value);
                 var request = new HeartbeatRequest(agentOptions.Value.AgentId, ThisAssembly.Version, healthState,
                     (long)(DateTimeOffset.UtcNow - state.StartedAtUtc).TotalSeconds,
@@ -52,6 +61,23 @@ public sealed class HeartbeatWorker(
             catch (Exception ex) { sessions.Invalidate(); logger.LogWarning(ex, "Heartbeat failed"); }
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(10, agentOptions.Value.HeartbeatIntervalSeconds)), stoppingToken).ConfigureAwait(false);
         }
+    }
+
+    // One log entry per crossed threshold per process (30/14 warning, 7/3/1 error, expired
+    // critical); the heartbeat itself always carries the expiry date for ERP-side monitoring.
+    private void WarnCertificateExpiry(DateTimeOffset expiry)
+    {
+        var crossed = Application.Security.CertificateExpiryPolicy.CrossedThreshold(expiry, DateTimeOffset.UtcNow);
+        if (crossed is null)
+        {
+            _lastCertificateWarning = null; // a renewed certificate starts its own warning sequence
+            return;
+        }
+        if (crossed == _lastCertificateWarning) return;
+        _lastCertificateWarning = crossed;
+        if (crossed == 0) logger.LogCritical("CERTIFICATE_EXPIRED NotAfter={NotAfter}", expiry);
+        else if (crossed <= 7) logger.LogError("CERTIFICATE_EXPIRING DaysThreshold={Days} NotAfter={NotAfter}", crossed, expiry);
+        else logger.LogWarning("CERTIFICATE_EXPIRING DaysThreshold={Days} NotAfter={NotAfter}", crossed, expiry);
     }
 
     private static string GetHealthState(AgentRuntimeState state, AgentMetrics metrics, StorageOptions storage)

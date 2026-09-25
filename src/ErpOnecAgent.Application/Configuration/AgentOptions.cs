@@ -90,6 +90,12 @@ public sealed class EtlOptions
     /// <summary>Durable bound on ADMITTED batch send attempts (O2 send ledger, decision D1). Uncertain outcomes never retry, so this bounds ledger-proven-unsent (precheck_failed) admissions; persisted on the batch at first claim with identical-value enforcement.</summary>
     public int MaxBatchUploadAttempts { get; init; } = 5;
     public int TargetBatchUncompressedBytes { get; init; } = 10 * 1024 * 1024;
+    /// <summary>A10: hard bound on one OData page response body (bytes, after decompression); exceeding it fails the read.
+    /// The page is parsed as a whole, so peak memory is a small multiple of this value (parse buffer plus
+    /// token metadata); the validated maximum is 256 MB.</summary>
+    public long MaxODataPageBytes { get; init; } = 64L * 1024 * 1024;
+    /// <summary>A10: hard bound on one OData record's JSON text (bytes).</summary>
+    public int MaxODataRowBytes { get; init; } = 8 * 1024 * 1024;
     public IReadOnlyList<EtlEntityDefinition> Entities { get; init; } = [];
 }
 

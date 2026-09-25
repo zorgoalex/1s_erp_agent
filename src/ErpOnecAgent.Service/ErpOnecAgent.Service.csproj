@@ -22,4 +22,8 @@
     <PackageReference Include="Serilog.Sinks.Console" />
     <PackageReference Include="Serilog.Sinks.File" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- C1: worker passes (RunOnceAsync) are exercised directly by the pipeline tests. -->
+    <InternalsVisibleTo Include="ErpOnecAgent.IntegrationTests" />
+  </ItemGroup>
 </Project>

@@ -3,6 +3,7 @@ using ErpOnecAgent.Application.Abstractions;
 using ErpOnecAgent.Application.Configuration;
 using ErpOnecAgent.Domain.Agent;
 using ErpOnecAgent.Domain.Common;
+using ErpOnecAgent.Infrastructure.Persistence.Sqlite;
 using ErpOnecAgent.Infrastructure.Security;
 using Microsoft.Extensions.Options;
 
@@ -19,7 +20,8 @@ public sealed class BootstrapService(
     IOptions<AgentOptions> agentOptions,
     IOptions<ErpOptions> erpOptions,
     IOptions<OnecOptions> onecOptions,
-    ILogger<BootstrapService> logger) : IHostedService
+    ILogger<BootstrapService> logger,
+    SqliteConnectionFactory? database = null) : IHostedService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = true };
 
@@ -32,9 +34,15 @@ public sealed class BootstrapService(
         }
         if (await secrets.ReadAsync(onecOptions.Value.CredentialSecretName, cancellationToken).ConfigureAwait(false) is null)
             throw new InvalidOperationException($"1C credential '{onecOptions.Value.CredentialSecretName}' is not configured. Run --store-onec-credential interactively before starting the service.");
+        // The database-presence guard runs whenever the store is backed by a file database
+        // (always in the service); in-process test hosts that inject a store without the
+        // factory skip it.
+        if (database is not null && DatabasePresenceGuard.CheckBeforeStart(database.DatabasePath, Path.Combine(agentOptions.Value.DataDirectory, "spool")) is { } missing)
+            throw new InvalidOperationException(missing);
         await store.InitializeAsync(cancellationToken).ConfigureAwait(false);
         var integrity = await store.IntegrityCheckAsync(cancellationToken).ConfigureAwait(false);
         if (!string.Equals(integrity, "ok", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"SQLite integrity check failed: {integrity}");
+        if (database is not null) DatabasePresenceGuard.MarkInitialized(database.DatabasePath);
         await store.RecoverAsync(cancellationToken).ConfigureAwait(false);
         await spool.QuarantineTemporaryFilesAsync(cancellationToken).ConfigureAwait(false);
         await localPause.RestoreAsync(cancellationToken).ConfigureAwait(false);
