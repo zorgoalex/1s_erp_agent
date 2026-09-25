@@ -74,6 +74,21 @@ public sealed class ErpClient : IErpClient
     public async Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken) =>
         await SendNoContentAsync(HttpMethod.Post, $"etl/runs/{runId:D}/complete", JsonContent.Create(summary, options: JsonOptions), cancellationToken).ConfigureAwait(false);
 
+    /// <inheritdoc cref="IErpClient.CompleteEtlRunRawAsync"/>
+    public async Task CompleteEtlRunRawAsync(Guid runId, string completePayloadJson, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(completePayloadJson);
+        using var request = CreateRequest(HttpMethod.Post, $"etl/runs/{runId:D}/complete");
+        request.Headers.TryAddWithoutValidation("Idempotency-Key", runId.ToString("D"));
+        // ByteArrayContent, not StringContent: the exact stored bytes, UTF-8 without BOM,
+        // with an explicit media type — nothing is re-encoded or re-serialized.
+        // throwOnInvalidBytes: a lone surrogate fails closed instead of silently becoming U+FFFD.
+        request.Content = new ByteArrayContent(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetBytes(completePayloadJson));
+        request.Content.Headers.ContentType = new("application/json") { CharSet = "utf-8" };
+        using var response = await _sendAsync(request, cancellationToken).ConfigureAwait(false);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
     public async Task SendHeartbeatAsync(HeartbeatRequest request, CancellationToken cancellationToken) =>
         await SendNoContentAsync(HttpMethod.Post, "heartbeat", JsonContent.Create(request, options: JsonOptions), cancellationToken).ConfigureAwait(false);
 
@@ -116,12 +131,14 @@ public sealed class ErpClient : IErpClient
         return request;
     }
 
+    // Stage 6 redaction: the ERP response body is never copied into the exception message,
+    // which is logged and may be persisted (e.g. as a completion retry error); only the status
+    // and the body size are reported.
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         if (response.IsSuccessStatusCode) return;
-        var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-        if (body.Length > 2048) body = body[..2048];
-        throw new HttpRequestException($"ERP API returned {(int)response.StatusCode}: {body}", null, response.StatusCode);
+        var body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        throw new HttpRequestException($"ERP API returned {(int)response.StatusCode} ({body.Length} body bytes withheld).", null, response.StatusCode);
     }
 }
 

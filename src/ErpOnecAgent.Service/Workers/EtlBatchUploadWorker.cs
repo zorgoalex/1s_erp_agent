@@ -21,7 +21,13 @@ public sealed class EtlBatchUploadWorker(IAgentStore store, ISpoolStore spool, I
             var batches = await store.GetPendingBatchesAsync(options.Value.MaxConcurrentBatchUploads, DateTimeOffset.UtcNow, stoppingToken).ConfigureAwait(false);
             await Task.WhenAll(batches.Select(batch => UploadBatchAsync(batch, stoppingToken))).ConfigureAwait(false);
 
-            foreach (var run in await store.GetRunsReadyToCompleteAsync(stoppingToken).ConfigureAwait(false))
+            // A07 B4: run completion is gated on its own permission (today identical to
+            // CanUploadBatches = IsReady, so behaviour is unchanged) — the permission model is
+            // honest if a future mode separates upload from complete-run.
+            var completions = state.Snapshot.CanCompleteEtlRuns
+                ? await store.GetRunsReadyToCompleteAsync(stoppingToken).ConfigureAwait(false)
+                : [];
+            foreach (var run in completions)
             {
                 try
                 {

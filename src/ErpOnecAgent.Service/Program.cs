@@ -42,10 +42,13 @@ static async Task<int> RunAsync(string[] args)
     builder.Services.AddSingleton(sp => new SqliteConnectionFactory(Path.Combine(sp.GetRequiredService<IOptions<AgentOptions>>().Value.DataDirectory, "data", "agent.db")));
     builder.Services.AddSingleton<SqliteMigrator>();
     builder.Services.AddSingleton<IAgentStore, SqliteAgentStore>();
+    builder.Services.AddSingleton<ErpOnecAgent.Application.Etl.IDiskSpaceProbe, DriveInfoDiskSpaceProbe>();
     builder.Services.AddSingleton<ISpoolStore>(sp => new FileSpoolStore(
         Path.Combine(sp.GetRequiredService<IOptions<AgentOptions>>().Value.DataDirectory, "spool"),
         sp.GetRequiredService<IOptions<StorageOptions>>().Value.MaxBatchCompressedBytes,
-        sp.GetRequiredService<IOptions<StorageOptions>>().Value.MaxSpoolBytes));
+        sp.GetRequiredService<IOptions<StorageOptions>>().Value.MaxSpoolBytes,
+        sp.GetRequiredService<ErpOnecAgent.Application.Etl.IDiskSpaceProbe>(),
+        sp.GetRequiredService<IOptions<StorageOptions>>().Value.MinimumReservedBytesForCommands));
     builder.Services.AddSingleton<ISecretStore>(sp => new DpapiSecretStore(Path.Combine(sp.GetRequiredService<IOptions<AgentOptions>>().Value.DataDirectory, "secrets")));
     builder.Services.AddSingleton<OnecAuthentication>();
     builder.Services.AddSingleton<AgentRuntimeState>(); builder.Services.AddSingleton<DynamicConfigurationState>(); builder.Services.AddSingleton<LocalEtlPauseController>(); builder.Services.AddSingleton<EtlTrigger>(); builder.Services.AddSingleton<SingleInstanceLock>(); builder.Services.AddSingleton<ErpSessionManager>(); builder.Services.AddSingleton<AgentMetricsCollector>();

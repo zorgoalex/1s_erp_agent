@@ -1,6 +1,7 @@
 using System.Text.Json;
 using ErpOnecAgent.Application.Abstractions;
 using ErpOnecAgent.Application.Configuration;
+using ErpOnecAgent.Application.Etl;
 using ErpOnecAgent.Domain.Etl;
 using ErpOnecAgent.Service.Runtime;
 using Microsoft.Extensions.Options;
@@ -16,6 +17,8 @@ public sealed class OnecEtlWorker(
     DynamicConfigurationState dynamicConfiguration,
     IOptions<EtlOptions> etlOptions,
     IOptions<StorageOptions> storageOptions,
+    IOptions<AgentOptions> agentOptions,
+    IDiskSpaceProbe diskProbe,
     ILogger<OnecEtlWorker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -36,7 +39,26 @@ public sealed class OnecEtlWorker(
 
             if (!etlOptions.Value.Enabled || !state.Snapshot.CanExtract) continue;
             if (await spool.GetSizeAsync(stoppingToken).ConfigureAwait(false) >= storageOptions.Value.MaxSpoolBytes) { logger.LogWarning("DISK_WARNING ETL skipped because spool limit is reached"); continue; }
+            // A08: extraction starts only while the data volume keeps the command reserve plus
+            // one batch of headroom free; otherwise the run is not created at all.
+            if (!DiskAllowsExtraction()) { logger.LogWarning("DISK_WARNING ETL skipped because free disk space would not keep the command reserve"); continue; }
             await RunAsync(request, stoppingToken).ConfigureAwait(false);
+        }
+    }
+
+    private bool DiskAllowsExtraction()
+    {
+        var storage = storageOptions.Value;
+        try
+        {
+            var free = diskProbe.GetAvailableFreeBytes(agentOptions.Value.DataDirectory);
+            return EtlDiskAdmission.Allows(free, storage.MinimumReservedBytesForCommands, Math.Min(storage.MaxBatchCompressedBytes, EtlDiskAdmission.DefaultBatchHeadroomBytes));
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            // Unknown free space fails closed without stopping the host.
+            logger.LogWarning(ex, "DISK_WARNING free disk space could not be determined; ETL extraction deferred");
+            return false;
         }
     }
 

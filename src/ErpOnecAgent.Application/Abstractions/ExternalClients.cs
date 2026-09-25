@@ -14,6 +14,16 @@ public interface IErpClient
     Task AcknowledgeResultAsync(Guid commandId, string resultJson, CancellationToken cancellationToken);
     Task<BatchAcknowledgement> UploadBatchAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken);
     Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// H1: sends the run completion with the EXACT stored payload text (F1
+    /// <c>complete_payload_json</c>) as UTF-8 bytes, never re-serialized, with
+    /// <c>Idempotency-Key</c> = run id. Every fenced retry of one completion therefore
+    /// presents identical body bytes and dedup identity. ERP-side dedup is still unproven;
+    /// this only guarantees the agent never varies what it re-sends.
+    /// </summary>
+    Task CompleteEtlRunRawAsync(Guid runId, string completePayloadJson, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("This ERP client does not support byte-identical completion replay.");
     Task SendHeartbeatAsync(HeartbeatRequest request, CancellationToken cancellationToken);
     Task<RemoteConfigurationResponse?> GetConfigurationAsync(long currentVersion, CancellationToken cancellationToken);
 }
