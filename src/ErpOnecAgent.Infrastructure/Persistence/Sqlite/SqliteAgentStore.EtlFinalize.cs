@@ -126,19 +126,47 @@ public sealed partial class SqliteAgentStore
                 jobEntitiesJson = reader.GetString(2);
             }
         }
-        // O1: there is no frozen identity source for a jobless run — Begin rejects any
-        // run without an etl_jobs row outright until O3 lands resolved_entities_json.
+        string? scheduleKey = null;
+        string? resolvedEntitiesJson = null;
+        await using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = "SELECT schedule_key,resolved_entities_json FROM etl_runs WHERE run_id=$run;";
+            Add(read, "$run", runId.ToString("D"));
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                scheduleKey = NullableString(reader, 0);
+                resolvedEntitiesJson = NullableString(reader, 1);
+            }
+        }
         if (jobEntitiesJson is null)
         {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobMissing);
+            // A jobless run has a frozen identity source only when it is a scheduled run
+            // (O3): its resolved definitions must still form a consistent frozen identity
+            // with the manifest, and the caller's definition must equal the frozen one. A
+            // jobless run without a schedule key (e.g. legacy) has no identity source.
+            if (scheduleKey is null)
+            {
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobMissing);
+            }
+            if (!ScheduledIdentityConsistent(runMode, runConfigurationVersion, resolvedEntitiesJson, requestedEntitiesJson)
+                || !FrozenDefinitionMatches(resolvedEntitiesJson!, request.EntityName, request.EntityDefinitionJson))
+            {
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.RunDefinitionMismatch);
+            }
         }
-        if (!string.Equals(jobMode, runMode, StringComparison.Ordinal) || jobConfigurationVersion != runConfigurationVersion)
+        // A job-backed run never carries a schedule key: both identity sources at once is
+        // corrupt evidence.
+        else if (scheduleKey is not null
+            || !string.Equals(jobMode, runMode, StringComparison.Ordinal) || jobConfigurationVersion != runConfigurationVersion)
         {
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobInconsistent);
         }
-        if (!FrozenDefinitionMatches(jobEntitiesJson, request.EntityName, request.EntityDefinitionJson))
+        if (jobEntitiesJson is not null && !FrozenDefinitionMatches(jobEntitiesJson, request.EntityName, request.EntityDefinitionJson))
         {
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.JobDefinitionMismatch);

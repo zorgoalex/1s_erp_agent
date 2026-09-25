@@ -31,6 +31,7 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
     private string _migration006Sql = null!;
     private string _migration007Sql = null!;
     private string _migration008Sql = null!;
+    private string _migration009Sql = null!;
 
     public async Task InitializeAsync()
     {
@@ -42,6 +43,7 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
         _migration006Sql = await ReadMigrationAsync("006_etl_finalize.sql");
         _migration007Sql = await ReadMigrationAsync("007_etl_ownership.sql");
         _migration008Sql = await ReadMigrationAsync("008_etl_send_attempts.sql");
+        _migration009Sql = await ReadMigrationAsync("009_etl_scheduled_runs.sql");
         _factory = _database.CreateFactory(Path.Combine("data", "agent.db"));
 
         // Seed an actual v4 database: 001-004 schema + correct v1-v4 ledger rows + populated v4 data.
@@ -83,8 +85,8 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
 
         await migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(8, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(8, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(9, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(9, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(attemptsBefore, await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;"));
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
@@ -105,6 +107,7 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
         Assert.Equal(PublishedChecksum(_migration006Sql), await ChecksumForVersionAsync(6));
         Assert.Equal(PublishedChecksum(_migration007Sql), await ChecksumForVersionAsync(7));
         Assert.Equal(PublishedChecksum(_migration008Sql), await ChecksumForVersionAsync(8));
+        Assert.Equal(PublishedChecksum(_migration009Sql), await ChecksumForVersionAsync(9));
 
         // New durable storage exists and is empty; new pending-run columns backfill deterministically.
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='etl_jobs'"));
@@ -125,7 +128,7 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
         Assert.Equal(afterFirstRun, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
         Assert.Equal(jobsAfterFirstRun, await SnapshotRowsAsync("SELECT * FROM etl_jobs ORDER BY job_id;"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
-        Assert.Equal(8, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(9, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     private static async Task<string> ReadMigrationAsync(string fileName) =>

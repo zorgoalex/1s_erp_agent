@@ -29,6 +29,24 @@ internal sealed class SqliteTestDatabase
             await ClearPoolAsync(factory);
         }
 
-        if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
+        // Teardown only: a worker stopped by the test may still be finishing an in-flight
+        // write with CancellationToken.None (results are never abandoned), briefly holding
+        // the database file. Retry the cleanup instead of failing an already-asserted test.
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(Root)) Directory.Delete(Root, recursive: true);
+                return;
+            }
+            catch (IOException) when (attempt < 50)
+            {
+                await Task.Delay(100);
+                foreach (var factory in _factories)
+                {
+                    await ClearPoolAsync(factory);
+                }
+            }
+        }
     }
 }

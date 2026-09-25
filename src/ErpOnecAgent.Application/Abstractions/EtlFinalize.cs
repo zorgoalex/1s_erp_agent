@@ -86,8 +86,10 @@ public enum EtlEntityBeginRejection
     ExtractionClaimLost,
     /// <summary>The run's manifest does not equal its bindings and active ownership rows at the bound epochs (missing, foreign, released, wrong-epoch, or extra ownership state).</summary>
     OwnershipSetMismatch,
-    /// <summary>The run has no etl_jobs row; O1 has no frozen identity source for a jobless run (scheduled identity is O3).</summary>
-    JobMissing
+    /// <summary>The run has no etl_jobs row and is not a scheduled run with frozen resolved definitions — no frozen identity source exists.</summary>
+    JobMissing,
+    /// <summary>A scheduled run's supplied definition does not equal its frozen resolved definition for this entity, or its frozen identity is unusable.</summary>
+    RunDefinitionMismatch
 }
 
 public abstract record EtlEntityBeginOutcome

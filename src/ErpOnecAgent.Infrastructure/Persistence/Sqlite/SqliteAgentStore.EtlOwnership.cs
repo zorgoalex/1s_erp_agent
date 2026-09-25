@@ -44,6 +44,7 @@ public sealed partial class SqliteAgentStore
         var claimantManifest = run is null ? null : ParseManifestOrdered(run.RequestedEntitiesJson);
         var consistent = job is not null && run is not null
             && string.Equals(run.Status, "pending", StringComparison.Ordinal)
+            && run.ScheduleKey is null
             && FrozenJobIdentityConsistent(job.Mode, run.Mode, job.ConfigurationVersion, run.ConfigurationVersion, job.EntitiesJson, run.RequestedEntitiesJson);
         if (!consistent)
         {
@@ -55,7 +56,7 @@ public sealed partial class SqliteAgentStore
             // keep its pending admission hold — silently retiring it would let a younger
             // overlapping claim bypass the hold — so only the job is diagnostically
             // blocked and the run stays pending forever until explicit resolution.
-            const string inconsistentMessage = "Durable job/run identity is inconsistent (run not pending, mode/configuration drift, or frozen entities no longer equal the requested manifest); corrupt evidence never dispatches.";
+            const string inconsistentMessage = "Durable job/run identity is inconsistent (run not pending, run carries a schedule_key, mode/configuration drift, or frozen entities no longer equal the requested manifest); corrupt evidence never dispatches.";
             var inert = run is null || await RunProvablyInertAsync(connection, transaction, run.RunId, cancellationToken).ConfigureAwait(false);
             if (inert)
             {
@@ -85,125 +86,39 @@ public sealed partial class SqliteAgentStore
             return new EtlJobClaimOutcome.Blocked("JOB_MANIFEST_INCONSISTENT", inconsistentMessage);
         }
 
-        // Elder-manifest quarantine BEFORE overlap work (root disposition): every older
-        // pending run's manifest is validated as a typed nonempty unique string array
-        // consistent with its frozen job identity. A provably never-started corrupt elder
-        // is quarantined (blocked, MANIFEST_INVALID) and leaves the reservation; an elder
-        // with unproven effects keeps its reservation and the claimant defers
-        // elder_manifest_invalid — unresolved evidence stops admission until explicit
-        // resolution.
-        var elders = await ReadElderRowsAsync(connection, transaction, run!.RunId, run.CreatedAtUtc, cancellationToken).ConfigureAwait(false);
-        foreach (var elder in elders)
+        // Shared claim core (elder quarantine, overlap reservation, all-entity ownership
+        // acquisition, run start) — identical for manual jobs and scheduled runs (O3).
+        var core = await ClaimPendingRunCoreAsync(connection, transaction, run!, claimantManifest!, jobId, ownerId, now, cancellationToken).ConfigureAwait(false);
+        switch (core)
         {
-            var elderManifest = ParseManifestOrdered(elder.ManifestJson);
-            var elderInvalid = elderManifest is null
-                || (elder.JobId is not null
-                    && !FrozenJobIdentityConsistent(elder.JobMode, elder.RunMode, elder.JobConfigurationVersion, elder.RunConfigurationVersion, elder.JobEntitiesJson, elder.ManifestJson));
-            if (!elderInvalid) continue;
-            if (!elder.ProvablyInert)
+            case ClaimCoreResult.ElderHold hold:
             {
-                var hold = $"An older pending run '{elder.RunId:D}' holds an invalid manifest with unproven effects; admission is held pending explicit resolution.";
-                var held = await DeferJobAsync(connection, transaction, jobId, "elder_manifest_invalid", hold, deferUntil, now, cancellationToken).ConfigureAwait(false);
+                var holdMessage = $"An older pending run '{hold.ElderRunId:D}' holds an invalid manifest with unproven effects; admission is held pending explicit resolution.";
+                var held = await DeferJobAsync(connection, transaction, jobId, "elder_manifest_invalid", holdMessage, deferUntil, now, cancellationToken).ConfigureAwait(false);
                 if (!held) throw new InvalidOperationException($"ETL job {jobId:D} left the claimable state mid-transaction.");
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return new EtlJobClaimOutcome.Deferred(EtlJobDeferralReason.ElderManifestInvalid);
             }
-            var quarantine = $"Pending run '{elder.RunId:D}' failed typed manifest validation with proof it never started; quarantined (MANIFEST_INVALID).";
-            var (jobsBlocked, runsBlocked) = await CommitJobManifestBlockAsync(connection, transaction, elder.JobId, elder.RunId, "MANIFEST_INVALID", quarantine, now, cancellationToken).ConfigureAwait(false);
-            // The elder was read 'pending' inside THIS transaction — its quarantine
-            // transition is expected-one: a swallowed or zero-row write aborts the whole
-            // claim transaction (never a partial quarantine that frees the reservation
-            // while the run still stands). The job may legitimately be absent or already
-            // terminal (0); a still-blockable job must transition.
-            if (runsBlocked != 1)
-                throw new InvalidOperationException($"Pending run {elder.RunId:D} failed its quarantine transition mid-transaction.");
-            if (elder.JobId is not null && elder.JobStatus is not ("finished" or "cancelled" or "blocked") && jobsBlocked != 1)
-                throw new InvalidOperationException($"ETL job {elder.JobId:D} left the blockable state mid-transaction.");
-        }
-
-        // Elder-overlap reservation inside the claim transaction (the enumerator can
-        // never bypass it): no older pending run may overlap this manifest — a pending
-        // elder whose job is terminally blocked still holds its reservation (that IS the
-        // durable admission hold for unresolved effects). The order key is
-        // (created_at_utc, run_id) — a deterministic total order, not arrival FIFO.
-        var elderOverlap = await ScalarLongAsync(connection, transaction, """
-            SELECT COUNT(*) FROM etl_runs r2
-            WHERE r2.status='pending' AND r2.run_id <> $run
-              AND (COALESCE(r2.created_at_utc,'') < $created OR (COALESCE(r2.created_at_utc,'') = $created AND r2.run_id < $run))
-              AND json_valid(r2.requested_entities_json)
-              AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r2.requested_entities_json) THEN r2.requested_entities_json ELSE '[]' END) e2
-                          JOIN json_each($manifest) e1 ON e1.value = e2.value);
-            """, cancellationToken,
-            ("$run", run.RunId.ToString("D")), ("$created", run.CreatedAtUtc ?? string.Empty), ("$manifest", run.RequestedEntitiesJson)).ConfigureAwait(false);
-        if (elderOverlap != 0)
-        {
-            const string overlapMessage = "An older pending run overlaps this manifest; the elder reserves its overlap before any newer claim.";
-            var deferred = await DeferJobAsync(connection, transaction, jobId, "queued_overlap", overlapMessage, deferUntil, now, cancellationToken).ConfigureAwait(false);
-            if (!deferred) throw new InvalidOperationException($"ETL job {jobId:D} left the claimable state mid-transaction.");
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlJobClaimOutcome.Deferred(EtlJobDeferralReason.QueuedOverlap);
-        }
-
-        // All-entity ownership acquisition under a SAVEPOINT: the savepoint opens
-        // immediately before the acquisition loop so every acquired/re-acquired row and
-        // every binding insert is reversible independently of the deferral commit. Any
-        // conflict rolls the whole partial acquisition back — a conflict on entity 2
-        // leaves entity 1's prior owner untouched and entity 1 unowned by this run.
-        await ExecuteAsync(connection, transaction, "SAVEPOINT etl_acquire;", cancellationToken).ConfigureAwait(false);
-        var conflict = false;
-        foreach (var entity in claimantManifest!.OrderBy(static entity => entity, StringComparer.Ordinal))
-        {
-            var reacquired = await ExecuteAsync(connection, transaction, """
-                UPDATE etl_entity_ownership SET owner_run_id=$run, owner_job_id=$job, ownership_epoch=ownership_epoch+1,
-                    acquired_at_utc=$now, released_at_utc=NULL, release_reason=NULL, updated_at_utc=$now, row_version=row_version+1
-                WHERE entity_name=$entity AND released_at_utc IS NOT NULL;
-                """, cancellationToken,
-                ("$run", run.RunId.ToString("D")), ("$job", jobId.ToString("D")), ("$entity", entity), ("$now", now)).ConfigureAwait(false);
-            if (reacquired == 0)
+            case ClaimCoreResult.Overlap:
             {
-                var inserted = await ExecuteAsync(connection, transaction, """
-                    INSERT INTO etl_entity_ownership(entity_name,owner_run_id,owner_job_id,ownership_epoch,acquired_at_utc,updated_at_utc,row_version)
-                    SELECT $entity,$run,$job,1,$now,$now,1
-                    WHERE NOT EXISTS (SELECT 1 FROM etl_entity_ownership o WHERE o.entity_name=$entity);
-                    """, cancellationToken,
-                    ("$entity", entity), ("$run", run.RunId.ToString("D")), ("$job", jobId.ToString("D")), ("$now", now)).ConfigureAwait(false);
-                if (inserted == 0) { conflict = true; break; }
+                const string overlapMessage = "An older pending run overlaps this manifest; the elder reserves its overlap before any newer claim.";
+                var deferred = await DeferJobAsync(connection, transaction, jobId, "queued_overlap", overlapMessage, deferUntil, now, cancellationToken).ConfigureAwait(false);
+                if (!deferred) throw new InvalidOperationException($"ETL job {jobId:D} left the claimable state mid-transaction.");
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new EtlJobClaimOutcome.Deferred(EtlJobDeferralReason.QueuedOverlap);
             }
-
-            // Immutable binding: the epoch actually committed is read back in-transaction,
-            // never assumed (insert=1, reacquire=old+1). Zero rows means the just-written
-            // ownership row is inconsistent — same fail-closed conflict path.
-            var bound = await ExecuteAsync(connection, transaction, """
-                INSERT INTO etl_run_ownership_bindings(run_id,entity_name,expected_epoch,acquired_at_utc)
-                SELECT $run,$entity,o.ownership_epoch,$now FROM etl_entity_ownership o
-                WHERE o.entity_name=$entity AND o.owner_run_id=$run AND o.released_at_utc IS NULL;
-                """, cancellationToken,
-                ("$run", run.RunId.ToString("D")), ("$entity", entity), ("$now", now)).ConfigureAwait(false);
-            if (bound != 1) { conflict = true; break; }
+            case ClaimCoreResult.Busy:
+            {
+                const string busyMessage = "At least one manifest entity is owned by another active run; the partial acquisition was rolled back and the job is deferred.";
+                var deferred = await DeferJobAsync(connection, transaction, jobId, "busy_entity", busyMessage, deferUntil, now, cancellationToken).ConfigureAwait(false);
+                if (!deferred) throw new InvalidOperationException($"ETL job {jobId:D} left the claimable state mid-transaction.");
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                return new EtlJobClaimOutcome.Deferred(EtlJobDeferralReason.BusyEntity);
+            }
         }
+        var extractionClaimId = ((ClaimCoreResult.Acquired)core).ExtractionClaimId;
 
-        if (conflict)
-        {
-            await ExecuteAsync(connection, transaction, "ROLLBACK TO SAVEPOINT etl_acquire; RELEASE SAVEPOINT etl_acquire;", cancellationToken).ConfigureAwait(false);
-            const string busyMessage = "At least one manifest entity is owned by another active run; the partial acquisition was rolled back and the job is deferred.";
-            var deferred = await DeferJobAsync(connection, transaction, jobId, "busy_entity", busyMessage, deferUntil, now, cancellationToken).ConfigureAwait(false);
-            if (!deferred) throw new InvalidOperationException($"ETL job {jobId:D} left the claimable state mid-transaction.");
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlJobClaimOutcome.Deferred(EtlJobDeferralReason.BusyEntity);
-        }
-        await ExecuteAsync(connection, transaction, "RELEASE SAVEPOINT etl_acquire;", cancellationToken).ConfigureAwait(false);
-
-        // Success: run pending→running minting the fresh extraction claim fence; job
-        // running with dispatch diagnostics and the committed-claim counter incremented.
-        var extractionClaimId = Guid.NewGuid();
-        var runStarted = await ExecuteAsync(connection, transaction, """
-            UPDATE etl_runs SET status='running', started_at_utc=$now,
-                extraction_claim_id=$claim, extraction_claim_owner_id=$owner, extraction_claim_acquired_at_utc=$now,
-                updated_at_utc=$now, row_version=row_version+1
-            WHERE run_id=$run AND status='pending';
-            """, cancellationToken,
-            ("$now", now), ("$claim", extractionClaimId.ToString("D")), ("$owner", ownerId), ("$run", run.RunId.ToString("D"))).ConfigureAwait(false);
-        if (runStarted != 1) throw new InvalidOperationException($"ETL run {run.RunId:D} left 'pending' mid-transaction.");
+        // Job running with dispatch diagnostics and the committed-claim counter incremented.
         var jobStarted = await ExecuteAsync(connection, transaction, """
             UPDATE etl_jobs SET status='running', dispatch_owner_id=$owner, dispatch_claimed_at_utc=$now,
                 claim_attempt_count=claim_attempt_count+1, deferral_code=NULL, deferral_message=NULL, available_at_utc=NULL,
@@ -214,7 +129,7 @@ public sealed partial class SqliteAgentStore
         if (jobStarted != 1) throw new InvalidOperationException($"ETL job {jobId:D} left the claimable state mid-transaction.");
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new EtlJobClaimOutcome.Claimed(new EtlJobClaim(jobId, run.RunId, extractionClaimId, job!.Mode, job.EntitiesJson!, job.ConfigurationVersion!.Value));
+        return new EtlJobClaimOutcome.Claimed(new EtlJobClaim(jobId, run!.RunId, extractionClaimId, job!.Mode, job.EntitiesJson!, job.ConfigurationVersion!.Value));
     }
 
     /// <inheritdoc cref="IAgentStore.GetDispatchableEtlJobsAsync"/>
@@ -245,7 +160,7 @@ public sealed partial class SqliteAgentStore
                 SELECT j.job_id, j.run_id, j.mode, j.configuration_version, j.entities_json
                 FROM etl_jobs j JOIN etl_runs r ON r.run_id = j.run_id
                 WHERE (j.status='pending' OR (j.status='deferred' AND (j.available_at_utc IS NULL OR j.available_at_utc <= $now)))
-                  AND r.status='pending'
+                  AND r.status='pending' AND r.schedule_key IS NULL
                   AND j.mode = r.mode
                   AND j.configuration_version IS NOT NULL AND j.configuration_version = r.configuration_version
                   AND etl_job_manifest_consistent(j.entities_json, r.requested_entities_json) = 1
@@ -275,7 +190,8 @@ public sealed partial class SqliteAgentStore
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = """
-                SELECT r2.run_id, r2.requested_entities_json, j2.job_id, j2.entities_json, j2.mode, j2.configuration_version, r2.mode, r2.configuration_version
+                SELECT r2.run_id, r2.requested_entities_json, j2.job_id, j2.entities_json, j2.mode, j2.configuration_version, r2.mode, r2.configuration_version,
+                       r2.schedule_key, r2.resolved_entities_json
                 FROM etl_runs r2 LEFT JOIN etl_jobs j2 ON j2.run_id = r2.run_id
                 WHERE r2.status='pending'
                 ORDER BY COALESCE(r2.created_at_utc,''), r2.run_id;
@@ -291,8 +207,12 @@ public sealed partial class SqliteAgentStore
                 var jobConfig = NullableLong(reader, 5);
                 var runMode = NullableString(reader, 6);
                 var runConfig = NullableLong(reader, 7);
+                var scheduleKey = NullableString(reader, 8);
+                var resolvedJson = NullableString(reader, 9);
                 var invalid = ParseManifestOrdered(manifestJson) is null
-                    || (jobId is not null && !FrozenJobIdentityConsistent(jobMode, runMode, jobConfig, runConfig, entitiesJson, manifestJson));
+                    || (jobId is not null && !FrozenJobIdentityConsistent(jobMode, runMode, jobConfig, runConfig, entitiesJson, manifestJson))
+                    || (jobId is not null && scheduleKey is not null)
+                    || (jobId is null && scheduleKey is not null && !ScheduledIdentityConsistent(runMode, runConfig, resolvedJson, manifestJson));
                 if (invalid)
                 {
                     quarantined.Add(new EtlPendingRunQuarantine(runId, jobId, "MANIFEST_INVALID",
@@ -305,6 +225,133 @@ public sealed partial class SqliteAgentStore
     }
 
     // ---------- O1 shared internals ----------
+
+    // The shared claim core for a pending run (manual job or scheduled, O3): elder-manifest
+    // quarantine, the elder-overlap reservation by run (created_at_utc, run_id), all-entity
+    // ownership acquisition with immutable bindings under a savepoint (owner_job_id is the
+    // job, or NULL for a scheduled run), and the run start minting the extraction claim.
+    // Runs inside the caller's transaction; the caller commits or rolls back and owns every
+    // job-specific write. Quarantined counts elders blocked in this pass — writes that must
+    // commit even when the claimant itself does not proceed.
+    private static async Task<ClaimCoreResult> ClaimPendingRunCoreAsync(SqliteConnection connection, SqliteTransaction transaction, ClaimRunRow run, List<string> manifest, Guid? jobId, string ownerId, string now, CancellationToken cancellationToken)
+    {
+        var quarantined = 0;
+        // Elder-manifest quarantine BEFORE overlap work (root disposition): every older
+        // pending run's manifest is validated as a typed nonempty unique string array
+        // consistent with its frozen job identity. A provably never-started corrupt elder
+        // is quarantined (blocked, MANIFEST_INVALID) and leaves the reservation; an elder
+        // with unproven effects keeps its reservation and the claimant defers
+        // elder_manifest_invalid — unresolved evidence stops admission until explicit
+        // resolution.
+        var elders = await ReadElderRowsAsync(connection, transaction, run.RunId, run.CreatedAtUtc, cancellationToken).ConfigureAwait(false);
+        foreach (var elder in elders)
+        {
+            var elderManifest = ParseManifestOrdered(elder.ManifestJson);
+            var elderInvalid = elderManifest is null
+                || (elder.JobId is not null
+                    && !FrozenJobIdentityConsistent(elder.JobMode, elder.RunMode, elder.JobConfigurationVersion, elder.RunConfigurationVersion, elder.JobEntitiesJson, elder.ManifestJson))
+                || (elder.JobId is not null && elder.ScheduleKey is not null)
+                || (elder.JobId is null && elder.ScheduleKey is not null
+                    && !ScheduledIdentityConsistent(elder.RunMode, elder.RunConfigurationVersion, elder.ResolvedEntitiesJson, elder.ManifestJson));
+            if (!elderInvalid) continue;
+            if (!elder.ProvablyInert) return new ClaimCoreResult.ElderHold(elder.RunId, quarantined);
+            var quarantine = $"Pending run '{elder.RunId:D}' failed typed manifest validation with proof it never started; quarantined (MANIFEST_INVALID).";
+            var (jobsBlocked, runsBlocked) = await CommitJobManifestBlockAsync(connection, transaction, elder.JobId, elder.RunId, "MANIFEST_INVALID", quarantine, now, cancellationToken).ConfigureAwait(false);
+            // The elder was read 'pending' inside THIS transaction — its quarantine
+            // transition is expected-one: a swallowed or zero-row write aborts the whole
+            // claim transaction (never a partial quarantine that frees the reservation
+            // while the run still stands). The job may legitimately be absent or already
+            // terminal (0); a still-blockable job must transition.
+            if (runsBlocked != 1)
+                throw new InvalidOperationException($"Pending run {elder.RunId:D} failed its quarantine transition mid-transaction.");
+            if (elder.JobId is not null && elder.JobStatus is not ("finished" or "cancelled" or "blocked") && jobsBlocked != 1)
+                throw new InvalidOperationException($"ETL job {elder.JobId:D} left the blockable state mid-transaction.");
+            quarantined++;
+        }
+
+        // Elder-overlap reservation inside the claim transaction (the enumerator can
+        // never bypass it): no older pending run may overlap this manifest — a pending
+        // elder whose job is terminally blocked still holds its reservation (that IS the
+        // durable admission hold for unresolved effects). The order key is
+        // (created_at_utc, run_id) — a deterministic total order, not arrival FIFO.
+        var elderOverlap = await ScalarLongAsync(connection, transaction, """
+            SELECT COUNT(*) FROM etl_runs r2
+            WHERE r2.status='pending' AND r2.run_id <> $run
+              AND (COALESCE(r2.created_at_utc,'') < $created OR (COALESCE(r2.created_at_utc,'') = $created AND r2.run_id < $run))
+              AND json_valid(r2.requested_entities_json)
+              AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(r2.requested_entities_json) THEN r2.requested_entities_json ELSE '[]' END) e2
+                          JOIN json_each($manifest) e1 ON e1.value = e2.value);
+            """, cancellationToken,
+            ("$run", run.RunId.ToString("D")), ("$created", run.CreatedAtUtc ?? string.Empty), ("$manifest", run.RequestedEntitiesJson)).ConfigureAwait(false);
+        if (elderOverlap != 0) return new ClaimCoreResult.Overlap(quarantined);
+
+        // All-entity ownership acquisition under a SAVEPOINT: the savepoint opens
+        // immediately before the acquisition loop so every acquired/re-acquired row and
+        // every binding insert is reversible independently of the deferral commit. Any
+        // conflict rolls the whole partial acquisition back — a conflict on entity 2
+        // leaves entity 1's prior owner untouched and entity 1 unowned by this run.
+        await ExecuteAsync(connection, transaction, "SAVEPOINT etl_acquire;", cancellationToken).ConfigureAwait(false);
+        var conflict = false;
+        foreach (var entity in manifest.OrderBy(static entity => entity, StringComparer.Ordinal))
+        {
+            var reacquired = await ExecuteAsync(connection, transaction, """
+                UPDATE etl_entity_ownership SET owner_run_id=$run, owner_job_id=$job, ownership_epoch=ownership_epoch+1,
+                    acquired_at_utc=$now, released_at_utc=NULL, release_reason=NULL, updated_at_utc=$now, row_version=row_version+1
+                WHERE entity_name=$entity AND released_at_utc IS NOT NULL;
+                """, cancellationToken,
+                ("$run", run.RunId.ToString("D")), ("$job", jobId?.ToString("D")), ("$entity", entity), ("$now", now)).ConfigureAwait(false);
+            if (reacquired == 0)
+            {
+                var inserted = await ExecuteAsync(connection, transaction, """
+                    INSERT INTO etl_entity_ownership(entity_name,owner_run_id,owner_job_id,ownership_epoch,acquired_at_utc,updated_at_utc,row_version)
+                    SELECT $entity,$run,$job,1,$now,$now,1
+                    WHERE NOT EXISTS (SELECT 1 FROM etl_entity_ownership o WHERE o.entity_name=$entity);
+                    """, cancellationToken,
+                    ("$entity", entity), ("$run", run.RunId.ToString("D")), ("$job", jobId?.ToString("D")), ("$now", now)).ConfigureAwait(false);
+                if (inserted == 0) { conflict = true; break; }
+            }
+
+            // Immutable binding: the epoch actually committed is read back in-transaction,
+            // never assumed (insert=1, reacquire=old+1). Zero rows means the just-written
+            // ownership row is inconsistent — same fail-closed conflict path.
+            var bound = await ExecuteAsync(connection, transaction, """
+                INSERT INTO etl_run_ownership_bindings(run_id,entity_name,expected_epoch,acquired_at_utc)
+                SELECT $run,$entity,o.ownership_epoch,$now FROM etl_entity_ownership o
+                WHERE o.entity_name=$entity AND o.owner_run_id=$run AND o.released_at_utc IS NULL;
+                """, cancellationToken,
+                ("$run", run.RunId.ToString("D")), ("$entity", entity), ("$now", now)).ConfigureAwait(false);
+            if (bound != 1) { conflict = true; break; }
+        }
+
+        if (conflict)
+        {
+            await ExecuteAsync(connection, transaction, "ROLLBACK TO SAVEPOINT etl_acquire; RELEASE SAVEPOINT etl_acquire;", cancellationToken).ConfigureAwait(false);
+            return new ClaimCoreResult.Busy(quarantined);
+        }
+        await ExecuteAsync(connection, transaction, "RELEASE SAVEPOINT etl_acquire;", cancellationToken).ConfigureAwait(false);
+
+        // Success: run pending→running minting the fresh extraction claim fence.
+        var extractionClaimId = Guid.NewGuid();
+        var runStarted = await ExecuteAsync(connection, transaction, """
+            UPDATE etl_runs SET status='running', started_at_utc=$now,
+                extraction_claim_id=$claim, extraction_claim_owner_id=$owner, extraction_claim_acquired_at_utc=$now,
+                updated_at_utc=$now, row_version=row_version+1
+            WHERE run_id=$run AND status='pending';
+            """, cancellationToken,
+            ("$now", now), ("$claim", extractionClaimId.ToString("D")), ("$owner", ownerId), ("$run", run.RunId.ToString("D"))).ConfigureAwait(false);
+        if (runStarted != 1) throw new InvalidOperationException($"ETL run {run.RunId:D} left 'pending' mid-transaction.");
+        return new ClaimCoreResult.Acquired(extractionClaimId);
+    }
+
+    private abstract record ClaimCoreResult
+    {
+        private ClaimCoreResult() { }
+        public sealed record Acquired(Guid ExtractionClaimId) : ClaimCoreResult;
+        public sealed record ElderHold(Guid ElderRunId, int Quarantined) : ClaimCoreResult;
+        public sealed record Overlap(int Quarantined) : ClaimCoreResult;
+        public sealed record Busy(int Quarantined) : ClaimCoreResult;
+    }
+
 
     // The exact three-way ownership gate evaluated inside a guarded write on etl_runs
     // (alias r). The manifest itself must satisfy the TYPED nonempty-unique-string
@@ -407,6 +454,16 @@ public sealed partial class SqliteAgentStore
         && jobConfigurationVersion is not null && jobConfigurationVersion == runConfigurationVersion
         && JobManifestConsistent(entitiesJson, manifestJson);
 
+    // Frozen identity of a scheduled (jobless) run: the incremental mode, a
+    // configuration version, and frozen resolved definitions whose ordered typed codes
+    // equal the manifest — the same typed check a job's entities_json passes.
+    private const string ScheduledRunMode = "incremental";
+
+    private static bool ScheduledIdentityConsistent(string? runMode, long? runConfigurationVersion, string? resolvedEntitiesJson, string? manifestJson) =>
+        runMode == ScheduledRunMode
+        && runConfigurationVersion is not null && runConfigurationVersion >= 0
+        && JobManifestConsistent(resolvedEntitiesJson, manifestJson);
+
     // Ordered entity codes of a job's frozen entities_json — valid only when every element
     // deserializes to a structurally valid resolved definition with unique codes.
     private static List<string>? JobEntityCodes(string entitiesJson)
@@ -470,17 +527,19 @@ public sealed partial class SqliteAgentStore
             : null;
     }
 
-    private sealed record ClaimRunRow(Guid RunId, string Status, string Mode, string? RequestedEntitiesJson, long? ConfigurationVersion, string? CreatedAtUtc);
+    private sealed record ClaimRunRow(Guid RunId, string Status, string Mode, string? RequestedEntitiesJson, long? ConfigurationVersion, string? CreatedAtUtc,
+        string? ScheduleKey, string? ResolvedEntitiesJson);
 
     private static async Task<ClaimRunRow?> ReadClaimRunRowAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT run_id,status,mode,requested_entities_json,configuration_version,created_at_utc FROM etl_runs WHERE run_id=$run;";
+        command.CommandText = "SELECT run_id,status,mode,requested_entities_json,configuration_version,created_at_utc,schedule_key,resolved_entities_json FROM etl_runs WHERE run_id=$run;";
         Add(command, "$run", runId.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
-            ? new ClaimRunRow(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), NullableString(reader, 5))
+            ? new ClaimRunRow(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), NullableString(reader, 5),
+                NullableString(reader, 6), NullableString(reader, 7))
             : null;
     }
 
@@ -492,7 +551,8 @@ public sealed partial class SqliteAgentStore
     // elder — including one whose job is already terminally blocked: pending status
     // with a dead job IS the durable admission hold retained for unresolved effects.
     private sealed record ElderRow(Guid RunId, string? ManifestJson, string? RunMode, long? RunConfigurationVersion,
-        Guid? JobId, string? JobEntitiesJson, string? JobMode, long? JobConfigurationVersion, string? JobStatus, bool ProvablyInert);
+        Guid? JobId, string? JobEntitiesJson, string? JobMode, long? JobConfigurationVersion, string? JobStatus, bool ProvablyInert,
+        string? ScheduleKey, string? ResolvedEntitiesJson);
 
     private static async Task<List<ElderRow>> ReadElderRowsAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string? createdAtUtc, CancellationToken cancellationToken)
     {
@@ -503,7 +563,8 @@ public sealed partial class SqliteAgentStore
             SELECT r2.run_id, r2.requested_entities_json, r2.mode, r2.configuration_version,
                    j2.job_id, j2.entities_json, j2.mode, j2.configuration_version, j2.status,
                    CASE WHEN {RunInertPredicate("r2")}
-                        THEN 1 ELSE 0 END
+                        THEN 1 ELSE 0 END,
+                   r2.schedule_key, r2.resolved_entities_json
             FROM etl_runs r2 LEFT JOIN etl_jobs j2 ON j2.run_id = r2.run_id
             WHERE r2.status='pending' AND r2.run_id <> $run
               AND (COALESCE(r2.created_at_utc,'') < $created OR (COALESCE(r2.created_at_utc,'') = $created AND r2.run_id < $run))
@@ -515,7 +576,7 @@ public sealed partial class SqliteAgentStore
         {
             elders.Add(new ElderRow(Guid.Parse(reader.GetString(0)), NullableString(reader, 1), NullableString(reader, 2), NullableLong(reader, 3),
                 reader.IsDBNull(4) ? null : Guid.Parse(reader.GetString(4)), NullableString(reader, 5), NullableString(reader, 6), NullableLong(reader, 7),
-                NullableString(reader, 8), reader.GetInt64(9) == 1));
+                NullableString(reader, 8), reader.GetInt64(9) == 1, NullableString(reader, 10), NullableString(reader, 11)));
         }
         return elders;
     }

@@ -143,6 +143,36 @@ public interface IAgentStore
     /// </summary>
     Task<EtlJobDispatchPage> GetDispatchableEtlJobsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// O3: idempotent scheduled tick. Inserts one pending jobless run carrying
+    /// <c>schedule_key</c>, the ordered entity-code manifest, the frozen full definitions
+    /// (<c>resolved_entities_json</c>) and the configuration version — unless an active or
+    /// unresolved run already holds the key (pending/running/uploading/completing, or
+    /// failed/blocked without <c>resolved_at_utc</c>), in which case it returns that run
+    /// with zero writes. A failed or blocked scheduled run therefore never mints a
+    /// successor. Invalid requests (blank key, unsupported mode, empty/duplicate/invalid
+    /// definitions, negative configuration version) throw <see cref="ArgumentException"/>.
+    /// </summary>
+    Task<EtlScheduledRunEnsureOutcome> EnsureScheduledEtlRunAsync(EtlScheduledRunRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// O3: claims a pending scheduled run through the SAME transaction shape as
+    /// <see cref="TryClaimEtlJobAsync"/> — elder-manifest quarantine, elder-overlap
+    /// reservation by run (created_at_utc, run_id) shared with manual jobs, all-entity
+    /// ownership acquisition with immutable bindings under a savepoint, and the fresh
+    /// extraction claim — with <c>owner_job_id</c> NULL. The frozen identity
+    /// (<c>resolved_entities_json</c> codes equal to the manifest) is verified in the
+    /// transaction; corrupt identity never dispatches.
+    /// </summary>
+    Task<EtlScheduledRunClaimOutcome> TryClaimScheduledRunAsync(Guid runId, string ownerId, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// O3: enumerates pending scheduled runs that the claim would admit — consistent frozen
+    /// identity, no elder-overlap reservation, all manifest entities acquirable — applied in
+    /// SQL BEFORE LIMIT, ranked by run (created_at_utc, run_id). Read-only.
+    /// </summary>
+    Task<IReadOnlyList<EtlDueScheduledRun>> GetDueScheduledRunsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
     Task CreateEtlRunAsync(EtlRun run, CancellationToken cancellationToken);
     Task RegisterBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
     Task MarkEtlRunExtractedAsync(Guid runId, CancellationToken cancellationToken);
