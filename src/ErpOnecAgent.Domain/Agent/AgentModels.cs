@@ -11,5 +11,6 @@ public enum HealthState { Healthy, Degraded, OfflineErp, OfflineOnec, StorageWar
 /// counted exactly once: after the result is acknowledged the <c>result_status</c> still carries the
 /// dead-letter outcome, so the inclusion point (local completion) is the only one.
 /// </summary>
-public sealed record QueueMetrics(long CommandsPending, long ResultsPending, long EtlBatchesPending, long DeadLetters, long CommandsDeadLetter = 0);
+public sealed record QueueMetrics(long CommandsPending, long ResultsPending, long EtlBatchesPending, long DeadLetters, long CommandsDeadLetter = 0,
+    DateTimeOffset? OldestPendingCommandAtUtc = null, DateTimeOffset? OldestPendingResultAtUtc = null, long EtlRunsUnresolved = 0);
 
