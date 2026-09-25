@@ -92,7 +92,8 @@ public sealed class EtlFinalizeMigrationTests : IAsyncLifetime
         Assert.Equal(ledgerBefore, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations WHERE version<=5 ORDER BY version;"));
         for (var version = 1; version <= 7; version++)
         {
-            Assert.Equal(Checksum(_migrationSql[version - 1]), await ChecksumForVersionAsync(version));
+            var expected = version <= 5 ? Checksum(_migrationSql[version - 1]) : PublishedChecksum(_migrationSql[version - 1]);
+            Assert.Equal(expected, await ChecksumForVersionAsync(version));
         }
 
         // New durable storage exists; existing watermark rows keep their cursor bytes with
@@ -119,6 +120,10 @@ public sealed class EtlFinalizeMigrationTests : IAsyncLifetime
     }
 
     private static string Checksum(string sql) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sql)));
+
+    // Migrations applied now record the canonical published (git-blob LF)
+    // checksum; seeded ledger rows keep the seeded checksum byte-for-byte.
+    private static string PublishedChecksum(string sql) => Checksum(sql.Replace("\r\n", "\n", StringComparison.Ordinal));
 
     private static async Task InsertLedgerAsync(SqliteConnection connection, int version, string name, string sql)
     {

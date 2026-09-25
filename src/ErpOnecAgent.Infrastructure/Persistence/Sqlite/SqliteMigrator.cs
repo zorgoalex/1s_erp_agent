@@ -27,15 +27,26 @@ public sealed class SqliteMigrator(SqliteConnectionFactory factory)
             await using var stream = assembly.GetManifestResourceStream(resource) ?? throw new InvalidOperationException($"Missing migration resource {resource}.");
             using var reader = new StreamReader(stream);
             var sql = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
-            var checksum = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(sql)));
+            var resourceChecksum = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(sql)));
+            var checksum = MigrationChecksumCatalog.ResolveRecordedChecksum(version, fileName, resourceChecksum);
 
             await using var check = connection.CreateCommand();
-            check.CommandText = "SELECT checksum FROM schema_migrations WHERE version=$version;";
+            check.CommandText = "SELECT name, checksum FROM schema_migrations WHERE version=$version;";
             check.Parameters.AddWithValue("$version", version);
-            var existing = await check.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
-            if (existing is not null)
+            string? existingName = null;
+            string? existingChecksum = null;
+            await using (var ledger = await check.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
             {
-                if (!string.Equals(existing, checksum, StringComparison.Ordinal)) throw new InvalidOperationException($"Checksum mismatch for applied migration {fileName}.");
+                if (await ledger.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    existingName = ledger.GetString(0);
+                    existingChecksum = ledger.GetString(1);
+                }
+            }
+            if (existingChecksum is not null)
+            {
+                if (!string.Equals(existingName, fileName, StringComparison.Ordinal)) throw new InvalidOperationException($"Name mismatch for applied migration version {version}: ledger has {existingName}, resource is {fileName}.");
+                if (!MigrationChecksumCatalog.IsAcceptedStoredChecksum(version, fileName, resourceChecksum, existingChecksum)) throw new InvalidOperationException($"Checksum mismatch for applied migration {fileName}.");
                 continue;
             }
 

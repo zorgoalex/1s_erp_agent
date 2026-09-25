@@ -63,8 +63,8 @@ public sealed class PayloadConflictMigrationTests : IAsyncLifetime
         Assert.Equal(Checksum(_migration001Sql), await ChecksumForVersionAsync(1));
         Assert.Equal(Checksum(_migration002Sql), await ChecksumForVersionAsync(2));
         Assert.Equal(Checksum(_migration003Sql), await ChecksumForVersionAsync(3));
-        Assert.Equal(Checksum(_migration004Sql), await ChecksumForVersionAsync(4));
-        Assert.Equal(Checksum(_migration005Sql), await ChecksumForVersionAsync(5));
+        Assert.Equal(PublishedChecksum(_migration004Sql), await ChecksumForVersionAsync(4));
+        Assert.Equal(PublishedChecksum(_migration005Sql), await ChecksumForVersionAsync(5));
         Assert.Equal(8, await CountAsync("SELECT COUNT(*) FROM commands_inbox"));
         Assert.Equal(6, await CountAsync("SELECT COUNT(*) FROM command_attempts"));
         Assert.Equal(2, await CountAsync("SELECT COUNT(*) FROM results_outbox"));
@@ -89,6 +89,10 @@ public sealed class PayloadConflictMigrationTests : IAsyncLifetime
         await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Migrations", fileName));
 
     private static string Checksum(string sql) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sql)));
+
+    // Migrations applied now record the canonical published (git-blob LF)
+    // checksum; seeded ledger rows keep the seeded checksum byte-for-byte.
+    private static string PublishedChecksum(string sql) => Checksum(sql.Replace("\r\n", "\n", StringComparison.Ordinal));
 
     private static async Task InsertLedgerAsync(SqliteConnection connection, int version, string name, string sql)
     {

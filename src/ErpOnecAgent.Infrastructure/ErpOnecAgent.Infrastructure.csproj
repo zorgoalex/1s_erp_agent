@@ -14,4 +14,7 @@
   <ItemGroup>
     <EmbeddedResource Include="Persistence\Migrations\*.sql" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="ErpOnecAgent.UnitTests" />
+  </ItemGroup>
 </Project>

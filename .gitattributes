@@ -1,0 +1,5 @@
+# Migration SQL bytes are hashed (SHA-256, UTF-8) into the durable
+# schema_migrations ledger; published checksums are the git-blob LF form.
+# Pin LF checkouts so every clone embeds identical resource bytes. This does
+# not restage or rewrite the existing 001-007 files.
+src/ErpOnecAgent.Infrastructure/Persistence/Migrations/*.sql text eol=lf

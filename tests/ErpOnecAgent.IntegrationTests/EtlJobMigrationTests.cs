@@ -97,9 +97,9 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
         Assert.Equal(Checksum(_migration002Sql), await ChecksumForVersionAsync(2));
         Assert.Equal(Checksum(_migration003Sql), await ChecksumForVersionAsync(3));
         Assert.Equal(Checksum(_migration004Sql), await ChecksumForVersionAsync(4));
-        Assert.Equal(Checksum(_migration005Sql), await ChecksumForVersionAsync(5));
-        Assert.Equal(Checksum(_migration006Sql), await ChecksumForVersionAsync(6));
-        Assert.Equal(Checksum(_migration007Sql), await ChecksumForVersionAsync(7));
+        Assert.Equal(PublishedChecksum(_migration005Sql), await ChecksumForVersionAsync(5));
+        Assert.Equal(PublishedChecksum(_migration006Sql), await ChecksumForVersionAsync(6));
+        Assert.Equal(PublishedChecksum(_migration007Sql), await ChecksumForVersionAsync(7));
 
         // New durable storage exists and is empty; new pending-run columns backfill deterministically.
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='etl_jobs'"));
@@ -127,6 +127,10 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
         await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Migrations", fileName));
 
     private static string Checksum(string sql) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sql)));
+
+    // Migrations applied now record the canonical published (git-blob LF)
+    // checksum; seeded ledger rows keep the seeded checksum byte-for-byte.
+    private static string PublishedChecksum(string sql) => Checksum(sql.Replace("\r\n", "\n", StringComparison.Ordinal));
 
     private static async Task InsertLedgerAsync(SqliteConnection connection, int version, string name, string sql)
     {
