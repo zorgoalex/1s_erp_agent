@@ -458,7 +458,7 @@ public sealed class A07ModeStateTests : IAsyncLifetime
             _store,
             onec,
             new FakeOnecHealthClient(),
-            new EtlTrigger(),
+            new DynamicConfigurationState(Options.Create(new CommandOptions()), Options.Create(new EtlOptions())),
             state,
             controller,
             diagnostics,

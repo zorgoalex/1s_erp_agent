@@ -14,6 +14,9 @@ public interface IDiskSpaceProbe
 /// <summary>Raised when ETL spool writing would cut into the command disk reserve, or the disk is full.</summary>
 public sealed class EtlDiskReserveException(string message, Exception? inner = null) : IOException(message, inner);
 
+/// <summary>C1: raised when an ETL batch would exceed the configured spool quota (StorageOptions.MaxSpoolBytes).</summary>
+public sealed class EtlSpoolLimitException(string message) : IOException(message);
+
 public static class EtlDiskAdmission
 {
     /// <summary>Headroom required on top of the reserve before a new batch file is started.</summary>

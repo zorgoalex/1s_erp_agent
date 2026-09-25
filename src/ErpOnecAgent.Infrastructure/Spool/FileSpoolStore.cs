@@ -29,7 +29,7 @@ public sealed class FileSpoolStore(string spoolRoot, long maxBatchCompressedByte
         var temporaryPath = Path.Combine(creating, fileName + ".tmp");
         var readyPath = Path.Combine(ready, fileName);
         var existingSpoolBytes = await GetSizeAsync(cancellationToken).ConfigureAwait(false);
-        if (existingSpoolBytes >= _maxSpoolBytes) throw new IOException($"ETL spool limit reached: {existingSpoolBytes} bytes of {_maxSpoolBytes} bytes.");
+        if (existingSpoolBytes >= _maxSpoolBytes) throw new EtlSpoolLimitException($"ETL spool limit reached: {existingSpoolBytes} bytes of {_maxSpoolBytes} bytes.");
         EnsureDiskReserve(Math.Min(_maxBatchCompressedBytes, EtlDiskAdmission.DefaultBatchHeadroomBytes), "before the batch file is created");
         long uncompressed = 0;
         try
@@ -62,7 +62,7 @@ public sealed class FileSpoolStore(string spoolRoot, long maxBatchCompressedByte
             }
             var temporaryLength = new FileInfo(temporaryPath).Length;
             if (temporaryLength > _maxBatchCompressedBytes) throw new IOException($"Compressed ETL batch exceeds configured limit of {_maxBatchCompressedBytes} bytes.");
-            if (existingSpoolBytes + temporaryLength > _maxSpoolBytes) throw new IOException($"ETL batch would exceed configured spool limit of {_maxSpoolBytes} bytes.");
+            if (existingSpoolBytes + temporaryLength > _maxSpoolBytes) throw new EtlSpoolLimitException($"ETL batch would exceed configured spool limit of {_maxSpoolBytes} bytes.");
             File.Move(temporaryPath, readyPath, overwrite: false);
             await using var verify = new FileStream(readyPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65_536, FileOptions.Asynchronous | FileOptions.SequentialScan);
             var compressedLength = verify.Length;
@@ -123,7 +123,13 @@ public sealed class FileSpoolStore(string spoolRoot, long maxBatchCompressedByte
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (!Directory.Exists(_root)) return Task.FromResult(0L);
-        return Task.FromResult(Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories).Sum(static path => new FileInfo(path).Length));
+        // The quota bounds the upload backlog; quarantined files (orphans, leftover .tmp) are
+        // evidence, not backlog, and would otherwise hold extraction deferred forever. They
+        // still count against the real disk reserve (A08).
+        var quarantine = Path.Combine(_root, "quarantine") + Path.DirectorySeparatorChar;
+        return Task.FromResult(Directory.EnumerateFiles(_root, "*", SearchOption.AllDirectories)
+            .Where(path => !path.StartsWith(quarantine, StringComparison.OrdinalIgnoreCase))
+            .Sum(static path => new FileInfo(path).Length));
     }
 
     public Task QuarantineTemporaryFilesAsync(CancellationToken cancellationToken)
@@ -144,6 +150,25 @@ public sealed class FileSpoolStore(string spoolRoot, long maxBatchCompressedByte
         var path = EnsureInsideRoot(batch.FilePath);
         if (File.Exists(path)) File.Delete(path);
         return Task.CompletedTask;
+    }
+
+    /// <inheritdoc cref="ISpoolStore.QuarantineUnreferencedReadyFilesAsync"/>
+    public Task<int> QuarantineUnreferencedReadyFilesAsync(IReadOnlySet<string> referencedPaths, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(referencedPaths);
+        var ready = Path.Combine(_root, "ready");
+        if (!Directory.Exists(ready)) return Task.FromResult(0);
+        var known = new HashSet<string>(referencedPaths.Select(static path => Path.GetFullPath(path)), StringComparer.OrdinalIgnoreCase);
+        var quarantine = EnsureSubdirectory("quarantine");
+        var moved = 0;
+        foreach (var path in Directory.EnumerateFiles(ready, "*", SearchOption.TopDirectoryOnly))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (known.Contains(Path.GetFullPath(path))) continue;
+            File.Move(path, Path.Combine(quarantine, Path.GetFileName(path) + ".orphan." + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture)), overwrite: false);
+            moved++;
+        }
+        return Task.FromResult(moved);
     }
 
     private static object BuildEnvelope(JsonElement row, EtlEntityDefinition entity)

@@ -89,6 +89,8 @@ public sealed class EtlOptions
     public int MaxConcurrentBatchUploads { get; init; } = 2;
     /// <summary>Durable bound on ADMITTED batch send attempts (O2 send ledger, decision D1). Uncertain outcomes never retry, so this bounds ledger-proven-unsent (precheck_failed) admissions; persisted on the batch at first claim with identical-value enforcement.</summary>
     public int MaxBatchUploadAttempts { get; init; } = 5;
+    /// <summary>C1: bound on completion sends of one run (F1 completion_max_attempts); exhaustion blocks the run.</summary>
+    public int MaxRunCompletionAttempts { get; init; } = 20;
     public int TargetBatchUncompressedBytes { get; init; } = 10 * 1024 * 1024;
     /// <summary>A10: hard bound on one OData page response body (bytes, after decompression); exceeding it fails the read.
     /// The page is parsed as a whole, so peak memory is a small multiple of this value (parse buffer plus

@@ -52,7 +52,10 @@ public sealed class ErpClient : IErpClient
     public async Task AcknowledgeResultAsync(Guid commandId, string resultJson, CancellationToken cancellationToken) =>
         await SendNoContentAsync(HttpMethod.Put, $"commands/{commandId:D}/result", new StringContent(resultJson, Encoding.UTF8, "application/json"), cancellationToken).ConfigureAwait(false);
 
-    public async Task<BatchAcknowledgement> UploadBatchAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken)
+    public async Task<BatchAcknowledgement> UploadBatchAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken) =>
+        (await UploadBatchWithEvidenceAsync(batch, content, cancellationToken).ConfigureAwait(false)).Ack;
+
+    public async Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken)
     {
         using var request = CreateRequest(HttpMethod.Post, "etl/batches");
         request.Headers.TryAddWithoutValidation("Idempotency-Key", batch.BatchId.ToString("D"));
@@ -67,8 +70,10 @@ public sealed class ErpClient : IErpClient
         request.Content.Headers.ContentEncoding.Add("gzip");
         using var response = await _sendAsync(request, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
-        return await response.Content.ReadFromJsonAsync<BatchAcknowledgement>(JsonOptions, cancellationToken).ConfigureAwait(false)
+        var body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        var ack = JsonSerializer.Deserialize<BatchAcknowledgement>(body, JsonOptions)
             ?? throw new InvalidDataException("ERP returned an empty ETL acknowledgement.");
+        return new BatchUploadResponse(ack, body, (int)response.StatusCode);
     }
 
     public async Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken) =>

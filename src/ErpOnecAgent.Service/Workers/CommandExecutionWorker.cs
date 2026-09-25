@@ -4,6 +4,7 @@ using ErpOnecAgent.Application.Abstractions;
 using ErpOnecAgent.Application.Commands;
 using ErpOnecAgent.Application.Configuration;
 using ErpOnecAgent.Domain.Commands;
+using ErpOnecAgent.Domain.Etl;
 using ErpOnecAgent.Service.Diagnostics;
 using ErpOnecAgent.Service.Runtime;
 using Microsoft.Extensions.Options;
@@ -14,7 +15,7 @@ public sealed class CommandExecutionWorker(
     IAgentStore store,
     IOnecCommandClient onec,
     IOnecHealthClient health,
-    EtlTrigger etlTrigger,
+    DynamicConfigurationState configuration,
     AgentRuntimeState state,
     LocalEtlPauseController localPause,
     DiagnosticsCollector diagnostics,
@@ -94,18 +95,21 @@ public sealed class CommandExecutionWorker(
         switch (command.CommandType)
         {
             case "start_full_sync":
-                var entities = command.Payload.TryGetProperty("entities", out var list) && list.ValueKind == JsonValueKind.Array ? list.EnumerateArray().Select(static item => item.GetString()).Where(static item => item is not null).Cast<string>().ToArray() : null;
-                if (!etlTrigger.TryWrite(new("bootstrap_full", entities))) { await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ETL_TRIGGER_QUEUE_FULL", "ETL trigger queue is full.", true, cancellationToken).ConfigureAwait(false); return true; }
-                data = new { accepted = true, mode = "bootstrap_full" }; break;
+            {
+                var requested = command.Payload.TryGetProperty("entities", out var list) && list.ValueKind == JsonValueKind.Array
+                    ? list.EnumerateArray().Select(static item => item.GetString()).Where(static item => item is not null).Cast<string>().ToArray()
+                    : [];
+                return await AcceptEtlJobAsync(command, claimOwner, "bootstrap_full", requested, cancellationToken).ConfigureAwait(false);
+            }
             case "reload_entity":
                 if (!command.Payload.TryGetProperty("entity", out var entityValue) || string.IsNullOrWhiteSpace(entityValue.GetString())) { await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ENTITY_REQUIRED", "payload.entity is required.", false, cancellationToken).ConfigureAwait(false); return true; }
-                var entity = entityValue.GetString()!;
-                if (!etlTrigger.TryWrite(new("entity_reload", [entity]))) { await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ETL_TRIGGER_QUEUE_FULL", "ETL trigger queue is full.", true, cancellationToken).ConfigureAwait(false); return true; }
-                data = new { accepted = true, mode = "entity_reload", entity }; break;
+                return await AcceptEtlJobAsync(command, claimOwner, "entity_reload", [entityValue.GetString()!], cancellationToken).ConfigureAwait(false);
             case "reconcile_keys":
             case "reconcile_totals":
-                if (!etlTrigger.TryWrite(new(command.CommandType, null))) { await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ETL_TRIGGER_QUEUE_FULL", "ETL trigger queue is full.", true, cancellationToken).ConfigureAwait(false); return true; }
-                data = new { accepted = true, mode = command.CommandType }; break;
+                // Reconciliation modes are not implemented (A10); they are refused explicitly
+                // instead of silently running a full read.
+                await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ETL_MODE_UNSUPPORTED", $"'{command.CommandType}' is not supported by this agent version.", false, cancellationToken).ConfigureAwait(false);
+                return true;
             case "pause_etl":
                 await localPause.SetAsync(true, cancellationToken).ConfigureAwait(false);
                 data = new { mode = state.EffectiveMode.ToString() };
@@ -123,6 +127,51 @@ public sealed class CommandExecutionWorker(
         var result = JsonSerializer.Serialize(new { commandId = command.CommandId, status = "succeeded", completedAtUtc = DateTimeOffset.UtcNow, data, warnings = Array.Empty<string>(), resultVersion = 1 }, JsonOptions);
         await store.CompleteLocallyAsync(command.CommandId, claimOwner, CommandStatus.SucceededLocal, result, null, null, null, cancellationToken).ConfigureAwait(false);
         return true;
+    }
+
+    // C1: a durable ETL job + pending run + the command's accepted result + outbox commit in ONE
+    // transaction (A03a). The extraction worker dispatches the job from SQLite; nothing lives
+    // only in RAM. An explicit entity list must name enabled configured entities; an empty
+    // start_full_sync selects every enabled entity.
+    private async Task<bool> AcceptEtlJobAsync(CommandEnvelope command, string claimOwner, string mode, string[] requested, CancellationToken cancellationToken)
+    {
+        var enabled = configuration.Entities.Where(static entity => entity.Enabled).ToArray();
+        EtlEntityDefinition[] selected;
+        if (requested.Length == 0) selected = enabled;
+        else
+        {
+            var unknown = requested.Where(code => !enabled.Any(entity => entity.EntityCode == code)).ToArray();
+            if (unknown.Length > 0)
+            {
+                await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ENTITY_UNKNOWN", $"Not an enabled configured entity: {string.Join(", ", unknown)}.", false, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            selected = requested.Distinct(StringComparer.Ordinal).Select(code => enabled.First(entity => entity.EntityCode == code)).ToArray();
+        }
+        if (selected.Length == 0)
+        {
+            await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "NO_ENTITIES", "No enabled ETL entities are configured.", false, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+
+        var outcome = await store.AcceptEtlJobAndCompleteCommandAsync(command.CommandId, claimOwner, new EtlJobAcceptanceRequest(mode, selected, configuration.Version), cancellationToken).ConfigureAwait(false);
+        switch (outcome)
+        {
+            case EtlJobAcceptanceOutcome.Applied applied:
+                logger.LogInformation("ETL_JOB_ACCEPTED CommandId={CommandId} JobId={JobId} RunId={RunId} Mode={Mode}", command.CommandId, applied.Job.JobId, applied.Job.RunId, mode);
+                return true;
+            case EtlJobAcceptanceOutcome.AlreadyAccepted:
+                return true;
+            case EtlJobAcceptanceOutcome.NotApplied { Reason: EtlJobAcceptanceRejection.TypeModeMismatch }:
+                await SaveErrorAsync(command, claimOwner, CommandStatus.BusinessFailedLocal, "ENTITY_SELECTION_INVALID", "The resolved entity selection does not correspond to the command payload.", false, cancellationToken).ConfigureAwait(false);
+                return true;
+            case EtlJobAcceptanceOutcome.NotApplied notApplied:
+                // Claim lost, not in the never-sent state, expired or conflicting: nothing was
+                // written; the administrative fail-closed path records the uncertainty.
+                throw new InvalidOperationException($"ETL job acceptance not applied: {notApplied.Reason}.");
+            default:
+                throw new InvalidOperationException("Unknown ETL job acceptance outcome.");
+        }
     }
 
     private async Task SaveErrorAsync(CommandEnvelope command, string claimOwner, CommandStatus status, string code, string message, bool retryable, CancellationToken cancellationToken)

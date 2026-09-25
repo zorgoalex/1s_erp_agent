@@ -51,7 +51,7 @@ static async Task<int> RunAsync(string[] args)
         sp.GetRequiredService<IOptions<StorageOptions>>().Value.MinimumReservedBytesForCommands));
     builder.Services.AddSingleton<ISecretStore>(sp => new DpapiSecretStore(Path.Combine(sp.GetRequiredService<IOptions<AgentOptions>>().Value.DataDirectory, "secrets")));
     builder.Services.AddSingleton<OnecAuthentication>();
-    builder.Services.AddSingleton<AgentRuntimeState>(); builder.Services.AddSingleton<DynamicConfigurationState>(); builder.Services.AddSingleton<LocalEtlPauseController>(); builder.Services.AddSingleton<EtlTrigger>(); builder.Services.AddSingleton<SingleInstanceLock>(); builder.Services.AddSingleton<ErpSessionManager>(); builder.Services.AddSingleton<AgentMetricsCollector>();
+    builder.Services.AddSingleton<AgentRuntimeState>(); builder.Services.AddSingleton<DynamicConfigurationState>(); builder.Services.AddSingleton<LocalEtlPauseController>(); builder.Services.AddSingleton<SingleInstanceLock>(); builder.Services.AddSingleton<ErpSessionManager>(); builder.Services.AddSingleton<AgentMetricsCollector>();
     builder.Services.AddSingleton<DiagnosticsCollector>();
 
     builder.Services.AddErpApi();
@@ -72,8 +72,11 @@ static async Task<int> RunAsync(string[] args)
     builder.Services.AddHostedService<ResultDeliveryWorker>();
     builder.Services.AddHostedService<CommandLeaseWorker>();
     builder.Services.AddHostedService<CommandExecutionWorker>();
-    builder.Services.AddHostedService<EtlBatchUploadWorker>();
-    builder.Services.AddHostedService<OnecEtlWorker>();
+    // C1: the durable ETL path. The legacy OnecEtlWorker/EtlBatchUploadWorker and the RAM
+    // EtlTrigger are removed; the legacy writers are fenced out of IAgentStore.
+    builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlExtractionWorker>();
+    builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlUploadWorker>();
+    builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlCompletionWorker>();
     builder.Services.AddHostedService<HealthMonitorWorker>();
     builder.Services.AddHostedService<HeartbeatWorker>();
     builder.Services.AddHostedService<MaintenanceWorker>();
@@ -120,7 +123,7 @@ static void ConfigureOptions(IServiceCollection services, IConfiguration configu
     services.AddOptions<CommandOptions>().Bind(configuration.GetSection(CommandOptions.SectionName))
         .Validate(static value => value.MaxConcurrency is >= 1 and <= 4 && value.DefaultTimeoutSeconds > 0 && value.MaxPayloadBytes > 0, "Command limits are invalid.").ValidateOnStart();
     services.AddOptions<EtlOptions>().Bind(configuration.GetSection(EtlOptions.SectionName))
-        .Validate(static value => value.IntervalMinutes > 0 && value.SafetyLagSeconds >= 0 && value.DefaultPageSize is >= 1 and <= 10_000 && value.TargetBatchUncompressedBytes > 0 && value.MaxConcurrentRequests is >= 1 and <= 8 && value.MaxConcurrentBatchUploads is >= 1 and <= 8 && value.MaxBatchUploadAttempts is >= 1 and <= 20 && value.MaxODataPageBytes is >= 1024 * 1024 and <= 256L * 1024 * 1024 && value.MaxODataRowBytes is >= 64 * 1024 && value.MaxODataRowBytes <= value.MaxODataPageBytes && value.ODataPageRetries is >= 0 and <= 10 && value.ODataRetryBaseDelayMilliseconds is >= 0 and <= 60_000, "ETL limits are invalid.")
+        .Validate(static value => value.IntervalMinutes > 0 && value.SafetyLagSeconds >= 0 && value.DefaultPageSize is >= 1 and <= 10_000 && value.TargetBatchUncompressedBytes > 0 && value.MaxConcurrentRequests is >= 1 and <= 8 && value.MaxConcurrentBatchUploads is >= 1 and <= 8 && value.MaxBatchUploadAttempts is >= 1 and <= 20 && value.MaxODataPageBytes is >= 1024 * 1024 and <= 256L * 1024 * 1024 && value.MaxODataRowBytes is >= 64 * 1024 && value.MaxODataRowBytes <= value.MaxODataPageBytes && value.ODataPageRetries is >= 0 and <= 10 && value.ODataRetryBaseDelayMilliseconds is >= 0 and <= 60_000 && value.MaxRunCompletionAttempts is >= 1 and <= 100, "ETL limits are invalid.")
         .Validate(static value => value.Entities.Select(static entity => entity.EntityCode).Distinct(StringComparer.Ordinal).Count() == value.Entities.Count, "ETL entity codes must be unique.")
         .Validate(static value => value.Entities.All(static entity =>
         {

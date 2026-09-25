@@ -633,7 +633,7 @@ public sealed class A07CommandBoundaryTests : IAsyncLifetime
             store,
             onec,
             new FakeOnecHealthClient(),
-            new EtlTrigger(),
+            new DynamicConfigurationState(Options.Create(new CommandOptions()), Options.Create(new EtlOptions())),
             state,
             new LocalEtlPauseController(store, state),
             diagnostics,

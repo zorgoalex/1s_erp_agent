@@ -13,6 +13,17 @@ public interface IErpClient
     Task AcknowledgeReceivedAsync(Guid commandId, CommandReceivedRequest request, CancellationToken cancellationToken);
     Task AcknowledgeResultAsync(Guid commandId, string resultJson, CancellationToken cancellationToken);
     Task<BatchAcknowledgement> UploadBatchAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// C1: the upload with its ACK evidence — the received response body bytes and HTTP status,
+    /// so the send ledger hashes what ERP actually returned. The default (test doubles) derives
+    /// the body from the parsed ACK.
+    /// </summary>
+    async Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken)
+    {
+        var ack = await UploadBatchAsync(batch, content, cancellationToken).ConfigureAwait(false);
+        return new BatchUploadResponse(ack, JsonSerializer.SerializeToUtf8Bytes(ack, JsonSerializerOptions.Web), 200);
+    }
     Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken);
 
     /// <summary>
@@ -56,3 +67,6 @@ public interface IOnecIdentityClient
 {
     Task<ErpOnecAgent.Application.Etl.OnecIdentityFetchResult> GetIdentityAsync(CancellationToken cancellationToken);
 }
+
+/// <summary>C1: a parsed batch ACK with the exact response body bytes and HTTP status it came from.</summary>
+public sealed record BatchUploadResponse(BatchAcknowledgement Ack, byte[] Body, int HttpStatus);

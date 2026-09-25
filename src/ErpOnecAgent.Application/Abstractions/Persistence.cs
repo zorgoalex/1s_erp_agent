@@ -197,18 +197,9 @@ public interface IAgentStore
     /// </summary>
     Task<EtlWatermarkDomainResetOutcome> ResetEtlWatermarkDomainAsync(EtlWatermarkDomainResetRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
-    Task CreateEtlRunAsync(EtlRun run, CancellationToken cancellationToken);
-    Task RegisterBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
-    Task MarkEtlRunExtractedAsync(Guid runId, CancellationToken cancellationToken);
-    Task<IReadOnlyList<EtlBatch>> GetPendingBatchesAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
-    Task MarkBatchRetryAsync(Guid batchId, string errorMessage, DateTimeOffset retryAtUtc, CancellationToken cancellationToken);
-    Task AcknowledgeBatchAsync(Guid batchId, DateTimeOffset acknowledgedAtUtc, CancellationToken cancellationToken);
     Task<IReadOnlyList<EtlBatch>> GetAcknowledgedBatchesAsync(DateTimeOffset beforeUtc, CancellationToken cancellationToken);
     Task MarkBatchDeletedAsync(Guid batchId, CancellationToken cancellationToken);
-    Task<IReadOnlyList<EtlRunCompletion>> GetRunsReadyToCompleteAsync(CancellationToken cancellationToken);
     Task<EtlCursor?> GetCommittedWatermarkAsync(string entityName, CancellationToken cancellationToken);
-    Task CommitWatermarkAsync(string entityName, EtlCursor cursor, Guid runId, CancellationToken cancellationToken);
-    Task CompleteEtlRunAsync(Guid runId, EtlRunStatus status, string? errorMessage, CancellationToken cancellationToken);
 
     // --- A05b F1 dark storage APIs (isolated new path; NOT wired into workers,
     // recovery, or the ERP client — see EtlFinalize.cs header). Existing v5 writers
@@ -334,6 +325,27 @@ public interface IAgentStore
     /// </summary>
     Task<EtlRecoveryResult> RecoverInterruptedEtlRunsAsync(CancellationToken cancellationToken);
 
+    /// <summary>
+    /// C1 upgrade fence (startup-only, exclusive host): every running/uploading/completing run
+    /// without ownership bindings was written by the legacy pipeline and can never reach the
+    /// new path's readiness. It is blocked LEGACY_UNRESOLVED with its remaining
+    /// pre-acknowledgement batches fenced (RUN_BLOCKED), evidence preserved for R1 resolution.
+    /// Returns the number of runs blocked.
+    /// </summary>
+    Task<int> BlockLegacyEtlRunsAsync(CancellationToken cancellationToken);
+
+    /// <summary>C1 spool reconciliation: file paths referenced by every non-deleted batch row.</summary>
+    Task<IReadOnlySet<string>> GetReferencedBatchFilePathsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// C1 spool reconciliation (startup-only, exclusive host): every not-yet-sent batch
+    /// (ready/retry_waiting) whose spool file no longer exists is dead-lettered RUN_BLOCKED with
+    /// last_error SPOOL_FILE_MISSING, the rest of its run's pending batches are fenced RUN_BLOCKED, and
+    /// the run is blocked SPOOL_FILE_MISSING (ownership retained, evidence preserved for R1).
+    /// Returns the number of batches found missing.
+    /// </summary>
+    Task<int> BlockRunsWithMissingSpoolFilesAsync(Func<string, bool> fileExists, CancellationToken cancellationToken);
+
     // --- O2 dark storage APIs: the durable admitted-attempt send ledger with
     // owner-fenced claim/ACK/outcome and fail-closed unknown-outcome handling
     // (isolated new path; NOT wired into workers, recovery wiring, or the ERP
@@ -422,6 +434,25 @@ public interface IAgentStore
     Task CleanupAsync(DateTimeOffset completedBeforeUtc, DateTimeOffset batchesBeforeUtc, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// C1: the legacy (pre-O1) ETL writers — each one bypasses ownership, the extraction claim,
+/// the seal, the send ledger or the atomic finalize (design §9). They are fenced OUT of
+/// <see cref="IAgentStore"/>, so production code cannot reach them. They remain only for
+/// historical tests and upgrade fixtures that reproduce legacy rows.
+/// </summary>
+public interface ILegacyEtlStore
+{
+    Task CreateEtlRunAsync(EtlRun run, CancellationToken cancellationToken);
+    Task RegisterBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
+    Task MarkEtlRunExtractedAsync(Guid runId, CancellationToken cancellationToken);
+    Task<IReadOnlyList<EtlBatch>> GetPendingBatchesAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+    Task MarkBatchRetryAsync(Guid batchId, string errorMessage, DateTimeOffset retryAtUtc, CancellationToken cancellationToken);
+    Task AcknowledgeBatchAsync(Guid batchId, DateTimeOffset acknowledgedAtUtc, CancellationToken cancellationToken);
+    Task<IReadOnlyList<EtlRunCompletion>> GetRunsReadyToCompleteAsync(CancellationToken cancellationToken);
+    Task CommitWatermarkAsync(string entityName, EtlCursor cursor, Guid runId, CancellationToken cancellationToken);
+    Task CompleteEtlRunAsync(Guid runId, EtlRunStatus status, string? errorMessage, CancellationToken cancellationToken);
+}
+
 public interface ISpoolStore
 {
     Task<EtlBatch> WriteBatchAsync(Guid runId, EtlEntityDefinition entity, IReadOnlyList<System.Text.Json.JsonElement> rows, EtlCursor? watermarkFrom, EtlCursor? watermarkTo, CancellationToken cancellationToken);
@@ -429,6 +460,9 @@ public interface ISpoolStore
     Task<long> GetSizeAsync(CancellationToken cancellationToken);
     Task QuarantineTemporaryFilesAsync(CancellationToken cancellationToken);
     Task DeleteAcknowledgedAsync(EtlBatch batch, CancellationToken cancellationToken);
+
+    /// <summary>C1: moves every ready spool file not in <paramref name="referencedPaths"/> to quarantine (a crash between file rename and batch registration). Returns the moved count.</summary>
+    Task<int> QuarantineUnreferencedReadyFilesAsync(IReadOnlySet<string> referencedPaths, CancellationToken cancellationToken) => Task.FromResult(0);
 }
 
 public interface ISecretStore

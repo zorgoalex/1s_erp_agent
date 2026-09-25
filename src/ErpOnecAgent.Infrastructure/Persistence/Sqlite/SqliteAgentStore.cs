@@ -8,7 +8,7 @@ using Microsoft.Data.Sqlite;
 
 namespace ErpOnecAgent.Infrastructure.Persistence.Sqlite;
 
-public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, SqliteMigrator migrator) : IAgentStore
+public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, SqliteMigrator migrator) : IAgentStore, ILegacyEtlStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     // Process-lifetime write gate: serializes the read-check-write config transactions for every
@@ -28,7 +28,9 @@ public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, Sq
             "UPDATE commands_inbox SET exec_claim_owner_id=NULL, exec_claim_acquired_at_utc=NULL, row_version=row_version+1 WHERE status IN ('queued','retry_waiting','unknown_result') AND (exec_claim_owner_id IS NOT NULL OR exec_claim_acquired_at_utc IS NOT NULL);",
             cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(connection, transaction,
-            "UPDATE results_outbox SET status='pending', next_attempt_at_utc=$now WHERE status='sending'; UPDATE etl_batches SET status='ready', next_attempt_at_utc=$now WHERE status='uploading';",
+            // C1: an 'uploading' batch is NEVER reset to 'ready' here (bypass #7) — its remote
+            // outcome is unknown; RecoverInterruptedEtlRunsAsync quarantines it.
+            "UPDATE results_outbox SET status='pending', next_attempt_at_utc=$now WHERE status='sending';",
             cancellationToken, ("$now", UtcNow())).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }

@@ -44,7 +44,19 @@ public sealed class BootstrapService(
         if (!string.Equals(integrity, "ok", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"SQLite integrity check failed: {integrity}");
         if (database is not null) DatabasePresenceGuard.MarkInitialized(database.DatabasePath);
         await store.RecoverAsync(cancellationToken).ConfigureAwait(false);
+        // C1 startup recovery of the durable ETL path (exclusive host, before any worker runs):
+        // fence legacy runs first (so an interrupted legacy run is reported LEGACY_UNRESOLVED,
+        // not INTERRUPTED), then orphan admitted sends, quarantine in-flight batches and block
+        // interrupted runs, quarantine spool files no batch row references, and block runs
+        // whose registered batch file is missing.
+        var legacyBlocked = await store.BlockLegacyEtlRunsAsync(cancellationToken).ConfigureAwait(false);
+        var recovery = await store.RecoverInterruptedEtlRunsAsync(cancellationToken).ConfigureAwait(false);
         await spool.QuarantineTemporaryFilesAsync(cancellationToken).ConfigureAwait(false);
+        var orphans = await spool.QuarantineUnreferencedReadyFilesAsync(await store.GetReferencedBatchFilePathsAsync(cancellationToken).ConfigureAwait(false), cancellationToken).ConfigureAwait(false);
+        var missingFiles = await store.BlockRunsWithMissingSpoolFilesAsync(File.Exists, cancellationToken).ConfigureAwait(false);
+        if (recovery.RunsBlocked + recovery.BatchesFenced + recovery.AttemptsOrphaned + legacyBlocked + orphans + missingFiles > 0)
+            logger.LogWarning("ETL_STARTUP_RECOVERY RunsBlocked={Runs} BatchesFenced={Batches} AttemptsOrphaned={Attempts} LegacyRunsBlocked={Legacy} OrphanSpoolFiles={Orphans} MissingSpoolFiles={Missing}",
+                recovery.RunsBlocked, recovery.BatchesFenced, recovery.AttemptsOrphaned, legacyBlocked, orphans, missingFiles);
         await localPause.RestoreAsync(cancellationToken).ConfigureAwait(false);
         var active = await store.GetActiveConfigSnapshotAsync(cancellationToken).ConfigureAwait(false);
         if (active is not null)

@@ -680,9 +680,12 @@ public sealed class EtlSendLedgerO2Tests : IAsyncLifetime
         var runId = await SealedRunAsync("clients");
         var batchId = await ReadyBatchIdAsync(runId);
         var claim = Assert.IsType<EtlBatchUploadClaimOutcome.Claimed>(await _store.TryClaimBatchUploadAsync(batchId, "u", DateTimeOffset.UtcNow, 5, CancellationToken.None)).Claim;
-        // Production startup order: legacy RecoverAsync resets 'uploading' -> 'ready'.
+        // C1: RecoverAsync no longer resets 'uploading' -> 'ready' (bypass #7 fenced).
         await _store.RecoverAsync(CancellationToken.None);
-        Assert.Equal("ready", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batchId:D}'"));
+        Assert.Equal("uploading", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batchId:D}'"));
+        // The ledger must still hold if any writer outside it makes the batch due again
+        // (the pre-C1 reset is reproduced directly).
+        await ExecuteSqlAsync("UPDATE etl_batches SET status='ready' WHERE batch_id=$b;", ("$b", batchId.ToString("D")));
 
         // The uncertain outcome of the admitted attempt lands after the reset.
         await _store.FailClaimedBatchSendAsync(batchId, claim.AttemptId, "timeout", null, CancellationToken.None);
