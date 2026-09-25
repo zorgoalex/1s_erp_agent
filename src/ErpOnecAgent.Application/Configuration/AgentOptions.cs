@@ -96,6 +96,11 @@ public sealed class EtlOptions
     public long MaxODataPageBytes { get; init; } = 64L * 1024 * 1024;
     /// <summary>A10: hard bound on one OData record's JSON text (bytes).</summary>
     public int MaxODataRowBytes { get; init; } = 8 * 1024 * 1024;
+    /// <summary>A10c: retries of one OData page after a transient failure (network, timeout, 408/429/5xx); 0 disables.
+    /// Reading is idempotent and no row of a failed page has been yielded, so a retry cannot duplicate rows.</summary>
+    public int ODataPageRetries { get; init; } = 3;
+    /// <summary>A10c: first retry delay; doubles per attempt.</summary>
+    public int ODataRetryBaseDelayMilliseconds { get; init; } = 1000;
     public IReadOnlyList<EtlEntityDefinition> Entities { get; init; } = [];
 }
 

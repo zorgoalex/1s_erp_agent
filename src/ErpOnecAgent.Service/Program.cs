@@ -58,7 +58,10 @@ static async Task<int> RunAsync(string[] args)
 
     builder.Services.AddHttpClient<IOnecCommandClient, OnecCommandClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.CommandApiBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.RequestTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler());
     builder.Services.AddHttpClient<IOnecHealthClient, OnecHealthClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.CommandApiBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.HealthTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler()).AddStandardResilienceHandler();
-    builder.Services.AddHttpClient<IOnecODataClient, OnecODataClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.ODataBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.RequestTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler()).AddStandardResilienceHandler();
+    builder.Services.AddHttpClient<IOnecODataClient, OnecODataClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.ODataBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.RequestTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler());
+    // A10c: no resilience handler on the OData client — OnecODataClient retries whole pages
+    // itself (bounded, body included); a second layer would multiply attempts and its 10 s
+    // attempt timeout would cut long 1C queries.
     // S1: read-only identity of the 1C source (extension GET identity). No resilience
     // retries: a failed read is classified and the ETL gate simply does not start work.
     builder.Services.AddHttpClient<IOnecIdentityClient, OnecIdentityClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.CommandApiBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.HealthTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler());
@@ -117,7 +120,7 @@ static void ConfigureOptions(IServiceCollection services, IConfiguration configu
     services.AddOptions<CommandOptions>().Bind(configuration.GetSection(CommandOptions.SectionName))
         .Validate(static value => value.MaxConcurrency is >= 1 and <= 4 && value.DefaultTimeoutSeconds > 0 && value.MaxPayloadBytes > 0, "Command limits are invalid.").ValidateOnStart();
     services.AddOptions<EtlOptions>().Bind(configuration.GetSection(EtlOptions.SectionName))
-        .Validate(static value => value.IntervalMinutes > 0 && value.SafetyLagSeconds >= 0 && value.DefaultPageSize is >= 1 and <= 10_000 && value.TargetBatchUncompressedBytes > 0 && value.MaxConcurrentRequests is >= 1 and <= 8 && value.MaxConcurrentBatchUploads is >= 1 and <= 8 && value.MaxBatchUploadAttempts is >= 1 and <= 20 && value.MaxODataPageBytes is >= 1024 * 1024 and <= 256L * 1024 * 1024 && value.MaxODataRowBytes is >= 64 * 1024 && value.MaxODataRowBytes <= value.MaxODataPageBytes, "ETL limits are invalid.")
+        .Validate(static value => value.IntervalMinutes > 0 && value.SafetyLagSeconds >= 0 && value.DefaultPageSize is >= 1 and <= 10_000 && value.TargetBatchUncompressedBytes > 0 && value.MaxConcurrentRequests is >= 1 and <= 8 && value.MaxConcurrentBatchUploads is >= 1 and <= 8 && value.MaxBatchUploadAttempts is >= 1 and <= 20 && value.MaxODataPageBytes is >= 1024 * 1024 and <= 256L * 1024 * 1024 && value.MaxODataRowBytes is >= 64 * 1024 && value.MaxODataRowBytes <= value.MaxODataPageBytes && value.ODataPageRetries is >= 0 and <= 10 && value.ODataRetryBaseDelayMilliseconds is >= 0 and <= 60_000, "ETL limits are invalid.")
         .Validate(static value => value.Entities.Select(static entity => entity.EntityCode).Distinct(StringComparer.Ordinal).Count() == value.Entities.Count, "ETL entity codes must be unique.")
         .Validate(static value => value.Entities.All(static entity =>
         {

@@ -13,10 +13,20 @@ namespace ErpOnecAgent.Infrastructure.OneC;
 // A10: every page body is read through a byte-bounded stream (after decompression) and every
 // record's JSON text is bounded, so a huge or runaway response fails the read with
 // InvalidDataException instead of exhausting memory. The run then fails closed.
+// A10c: a page that fails transiently (network, timeout, 408/429/5xx) is fetched again, a
+// bounded number of times with doubling delay. The read is idempotent and the page is parsed
+// completely before any of its rows is yielded, so a retry never duplicates or skips rows.
+// Limit violations, malformed JSON, TLS failures, other HTTP statuses and caller cancellation
+// are not retried. Each attempt (headers AND body) is bounded by the client timeout, so a
+// stalled body is a retryable timeout instead of a hang. This is the ONLY retry layer of the
+// OData client (no resilience handler is registered for it). A nextLink that repeats is
+// refused instead of looping forever.
 public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentication authentication, IOptions<EtlOptions>? etlOptions = null) : IOnecODataClient
 {
     private readonly long _maxPageBytes = etlOptions?.Value.MaxODataPageBytes ?? new EtlOptions().MaxODataPageBytes;
     private readonly int _maxRowBytes = etlOptions?.Value.MaxODataRowBytes ?? new EtlOptions().MaxODataRowBytes;
+    private readonly int _pageRetries = etlOptions?.Value.ODataPageRetries ?? new EtlOptions().ODataPageRetries;
+    private readonly int _retryBaseDelayMilliseconds = etlOptions?.Value.ODataRetryBaseDelayMilliseconds ?? new EtlOptions().ODataRetryBaseDelayMilliseconds;
 
     [GeneratedRegex("^[\\p{L}\\p{N}_.$-]+$", RegexOptions.CultureInvariant)]
     private static partial Regex IdentifierPattern();
@@ -26,23 +36,13 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
         Validate(entity);
         var skip = 0;
         var continuationMode = false;
+        var visitedContinuations = new HashSet<string>(StringComparer.Ordinal);
         Uri? next = BuildInitialUri(entity, committedCursor, upperBound, full, skip);
+        visitedContinuations.Add(Absolute(next).AbsoluteUri);
         while (next is not null)
         {
-            var currentUri = next.IsAbsoluteUri
-                ? next
-                : new Uri(httpClient.BaseAddress ?? throw new InvalidOperationException("OData BaseAddress is missing."), next);
-            using var request = new HttpRequestMessage(HttpMethod.Get, next);
-            request.Headers.TryAddWithoutValidation("Accept", "application/json");
-            request.Headers.TryAddWithoutValidation("OData-Version", entity.ODataVersion.ToString(CultureInfo.InvariantCulture));
-            await authentication.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
-            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-            if (response.Content.Headers.ContentLength is { } declared && declared > _maxPageBytes)
-                throw new InvalidDataException($"OData page declares {declared} bytes, over the {_maxPageBytes}-byte limit.");
-            await using var raw = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            await using var stream = new BoundedReadStream(raw, _maxPageBytes);
-            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var currentUri = Absolute(next);
+            using var document = await FetchPageAsync(next, entity, cancellationToken).ConfigureAwait(false);
             var values = FindResultsArray(document.RootElement);
             foreach (var value in values.EnumerateArray())
             {
@@ -53,6 +53,8 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
             var continuation = ResolveContinuation(document.RootElement, currentUri);
             if (continuation is not null)
             {
+                if (!visitedContinuations.Add(continuation.AbsoluteUri))
+                    throw new InvalidDataException($"OData nextLink of '{entity.EntityCode}' repeats ({continuation}); refusing to loop.");
                 continuationMode = true;
                 next = continuation;
                 continue;
@@ -73,6 +75,59 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
             }
         }
     }
+
+    private async Task<JsonDocument> FetchPageAsync(Uri uri, EtlEntityDefinition entity, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await FetchPageOnceAsync(uri, entity, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (attempt < _pageRetries && IsTransient(ex, cancellationToken))
+            {
+                var delay = TimeSpan.FromMilliseconds(Math.Min(60_000d, _retryBaseDelayMilliseconds * Math.Pow(2, attempt)));
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private Uri Absolute(Uri uri) => uri.IsAbsoluteUri
+        ? uri
+        : new Uri(httpClient.BaseAddress ?? throw new InvalidOperationException("OData BaseAddress is missing."), uri);
+
+    private async Task<JsonDocument> FetchPageOnceAsync(Uri uri, EtlEntityDefinition entity, CancellationToken callerToken)
+    {
+        // HttpClient.Timeout ends at the response headers (ResponseHeadersRead); the linked
+        // source bounds the body read too. Its expiry surfaces as an OperationCanceledException
+        // while the caller's token is not cancelled, which IsTransient treats as a timeout.
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
+        if (httpClient.Timeout != Timeout.InfiniteTimeSpan) attempt.CancelAfter(httpClient.Timeout);
+        var cancellationToken = attempt.Token;
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("Accept", "application/json");
+        request.Headers.TryAddWithoutValidation("OData-Version", entity.ODataVersion.ToString(CultureInfo.InvariantCulture));
+        await authentication.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is { } declared && declared > _maxPageBytes)
+            throw new InvalidDataException($"OData page declares {declared} bytes, over the {_maxPageBytes}-byte limit.");
+        await using var raw = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using var stream = new BoundedReadStream(raw, _maxPageBytes);
+        return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>A10c: failures worth another attempt of the same idempotent page read.</summary>
+    internal static bool IsTransient(Exception ex, CancellationToken cancellationToken) => ex switch
+    {
+        OperationCanceledException => !cancellationToken.IsCancellationRequested, // HttpClient timeout, not the caller
+        HttpRequestException { StatusCode: null, HttpRequestError: HttpRequestError.SecureConnectionError or HttpRequestError.ConfigurationLimitExceeded } => false,
+        HttpRequestException { StatusCode: null } => true,                          // connection-level failure
+        HttpRequestException { StatusCode: { } status } => (int)status is 408 or 429 or 500 or 502 or 503 or 504,
+        InvalidDataException => false,                                              // A10 limits
+        IOException => true,                                                        // body read interrupted
+        _ => false
+    };
 
     public async Task<bool> CheckAsync(CancellationToken cancellationToken)
     {
