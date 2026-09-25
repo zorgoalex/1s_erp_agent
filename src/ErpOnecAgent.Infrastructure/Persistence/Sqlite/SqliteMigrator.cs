@@ -5,7 +5,7 @@ namespace ErpOnecAgent.Infrastructure.Persistence.Sqlite;
 
 public sealed class SqliteMigrator(SqliteConnectionFactory factory)
 {
-    public const int CurrentSchemaVersion = 10;
+    public const int CurrentSchemaVersion = 11;
 
     public async Task ApplyAsync(CancellationToken cancellationToken)
     {

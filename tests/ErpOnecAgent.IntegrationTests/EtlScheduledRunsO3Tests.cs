@@ -30,6 +30,7 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
     private static readonly TimeSpan GateTimeout = TimeSpan.FromSeconds(15);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly EtlCursor FinalClients = new(DateTimeOffset.Parse("2026-09-19T09:59:00.0000000+00:00", CultureInfo.InvariantCulture), "A10");
+    private static readonly EtlCursor CommittedClients = new(DateTimeOffset.Parse("2026-09-18T09:59:00.0000000+00:00", CultureInfo.InvariantCulture), "A5");
 
     private readonly SqliteTestDatabase _database = new();
     private SqliteConnectionFactory _factory = null!;
@@ -594,12 +595,34 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
     [Fact]
     public async Task Begin_with_the_exact_frozen_definition_begins_extraction()
     {
+        // D1: a scheduled (incremental) read never establishes a domain — seed the
+        // committed baseline watermark of this domain (generation 1) so Begin sees
+        // 'same', not absent.
+        await SeedBaselineAsync("clients", CursorJson(CommittedClients));
         var (runId, claim) = await ClaimedScheduledRunAsync("nightly", ["clients"]);
 
         var outcome = await _store.BeginEtlEntityExtractionAsync(runId, claim.ExtractionClaimId, Request("clients", ScheduledMode), CancellationToken.None);
 
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(outcome);
+        var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(outcome);
+        Assert.Equal("same", begun.Base.DomainStatus);
+        Assert.Equal(CursorJson(CommittedClients), begun.Base.CommittedCursorJson);
+        Assert.Equal(1, begun.Base.ExpectedBaseGeneration);
         Assert.Equal("extracting", await ScalarStringAsync($"SELECT status FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'"));
+    }
+
+    [Fact]
+    public async Task Begin_on_a_scheduled_incremental_without_a_baseline_is_rejected_with_zero_writes()
+    {
+        // D1: an incremental read on an entity with no committed watermark row can
+        // never establish the domain — a full baseline must come first.
+        var (runId, claim) = await ClaimedScheduledRunAsync("nightly", ["clients"]);
+
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, claim.ExtractionClaimId, Request("clients", ScheduledMode), CancellationToken.None);
+
+        Assert.Equal(EtlEntityBeginRejection.BaselineRequired, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
+        Assert.Equal(0, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId:D}'"));
+        Assert.Equal("running", await RunStatusAsync(runId));
+        Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM watermarks WHERE entity_name='clients'"));
     }
 
     [Fact]
@@ -640,6 +663,9 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
     [Fact]
     public async Task Full_scheduled_pipeline_extracts_uploads_finalizes_and_releases_the_key()
     {
+        // D1: the scheduled incremental continues an established baseline — the
+        // committed watermark row of the same domain at generation 1.
+        await SeedBaselineAsync("clients", CursorJson(CommittedClients));
         var now = DateTimeOffset.UtcNow;
         var request = EnsureRequest("nightly", ["clients"]);
         var ensured = Assert.IsType<EtlScheduledRunEnsureOutcome.Created>(
@@ -649,8 +675,11 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
         var claim = Assert.IsType<EtlScheduledRunClaimOutcome.Claimed>(
             await _store.TryClaimScheduledRunAsync(runId, "scheduler-1", now, CancellationToken.None)).Claim.ExtractionClaimId;
 
-        Assert.IsType<EtlEntityBeginOutcome.Begun>(
+        var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(
             await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("clients", ScheduledMode), CancellationToken.None));
+        Assert.Equal("same", begun.Base.DomainStatus);
+        Assert.Equal(CursorJson(CommittedClients), begun.Base.CommittedCursorJson);
+        Assert.Equal(1, begun.Base.ExpectedBaseGeneration);
         var batch = MakeBatch(runId, "clients", 5);
         Assert.IsType<EtlBatchRegistrationOutcome.Registered>(
             await _store.RegisterGuardedEtlBatchAsync(batch, claim, CancellationToken.None));
@@ -674,6 +703,12 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
         Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_entity_ownership WHERE owner_run_id='{run}' AND released_at_utc IS NOT NULL AND release_reason='finalized'"));
         Assert.Equal(CursorJson(FinalClients), await ScalarStringAsync("SELECT committed_cursor_json FROM watermarks WHERE entity_name='clients'"));
         Assert.Equal(run, await ScalarStringAsync("SELECT last_run_id FROM watermarks WHERE entity_name='clients'"));
+        // The seeded baseline took the UPDATE CAS path: generation 1 -> 2 in the SAME
+        // domain — the fingerprint equals the seeded one byte-for-byte.
+        Assert.Equal(2, await ScalarAsync("SELECT generation FROM watermarks WHERE entity_name='clients'"));
+        Assert.Equal(
+            EtlDomainFingerprint.Compute(SourceNamespace, "clients", DefinitionJson("clients"), ScheduledMode),
+            await ScalarStringAsync("SELECT domain_fingerprint FROM watermarks WHERE entity_name='clients'"));
 
         // 'succeeded' released the schedule key: the next tick mints a new run.
         var next = Assert.IsType<EtlScheduledRunEnsureOutcome.Created>(
@@ -869,6 +904,16 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
         Assert.IsType<EtlJobClaimOutcome.Claimed>(
             await _store.TryClaimEtlJobAsync(jobId, "test-dispatcher", DateTimeOffset.UtcNow.AddMinutes(5), DateTimeOffset.UtcNow, CancellationToken.None));
         return runId;
+    }
+
+    // D1: an established baseline — a committed watermark row in the entity's domain
+    // (the fingerprint over the frozen definition; cursor class is mode-independent).
+    private async Task SeedBaselineAsync(string entity, string? cursorJson, long generation = 1)
+    {
+        await ExecuteSqlAsync(
+            "INSERT INTO watermarks(entity_name,committed_cursor_json,extracting_cursor_json,last_run_id,generation,domain_fingerprint,updated_at_utc) VALUES($entity,$cursor,NULL,$run,$gen,$fp,$now);",
+            ("$entity", entity), ("$cursor", cursorJson), ("$run", Guid.NewGuid().ToString("D")), ("$gen", generation),
+            ("$fp", EtlDomainFingerprint.Compute(SourceNamespace, entity, DefinitionJson(entity), ScheduledMode)), ("$now", Now()));
     }
 
     // Ensure + claim: one committed scheduled run extraction claim.

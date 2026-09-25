@@ -198,6 +198,14 @@ tuple:
   definition change that could plausibly alter cursor semantics produces a
   different fp, and the CAS/conflict path handles it explicitly.
 
+> **D1 update (2026-09-26):** the implemented fingerprint no longer includes the read mode.
+> It hashes { source namespace, entity, entire frozen definition, cursor class }, where all
+> watermark modes share `watermark-cursor/v1`. Whether the `UpdatedAtField` predicate
+> applies is still covered, because the whole definition is hashed. An incremental read
+> with no watermark row is refused (`BaselineRequired`), and the attested
+> `ResetEtlWatermarkDomainAsync` is the reset procedure referenced below. See
+> [domain-transition-d1.md](domain-transition-d1.md).
+
 ### 3.3 `domain_status` at capture — fail closed, no adoption
 
 | stored row | stored fp | current fp | status | policy |

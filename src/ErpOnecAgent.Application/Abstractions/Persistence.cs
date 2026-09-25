@@ -188,6 +188,15 @@ public interface IAgentStore
     /// </summary>
     Task<EtlRunResolutionOutcome> ResolveEtlRunAsync(EtlRunResolutionRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// D1: attested watermark domain reset — the explicit exit from DOMAIN_CHANGED and
+    /// DOMAIN_UNKNOWN. Under a generation CAS and only while no active run owns the entity,
+    /// ONE transaction archives the row verbatim (watermark_domain_resets) and removes it;
+    /// the next extraction must then be a full baseline (an incremental read is refused
+    /// with BaselineRequired). Refusals write nothing; invalid requests throw.
+    /// </summary>
+    Task<EtlWatermarkDomainResetOutcome> ResetEtlWatermarkDomainAsync(EtlWatermarkDomainResetRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
     Task CreateEtlRunAsync(EtlRun run, CancellationToken cancellationToken);
     Task RegisterBatchAsync(EtlBatch batch, CancellationToken cancellationToken);
     Task MarkEtlRunExtractedAsync(Guid runId, CancellationToken cancellationToken);

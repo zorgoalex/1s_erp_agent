@@ -199,6 +199,14 @@ public sealed partial class SqliteAgentStore
             : string.Equals(baseFingerprint, fingerprint, StringComparison.Ordinal) ? "same"
             : "changed";
 
+        // D1: an incremental read never establishes a domain — the first watermark of an
+        // entity (and every watermark after a domain reset) comes from an explicit baseline.
+        if (!basePresent && request.QueryMode == "incremental")
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.BaselineRequired);
+        }
+
         var proceeded = domainStatus is "absent" or "same";
         await ExecuteAsync(connection, transaction, """
             INSERT INTO etl_run_entities(run_id,entity_name,entity_definition_json,domain_fingerprint,status,base_row_present,

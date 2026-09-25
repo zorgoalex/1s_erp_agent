@@ -12,22 +12,37 @@ namespace ErpOnecAgent.Application.Abstractions;
 
 /// <summary>
 /// Conservative domain identity of a cursor: the project-hash over the canonical tuple
-/// { source namespace, entity, entire frozen entity definition, query mode }. The
+/// { source namespace, entity, entire frozen entity definition, cursor class }. The
 /// <paramref name="sourceNamespace"/> must be a stable, explicitly configured,
 /// NON-SECRET identity of the 1C source the cursor was read from — credentials are
 /// never hashed and never accepted here. Any definition change that could plausibly
 /// alter cursor semantics produces a different fingerprint; equal serialized cursors
 /// under different fingerprints are different domains.
+/// <para>
+/// D1: the read mode is NOT part of the domain. bootstrap_full, entity_reload and
+/// incremental all produce the same (UpdatedAtUtc, SourceId) watermark cursor over the
+/// same definition and source, so a full baseline is continued by incremental runs in
+/// the same domain. A source change (namespace, including exportEpoch) or any
+/// definition change still yields a different domain and blocks until an explicit
+/// domain reset followed by a new baseline.
+/// </para>
 /// </summary>
 public static class EtlDomainFingerprint
 {
+    /// <summary>The cursor class shared by every supported watermark extraction mode.</summary>
+    public const string WatermarkCursorClass = "watermark-cursor/v1";
+
     public static string Compute(string sourceNamespace, string entityName, string entityDefinitionJson, string queryMode)
     {
         using var definition = JsonDocument.Parse(entityDefinitionJson);
         var tuple = JsonSerializer.SerializeToElement(
-            new { definition = definition.RootElement, entity = entityName, queryMode, source = sourceNamespace });
+            new { cursorClass = CursorClass(queryMode), definition = definition.RootElement, entity = entityName, source = sourceNamespace });
         return PayloadHasher.Compute(tuple);
     }
+
+    /// <summary>Supported modes share one cursor class; anything else stays distinct (and is rejected by Begin anyway).</summary>
+    public static string CursorClass(string queryMode) =>
+        queryMode is "bootstrap_full" or "entity_reload" or "incremental" ? WatermarkCursorClass : "unsupported:" + queryMode;
 }
 
 /// <summary>
@@ -89,7 +104,9 @@ public enum EtlEntityBeginRejection
     /// <summary>The run has no etl_jobs row and is not a scheduled run with frozen resolved definitions — no frozen identity source exists.</summary>
     JobMissing,
     /// <summary>A scheduled run's supplied definition does not equal its frozen resolved definition for this entity, or its frozen identity is unusable.</summary>
-    RunDefinitionMismatch
+    RunDefinitionMismatch,
+    /// <summary>D1: an incremental read found no committed watermark for the entity — a full baseline (bootstrap_full or entity_reload) must establish the domain first. Zero writes.</summary>
+    BaselineRequired
 }
 
 public abstract record EtlEntityBeginOutcome
