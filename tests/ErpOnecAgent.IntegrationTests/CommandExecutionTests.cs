@@ -28,6 +28,22 @@ public sealed class CommandExecutionTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task A07_command_expired_by_the_erp_clock_is_not_executed_even_if_the_local_clock_lags()
+    {
+        var onec = new FakeOnec();
+        // The local clock is 5 minutes behind ERP: by ERP time this command expired 3 minutes ago.
+        var service = new CommandExecutionService(_store, onec, static () => 12, expiryNow: static now => now.AddMinutes(5));
+        var command = MakeCommand(expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(2));
+        await _store.StoreCommandAsync(command, DateTimeOffset.UtcNow, CancellationToken.None);
+
+        await service.ProcessAsync(await SingleReadyAsync(), NeverAdministrative, CancellationToken.None);
+
+        Assert.Equal(0, onec.ExecuteCalls);
+        var result = await SingleResultAsync();
+        Assert.Equal("COMMAND_EXPIRED", result.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
     public async Task Expired_never_sent_expires_without_lookup_or_post()
     {
         var onec = new FakeOnec();

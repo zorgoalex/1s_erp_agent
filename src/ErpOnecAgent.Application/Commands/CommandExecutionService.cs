@@ -32,8 +32,11 @@ public sealed record CommandExecutionOptions
     public int RetryMaxDelaySeconds { get; init; } = 300;
 }
 
-public sealed class CommandExecutionService(IAgentStore store, IOnecCommandClient onec, Func<int> maxOperationalAttempts, CommandExecutionHooks? hooks = null, Func<CommandExecutionOptions>? executionOptions = null, string? executorId = null)
+public sealed class CommandExecutionService(IAgentStore store, IOnecCommandClient onec, Func<int> maxOperationalAttempts, CommandExecutionHooks? hooks = null, Func<CommandExecutionOptions>? executionOptions = null, string? executorId = null, Func<DateTimeOffset, DateTimeOffset>? expiryNow = null)
 {
+    // A07 time: ERP-defined expiry is judged against the later of the local clock and the
+    // latest possible ERP clock, so a lagging local clock never executes an expired command.
+    private readonly Func<DateTimeOffset, DateTimeOffset> _expiryNow = expiryNow ?? (static now => now);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly CommandExecutionHooks? _hooks = hooks;
     private readonly Func<CommandExecutionOptions>? _executionOptions = executionOptions;
@@ -138,7 +141,7 @@ public sealed class CommandExecutionService(IAgentStore store, IOnecCommandClien
             // expired command still expires — while a stale "never sent" snapshot whose row was
             // actually sent took the resolve path above instead of expiring a potentially-sent
             // command or overwriting a newer terminal result.
-            if (CommandPolicy.IsExpired(command, DateTimeOffset.UtcNow))
+            if (CommandPolicy.IsExpired(command, _expiryNow(DateTimeOffset.UtcNow)))
             {
                 await SaveErrorAsync(command, claimOwner, CommandStatus.Expired, "COMMAND_EXPIRED", "Command expired before execution.", false, null, cancellationToken).ConfigureAwait(false);
                 return;

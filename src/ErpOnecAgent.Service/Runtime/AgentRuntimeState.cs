@@ -84,6 +84,89 @@ public sealed class AgentRuntimeState
     }
 
     public DateTimeOffset StartedAtUtc => new(Interlocked.Read(ref _startedAtTicks), TimeSpan.Zero);
+
+    // A07 time: ERP clock estimate from the session handshake and the executing-command count.
+    private readonly System.Diagnostics.Stopwatch _uptime = System.Diagnostics.Stopwatch.StartNew();
+    private readonly object _clockGate = new();
+    private DateTimeOffset? _erpAnchor;         // ERP time at _anchorTimestamp
+    private long _anchorTimestamp;              // Stopwatch timestamp of the anchor
+    private TimeSpan _erpClockUncertainty;
+    private int _executingCommands;
+
+    /// <summary>A handshake sample with a longer round trip (retries, congestion) is too imprecise and is ignored.</summary>
+    public static readonly TimeSpan MaxClockSampleRoundTrip = TimeSpan.FromSeconds(2);
+    /// <summary>An offset beyond this is treated as a broken ERP clock and ignored.</summary>
+    public static readonly TimeSpan MaxPlausibleClockOffset = TimeSpan.FromDays(1);
+
+    /// <summary>Monotonic time since the process state was created (not affected by clock changes).</summary>
+    public TimeSpan Uptime => _uptime.Elapsed;
+
+    /// <summary>
+    /// ERP clock minus the CURRENT local clock; null until measured. The ERP clock is carried
+    /// forward on the monotonic clock from the last accepted handshake, so a later correction
+    /// of the Windows clock is reflected immediately.
+    /// </summary>
+    public TimeSpan? ErpClockOffset { get { lock (_clockGate) return ErpNowLocked() is { } erpNow ? erpNow - DateTimeOffset.UtcNow : null; } }
+
+    /// <summary>Half the handshake round trip: the error bound of <see cref="ErpClockOffset"/>.</summary>
+    public TimeSpan ErpClockUncertainty { get { lock (_clockGate) return _erpClockUncertainty; } }
+
+    /// <summary>True when the clocks differ by more than the threshold even at the favourable end of the error band.</summary>
+    public bool ClockDriftExceeds(TimeSpan threshold)
+    {
+        lock (_clockGate)
+            return ErpNowLocked() is { } erpNow && (erpNow - DateTimeOffset.UtcNow).Duration() - _erpClockUncertainty > threshold;
+    }
+
+    private DateTimeOffset? ErpNowLocked() =>
+        _erpAnchor is { } anchor ? anchor + System.Diagnostics.Stopwatch.GetElapsedTime(_anchorTimestamp) : null;
+
+    public int ExecutingCommands => Volatile.Read(ref _executingCommands);
+
+    /// <summary>
+    /// Records the ERP clock from a handshake: the server stamped its time somewhere inside the
+    /// round trip, so the offset is measured against the round trip's midpoint and is accurate
+    /// to half the round trip. Imprecise (slow) or implausible samples are ignored and the
+    /// previous estimate is kept. Returns whether the sample was accepted.
+    /// </summary>
+    public bool RecordErpClock(DateTimeOffset serverTimeUtc, DateTimeOffset localSentAtUtc, TimeSpan roundTrip)
+    {
+        if (roundTrip < TimeSpan.Zero) roundTrip = TimeSpan.Zero;
+        if (roundTrip > MaxClockSampleRoundTrip) return false;
+        var half = TimeSpan.FromTicks(roundTrip.Ticks / 2);
+        var offset = serverTimeUtc - (localSentAtUtc + half);
+        if (offset.Duration() > MaxPlausibleClockOffset) return false;
+        lock (_clockGate)
+        {
+            _anchorTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            _erpAnchor = DateTimeOffset.UtcNow + offset;
+            _erpClockUncertainty = half;
+        }
+        return true;
+    }
+
+    /// <summary>The "now" used for ERP-defined expiry: the later of the local clock and the latest possible ERP clock.</summary>
+    public DateTimeOffset ExpiryNow(DateTimeOffset localNowUtc)
+    {
+        lock (_clockGate)
+        {
+            if (ErpNowLocked() is not { } erpNow) return localNowUtc;
+            var latestErpNow = erpNow + _erpClockUncertainty;
+            return latestErpNow > localNowUtc ? latestErpNow : localNowUtc;
+        }
+    }
+
+    public IDisposable BeginCommandExecution()
+    {
+        Interlocked.Increment(ref _executingCommands);
+        return new ExecutionScope(this);
+    }
+
+    private sealed class ExecutionScope(AgentRuntimeState owner) : IDisposable
+    {
+        private int _disposed;
+        public void Dispose() { if (Interlocked.Exchange(ref _disposed, 1) == 0) Interlocked.Decrement(ref owner._executingCommands); }
+    }
     public DateTimeOffset? LastErpSuccessAtUtc { get; set; }
     public DateTimeOffset? LastOnecSuccessAtUtc { get; set; }
     public DateTimeOffset? LastEtlSuccessAtUtc { get; set; }

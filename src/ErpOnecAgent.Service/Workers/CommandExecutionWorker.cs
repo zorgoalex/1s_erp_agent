@@ -48,7 +48,8 @@ public sealed class CommandExecutionWorker(
                 RetryMaxDelaySeconds = commandOptions.RetryMaxDelaySeconds
             };
         },
-        executorId: CommandExecutionIdentity.NewOwnerId());
+        executorId: CommandExecutionIdentity.NewOwnerId(),
+        expiryNow: state.ExpiryNow);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -77,6 +78,7 @@ public sealed class CommandExecutionWorker(
 
     private async Task ProcessAsync(StoredCommand stored, CancellationToken cancellationToken)
     {
+        using var executing = state.BeginCommandExecution();
         try
         {
             await execution.ProcessAsync(stored, TryExecuteAdministrativeAsync, cancellationToken, () => state.Snapshot.CanExecuteCommands).ConfigureAwait(false);

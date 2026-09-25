@@ -12,6 +12,8 @@ public sealed class AgentOptions
     public int GracefulShutdownSeconds { get; init; } = 30;
     public int HeartbeatIntervalSeconds { get; init; } = 60;
     public int HealthCheckIntervalSeconds { get; init; } = 30;
+    /// <summary>A07: ERP/local clock difference above which CLOCK_DRIFT is logged.</summary>
+    public int MaxClockDriftSeconds { get; init; } = 30;
 }
 
 public sealed class ErpOptions

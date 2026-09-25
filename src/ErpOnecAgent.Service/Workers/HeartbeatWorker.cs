@@ -46,9 +46,9 @@ public sealed class HeartbeatWorker(
                     using var certificate = CertificateLoader.LoadClientCertificate(erpOptions.Value.ClientCertificateThumbprint);
                     certificateExpiry = certificate.NotAfter.ToUniversalTime();
                 }
-                var healthState = GetHealthState(state, metrics, storageOptions.Value);
+                var healthState = GetHealthState(state, metrics, storageOptions.Value, TimeSpan.FromSeconds(Math.Max(1, agentOptions.Value.MaxClockDriftSeconds)));
                 var request = new HeartbeatRequest(agentOptions.Value.AgentId, ThisAssembly.Version, healthState,
-                    (long)(DateTimeOffset.UtcNow - state.StartedAtUtc).TotalSeconds,
+                    (long)state.Uptime.TotalSeconds,
                     new(state.OnecODataAvailable, state.OnecCommandApiAvailable, state.LastOnecSuccessAtUtc, state.LastOnecError),
                     new(queues.CommandsPending, queues.ResultsPending, queues.EtlBatchesPending, queues.DeadLetters),
                     new(state.LastEtlSuccessAtUtc, state.CurrentEtlRunId),
@@ -80,7 +80,7 @@ public sealed class HeartbeatWorker(
         else logger.LogWarning("CERTIFICATE_EXPIRING DaysThreshold={Days} NotAfter={NotAfter}", crossed, expiry);
     }
 
-    private static string GetHealthState(AgentRuntimeState state, AgentMetrics metrics, StorageOptions storage)
+    internal static string GetHealthState(AgentRuntimeState state, AgentMetrics metrics, StorageOptions storage, TimeSpan maxClockDrift)
     {
         var snapshot = state.Snapshot;
         // incompatible_version outranks maintenance/storage/degraded: while an explicit rejection
@@ -91,6 +91,8 @@ public sealed class HeartbeatWorker(
         if (metrics.SqliteSizeBytes >= storage.MaxSqliteBytes || metrics.SpoolSizeBytes >= storage.MaxSpoolBytes || metrics.DiskFreeBytes <= storage.MinimumReservedBytesForCommands) return "storage_critical";
         if (!state.OnecCommandApiAvailable && !state.OnecODataAvailable) return "offline_onec";
         if (!state.OnecCommandApiAvailable || !state.OnecODataAvailable) return "degraded";
+        // A07 time: a clock far from ERP skews expiry decisions and every stored UTC date.
+        if (state.ClockDriftExceeds(maxClockDrift)) return "degraded";
         return "healthy";
     }
 }

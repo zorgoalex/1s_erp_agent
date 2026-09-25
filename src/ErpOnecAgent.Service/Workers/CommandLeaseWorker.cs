@@ -34,7 +34,7 @@ public sealed class CommandLeaseWorker(
                 var sessionId = await sessions.GetSessionAsync(stoppingToken).ConfigureAwait(false);
                 var options = commandOptions.Value;
                 var supportedTypes = dynamicConfiguration.Snapshot.CommandTypes;
-                var lease = await erp.LeaseCommandAsync(new LeaseRequest(sessionId, supportedTypes, erpOptions.Value.LongPollSeconds, new LeaseLoad(0, options.MaxConcurrency)), stoppingToken).ConfigureAwait(false);
+                var lease = await erp.LeaseCommandAsync(new LeaseRequest(sessionId, supportedTypes, erpOptions.Value.LongPollSeconds, new LeaseLoad(state.ExecutingCommands, options.MaxConcurrency)), stoppingToken).ConfigureAwait(false);
                 state.LastErpSuccessAtUtc = DateTimeOffset.UtcNow; failureCount = 0;
                 // A conforming ERP holds this request for LongPollSeconds. The
                 // small floor also prevents a faulty/non-long-polling endpoint
