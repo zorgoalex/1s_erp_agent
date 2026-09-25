@@ -56,6 +56,10 @@ static async Task<int> RunAsync(string[] args)
     builder.Services.AddHttpClient<IOnecCommandClient, OnecCommandClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.CommandApiBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.RequestTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler());
     builder.Services.AddHttpClient<IOnecHealthClient, OnecHealthClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.CommandApiBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.HealthTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler()).AddStandardResilienceHandler();
     builder.Services.AddHttpClient<IOnecODataClient, OnecODataClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.ODataBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.RequestTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler()).AddStandardResilienceHandler();
+    // S1: read-only identity of the 1C source (extension GET identity). No resilience
+    // retries: a failed read is classified and the ETL gate simply does not start work.
+    builder.Services.AddHttpClient<IOnecIdentityClient, OnecIdentityClient>((sp, client) => ConfigureOnecClient(client, sp.GetRequiredService<IOptions<OnecOptions>>().Value.CommandApiBaseUrl, sp.GetRequiredService<IOptions<OnecOptions>>().Value.HealthTimeoutSeconds)).ConfigurePrimaryHttpMessageHandler(static () => CreateBaseHandler());
+    builder.Services.AddSingleton(sp => new SourceIdentityGuard(() => sp.GetRequiredService<IOnecIdentityClient>(), sp.GetRequiredService<IOptions<OnecOptions>>()));
 
     builder.Services.AddHostedService<BootstrapService>();
     builder.Services.AddHostedService<ConfigurationWorker>();
@@ -103,7 +107,10 @@ static void ConfigureOptions(IServiceCollection services, IConfiguration configu
         .Validate(static value => !value.RequireClientCertificate || !string.IsNullOrWhiteSpace(value.ClientCertificateThumbprint), "mTLS certificate thumbprint is required.").ValidateOnStart();
     services.AddOptions<OnecOptions>().Bind(configuration.GetSection(OnecOptions.SectionName))
         .Validate(static value => Uri.TryCreate(value.ODataBaseUrl, UriKind.Absolute, out _) && Uri.TryCreate(value.CommandApiBaseUrl, UriKind.Absolute, out _), "1C endpoints must be absolute URLs.")
-        .Validate(static value => !string.IsNullOrWhiteSpace(value.CredentialSecretName), "1C secret reference is required.").ValidateOnStart();
+        .Validate(static value => !string.IsNullOrWhiteSpace(value.CredentialSecretName), "1C secret reference is required.")
+        .Validate(static value => value.SourceBinding is null || ErpOnecAgent.Application.Etl.OnecSourceBinding.TryCreate(value.SourceBinding, out _) is not null, "OneC:SourceBinding is invalid (non-empty UUIDs in D format, environment test|production, absolute ODataEndpoint without credentials/query).")
+        .Validate(static value => value.SourceBinding is null || string.Equals(ErpOnecAgent.Application.Etl.SourceEndpoint.Normalize(value.ODataBaseUrl), ErpOnecAgent.Application.Etl.SourceEndpoint.Normalize(value.SourceBinding.ODataEndpoint), StringComparison.Ordinal), "OneC:ODataBaseUrl must equal the bound SourceBinding.ODataEndpoint.")
+        .Validate(static value => value.SourceBinding is null || ErpOnecAgent.Application.Etl.SourceEndpoint.SamePublication(value.ODataBaseUrl, value.CommandApiBaseUrl), "OneC:ODataBaseUrl and OneC:CommandApiBaseUrl must belong to the same 1C publication when a SourceBinding is configured.").ValidateOnStart();
     services.AddOptions<CommandOptions>().Bind(configuration.GetSection(CommandOptions.SectionName))
         .Validate(static value => value.MaxConcurrency is >= 1 and <= 4 && value.DefaultTimeoutSeconds > 0 && value.MaxPayloadBytes > 0, "Command limits are invalid.").ValidateOnStart();
     services.AddOptions<EtlOptions>().Bind(configuration.GetSection(EtlOptions.SectionName))

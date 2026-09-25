@@ -34,6 +34,22 @@ public sealed class OnecOptions
     public string CredentialSecretName { get; init; } = "onec-main";
     public int HealthTimeoutSeconds { get; init; } = 5;
     public int RequestTimeoutSeconds { get; init; } = 30;
+
+    /// <summary>
+    /// The expected identity of the 1C source (extension 0.3.0+ GET identity), configured
+    /// explicitly after the source was verified — never adopted from a first server
+    /// response. Absent: no source namespace exists and the new ETL path cannot capture.
+    /// </summary>
+    public OnecSourceBindingOptions? SourceBinding { get; init; }
+}
+
+public sealed class OnecSourceBindingOptions
+{
+    public string DatabaseId { get; init; } = string.Empty;
+    public string ExportEpoch { get; init; } = string.Empty;
+    public string Environment { get; init; } = string.Empty;
+    /// <summary>The OData service root the binding was verified for; must equal the normalized <see cref="OnecOptions.ODataBaseUrl"/>.</summary>
+    public string ODataEndpoint { get; init; } = string.Empty;
 }
 
 public sealed class CommandOptions

@@ -37,3 +37,12 @@ public interface IOnecHealthClient
 {
     Task<OnecHealthResponse?> CheckAsync(CancellationToken cancellationToken);
 }
+
+/// <summary>
+/// S1: reads the extension's GET identity (read-only; never initializes or rotates). Every
+/// outcome is classified — the call never throws for transport, status or body errors.
+/// </summary>
+public interface IOnecIdentityClient
+{
+    Task<ErpOnecAgent.Application.Etl.OnecIdentityFetchResult> GetIdentityAsync(CancellationToken cancellationToken);
+}
