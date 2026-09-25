@@ -268,14 +268,95 @@ public interface IAgentStore
     /// <summary>
     /// Explicit dead-process recovery — startup-only, exclusive-host precondition, NOT
     /// used by RecoverAsync and never a live/time-based takeover: releases every
-    /// 'completing' claim (payload and evidence preserved), blocks 'running' runs
-    /// INTERRUPTED_NO_CHECKPOINT and clears their dead extraction claims, marks their
-    /// extracting entities failed, fences their pending batches to dead_letter, and
-    /// blocks their jobs — ownership rows and bindings are RETAINED in all cases (they
-    /// are the evidence of exactly what the interrupted run owned). 'pending' runs
-    /// untouched.
+    /// 'completing' claim (payload and evidence preserved), orphans every still-
+    /// 'admitted' send attempt (O2 — a dead owner can never produce a real outcome),
+    /// quarantines every 'uploading' batch UPLOAD_OUTCOME_UNKNOWN (a new-path
+    /// 'uploading' batch is NEVER reset to 'ready'), blocks their runs, then blocks
+    /// 'running' runs INTERRUPTED_NO_CHECKPOINT and clears their dead extraction
+    /// claims, marks their extracting entities failed, fences their pending batches to
+    /// dead_letter, and blocks their jobs — ownership rows and bindings are RETAINED
+    /// in all cases (they are the evidence of exactly what the interrupted run owned).
+    /// 'pending' runs untouched.
     /// </summary>
     Task<EtlRecoveryResult> RecoverInterruptedEtlRunsAsync(CancellationToken cancellationToken);
+
+    // --- O2 dark storage APIs: the durable admitted-attempt send ledger with
+    // owner-fenced claim/ACK/outcome and fail-closed unknown-outcome handling
+    // (isolated new path; NOT wired into workers, recovery wiring, or the ERP
+    // client — see EtlSendAttempts.cs header). Admission and ACK application require
+    // the FULL run ownership/binding three-way equality at positive epoch — the same
+    // O1 predicate — never a per-entity shortcut. An 'admitted' attempt is proof of
+    // admission only; uncertain outcomes quarantine and block, never replay.
+
+    /// <summary>
+    /// Batches admissible for upload right now: 'ready' (or due 'retry_waiting' from a
+    /// ledger-proven precheck failure) batches whose run is 'running'/'uploading' and
+    /// whose entity carries active ownership for that run, with no live 'admitted'
+    /// attempt — eligibility evaluated in SQL BEFORE LIMIT, ordered by
+    /// (created_at_utc, batch_id). The claim transaction re-verifies every predicate
+    /// plus the full three-way ownership set; enumeration can never bypass it.
+    /// </summary>
+    Task<IReadOnlyList<EtlDueBatchUpload>> GetDueBatchUploadsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// One-transaction send claim: a guarded write-first flip of the batch to
+    /// 'uploading' + the fresh send_attempt_id fence + the 'admitted' ledger row +
+    /// the persisted upload-attempt bound — all in ONE commit. The guarded flip holds
+    /// only while the batch is 'ready'/due-'retry_waiting', the run is
+    /// 'running'/'uploading', the FULL run ownership/binding set equality holds at
+    /// positive epoch, the batch entity is epoch-bound owned, no live 'admitted'
+    /// attempt exists, and the admitted-attempt count is below the durable bound.
+    /// <paramref name="maxAttempts"/> is the caller's policy bound (D1): persisted at
+    /// first claim, identical-value enforced on every later claim — a mismatch is
+    /// refused with zero writes. Bound exhaustion commits dead_letter
+    /// UPLOAD_ATTEMPTS_EXHAUSTED + eager run block; a swallowed ledger write (controlled
+    /// zero-row outcome) rolls the flip back to the savepoint then commits a block;
+    /// a thrown SQL error rolls back the whole transaction leaving the batch claimable.
+    /// </summary>
+    Task<EtlBatchUploadClaimOutcome> TryClaimBatchUploadAsync(Guid batchId, string ownerId, DateTimeOffset nowUtc, int maxAttempts, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Applies an ERP batch ACK bound to the durable admitted attempt — never to a
+    /// bare batch id. Fenced apply requires batch 'uploading' + send_attempt_id match +
+    /// attempt 'admitted' + run active + the full bound-epoch ownership set; a valid
+    /// ACK then acknowledges batch + attempt and bumps the run counter in one commit.
+    /// An invalid ACK under a live fence commits rejected_ack + dead_letter ACK_INVALID
+    /// + eager run block. When the live fence is gone but the (batch_id, attempt_id)
+    /// ledger row exists, the ACK is recorded as observation evidence on that attempt
+    /// row only (first observation wins; exact replay is preserved; a conflicting later
+    /// observation is explicit and never overwrites); if that batch was made due again
+    /// outside the ledger it is quarantined and an active run blocked. An ACK for a
+    /// precheck_failed attempt is AttestationContradicted: evidence recorded, an active
+    /// run blocked even when a later attempt acknowledged the batch. Every observation
+    /// records the store's validation of the body (ack_valid). <paramref name="ackPayloadHash"/>
+    /// is required (non-empty) — it identifies the observation for replay/conflict
+    /// detection. A foreign attempt id is ClaimLost with zero writes.
+    /// </summary>
+    Task<EtlBatchAckOutcome> AcknowledgeClaimedBatchAsync(Guid batchId, Guid attemptId, EtlBatchAckEvidence acknowledgement, string? ackPayloadHash, int? httpStatus, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Fail-closed uncertain outcome after admission (timeout, transport exception,
+    /// non-2xx, process death): under the live fence commits attempt 'unknown' + batch
+    /// dead_letter UPLOAD_OUTCOME_UNKNOWN + run blocked + job blocked in one
+    /// transaction — ownership and bindings retained, the batch is never re-claimable,
+    /// and no sibling batch of the blocked run is admissible afterwards (eager block).
+    /// A late report for a still-'admitted' attempt whose fence is already dead writes
+    /// 'unknown' on the attempt only; a report for a terminal (e.g. already-acknowledged)
+    /// attempt or a foreign attempt id is ClaimLost — zero writes.
+    /// </summary>
+    Task<EtlBatchSendFailureOutcome> FailClaimedBatchSendAsync(Guid batchId, Guid attemptId, string errorMessage, int? httpStatus, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Records the trusted precheck_failed attestation — the worker positively never
+    /// invoked the network call — under the live fence: attempt 'precheck_failed' +
+    /// batch 'retry_waiting' + the caller-supplied <paramref name="nextAttemptAtUtc"/>
+    /// (D2: the store invents no schedule; caller policy is BackoffDelay(attempt,
+    /// 5s, 5min) + jitter). The durable bound persisted at first claim is
+    /// authoritative; exhaustion commits dead_letter UPLOAD_ATTEMPTS_EXHAUSTED + eager
+    /// run block. Any post-invocation failure uses
+    /// the fail path instead; a stale/foreign attempt id is ClaimLost, zero writes.
+    /// </summary>
+    Task<EtlBatchSendRetryOutcome> RetryClaimedBatchSendAsync(Guid batchId, Guid attemptId, string errorMessage, DateTimeOffset nextAttemptAtUtc, CancellationToken cancellationToken);
 
     Task<QueueMetrics> GetQueueMetricsAsync(CancellationToken cancellationToken);
     Task SetStateAsync(string key, string valueJson, CancellationToken cancellationToken);

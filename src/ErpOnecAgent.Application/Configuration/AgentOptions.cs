@@ -71,6 +71,8 @@ public sealed class EtlOptions
     public int OverlapMinutes { get; init; } = 10;
     public int MaxConcurrentRequests { get; init; } = 1;
     public int MaxConcurrentBatchUploads { get; init; } = 2;
+    /// <summary>Durable bound on ADMITTED batch send attempts (O2 send ledger, decision D1). Uncertain outcomes never retry, so this bounds ledger-proven-unsent (precheck_failed) admissions; persisted on the batch at first claim with identical-value enforcement.</summary>
+    public int MaxBatchUploadAttempts { get; init; } = 5;
     public int TargetBatchUncompressedBytes { get; init; } = 10 * 1024 * 1024;
     public IReadOnlyList<EtlEntityDefinition> Entities { get; init; } = [];
 }

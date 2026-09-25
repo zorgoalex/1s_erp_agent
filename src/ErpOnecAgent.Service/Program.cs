@@ -107,7 +107,7 @@ static void ConfigureOptions(IServiceCollection services, IConfiguration configu
     services.AddOptions<CommandOptions>().Bind(configuration.GetSection(CommandOptions.SectionName))
         .Validate(static value => value.MaxConcurrency is >= 1 and <= 4 && value.DefaultTimeoutSeconds > 0 && value.MaxPayloadBytes > 0, "Command limits are invalid.").ValidateOnStart();
     services.AddOptions<EtlOptions>().Bind(configuration.GetSection(EtlOptions.SectionName))
-        .Validate(static value => value.IntervalMinutes > 0 && value.SafetyLagSeconds >= 0 && value.DefaultPageSize is >= 1 and <= 10_000 && value.TargetBatchUncompressedBytes > 0 && value.MaxConcurrentRequests is >= 1 and <= 8 && value.MaxConcurrentBatchUploads is >= 1 and <= 8, "ETL limits are invalid.")
+        .Validate(static value => value.IntervalMinutes > 0 && value.SafetyLagSeconds >= 0 && value.DefaultPageSize is >= 1 and <= 10_000 && value.TargetBatchUncompressedBytes > 0 && value.MaxConcurrentRequests is >= 1 and <= 8 && value.MaxConcurrentBatchUploads is >= 1 and <= 8 && value.MaxBatchUploadAttempts is >= 1 and <= 20, "ETL limits are invalid.")
         .Validate(static value => value.Entities.Select(static entity => entity.EntityCode).Distinct(StringComparer.Ordinal).Count() == value.Entities.Count, "ETL entity codes must be unique.")
         .Validate(static value => value.Entities.All(static entity =>
         {

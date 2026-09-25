@@ -227,4 +227,4 @@ public abstract record EtlRunCompletionRetryOutcome
 /// interrupted-run blocking, batch fencing, job blocking). Exclusive-host precondition:
 /// never run while another live agent could hold a claim.
 /// </summary>
-public sealed record EtlRecoveryResult(int ClaimsReleased, int RunsBlocked, int BatchesFenced, int EntitiesFailed, int JobsBlocked);
+public sealed record EtlRecoveryResult(int ClaimsReleased, int RunsBlocked, int BatchesFenced, int EntitiesFailed, int JobsBlocked, int AttemptsOrphaned);

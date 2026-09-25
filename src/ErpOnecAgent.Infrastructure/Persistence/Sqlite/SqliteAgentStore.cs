@@ -324,6 +324,12 @@ public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, Sq
         await ExecuteAsync(connection, transaction,
             "DELETE FROM command_attempts WHERE command_id IN (SELECT c.command_id FROM commands_inbox c WHERE c.status='completed' AND c.erp_acknowledged_at_utc < $before AND (c.result_status IS NULL OR c.result_status <> 'dead_letter') AND NOT EXISTS (SELECT 1 FROM results_outbox o WHERE o.command_id=c.command_id AND o.status <> 'acknowledged') AND NOT EXISTS (SELECT 1 FROM etl_jobs j WHERE j.command_id=c.command_id AND j.status NOT IN ('finished','cancelled'))); DELETE FROM results_outbox WHERE status='acknowledged' AND acknowledged_at_utc < $before AND NOT EXISTS (SELECT 1 FROM commands_inbox c WHERE c.command_id=results_outbox.command_id AND c.result_status='dead_letter') AND NOT EXISTS (SELECT 1 FROM etl_jobs j WHERE j.command_id=results_outbox.command_id AND j.status NOT IN ('finished','cancelled')); DELETE FROM commands_inbox WHERE status='completed' AND erp_acknowledged_at_utc < $before AND (result_status IS NULL OR result_status <> 'dead_letter') AND NOT EXISTS (SELECT 1 FROM results_outbox o WHERE o.command_id=commands_inbox.command_id AND o.status <> 'acknowledged') AND NOT EXISTS (SELECT 1 FROM etl_jobs j WHERE j.command_id=commands_inbox.command_id AND j.status NOT IN ('finished','cancelled'));",
             cancellationToken, ("$before", completedBeforeUtc.ToUniversalTime().ToString("O"))).ConfigureAwait(false);
+        // O2 send-attempt ledger reconciliation (root disposition 5): attempt rows are
+        // evidence and are deleted only inside the same transaction that purges their
+        // 'deleted' batch row of a SUCCEEDED run — never for unresolved/failed/blocked
+        // runs (their batches never pass the purge guard, so their attempts can never
+        // be orphaned by this path) and never left behind as FK orphans.
+        await ExecuteAsync(connection, transaction, "DELETE FROM etl_batch_send_attempts WHERE batch_id IN (SELECT batch_id FROM etl_batches WHERE status='deleted' AND acknowledged_at_utc < $before AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=etl_batches.run_id AND r.status='succeeded'));", cancellationToken, ("$before", batchesBeforeUtc.ToUniversalTime().ToString("O"))).ConfigureAwait(false);
         // Independent parent guard on the purge itself: 'deleted' batch rows (including legacy or
         // manually marked ones) of an unresolved run are evidence and survive cleanup; only rows
         // whose parent run succeeded are purged.

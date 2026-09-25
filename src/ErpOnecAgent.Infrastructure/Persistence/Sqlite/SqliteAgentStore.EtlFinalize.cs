@@ -720,6 +720,41 @@ public sealed partial class SqliteAgentStore
         var claims = await ExecuteAsync(connection, transaction,
             "UPDATE etl_runs SET completion_claim_id=NULL, completion_claim_owner_id=NULL, completion_claim_acquired_at_utc=NULL, updated_at_utc=$now, row_version=row_version+1 WHERE status='completing' AND completion_claim_id IS NOT NULL;",
             cancellationToken, ("$now", now)).ConfigureAwait(false);
+        // O2 fail-closed upload quarantine BEFORE the interruption pass (design §7).
+        // The set is decided by the ledger as well as the status, and fixed before any
+        // write: every 'uploading' batch (a legacy pre-008 one has no ledger row — the
+        // in-flight status itself is the unknown outcome) plus every due batch whose
+        // ledger holds a non-precheck attempt. The latter covers the production
+        // startup order, where legacy RecoverAsync has already reset 'uploading' to
+        // 'ready'. A batch is NEVER returned to 'ready' on this path.
+        await ExecuteAsync(connection, transaction, """
+            CREATE TEMP TABLE IF NOT EXISTS o2_recovery_batches(batch_id TEXT PRIMARY KEY);
+            DELETE FROM temp.o2_recovery_batches;
+            INSERT INTO temp.o2_recovery_batches(batch_id)
+            SELECT b.batch_id FROM etl_batches b
+            WHERE b.status='uploading'
+               OR (b.status IN ('creating','ready','retry_waiting')
+                   AND EXISTS (SELECT 1 FROM etl_batch_send_attempts x WHERE x.batch_id=b.batch_id AND x.outcome <> 'precheck_failed'));
+            """, cancellationToken).ConfigureAwait(false);
+        // Every still-'admitted' attempt had a dead owner — orphan it (terminal, never
+        // re-armed).
+        var orphanedAttempts = await ExecuteAsync(connection, transaction,
+            "UPDATE etl_batch_send_attempts SET outcome='orphaned', finished_at_utc=$now, last_error='UPLOAD_OUTCOME_UNKNOWN: admitted send recorded no outcome before process recovery' WHERE outcome='admitted';",
+            cancellationToken, ("$now", now)).ConfigureAwait(false);
+        var quarantinedBatches = await ExecuteAsync(connection, transaction,
+            "UPDATE etl_batches SET status='dead_letter', quarantine_code='UPLOAD_OUTCOME_UNKNOWN', last_error='A send was in flight or its outcome was unknown when the host stopped; the remote outcome is unknowable.', row_version=row_version+1 WHERE batch_id IN (SELECT batch_id FROM temp.o2_recovery_batches);",
+            cancellationToken).ConfigureAwait(false);
+        // Only runs owning a batch quarantined in THIS pass block (historical
+        // quarantine evidence never re-blocks a run); ownership + bindings RETAINED.
+        const string recoveredRunFilter = "status IN ('pending','running','paused','uploading','completing') AND run_id IN (SELECT eb.run_id FROM etl_batches eb WHERE eb.batch_id IN (SELECT batch_id FROM temp.o2_recovery_batches))";
+        var orphanClaims = await ScalarLongAsync(connection, transaction,
+            $"SELECT COUNT(*) FROM etl_runs WHERE extraction_claim_id IS NOT NULL AND {recoveredRunFilter};",
+            cancellationToken).ConfigureAwait(false);
+        var orphanRuns = await ExecuteAsync(connection, transaction,
+            $"UPDATE etl_runs SET status='blocked', finalize_conflict_code='UPLOAD_OUTCOME_UNKNOWN', finalize_conflict_message='A batch send was in flight when the host stopped; the remote outcome is unknowable — manual resolution required.', last_error='A batch send was in flight when the host stopped; the remote outcome is unknowable — manual resolution required.', finished_at_utc=$now, extraction_claim_id=NULL, extraction_claim_owner_id=NULL, extraction_claim_acquired_at_utc=NULL, completion_claim_id=NULL, completion_claim_owner_id=NULL, completion_claim_acquired_at_utc=NULL, updated_at_utc=$now, row_version=row_version+1 WHERE {recoveredRunFilter};",
+            cancellationToken, ("$now", now)).ConfigureAwait(false);
+        await ExecuteAsync(connection, transaction, "DROP TABLE temp.o2_recovery_batches;", cancellationToken).ConfigureAwait(false);
+        claims += (int)orphanClaims;
         // Dead extraction claims die with the interrupted run — cleared inside the same
         // block write and counted as released claims. Ownership rows and bindings are
         // RETAINED: they are the evidence of exactly what the interrupted run owned.
@@ -731,16 +766,16 @@ public sealed partial class SqliteAgentStore
             cancellationToken, ("$now", now)).ConfigureAwait(false);
         claims += (int)extractionClaims;
         var entities = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_run_entities SET status='failed', last_error='RUN_INTERRUPTED', updated_at_utc=$now, row_version=row_version+1 WHERE status='extracting' AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code='INTERRUPTED_NO_CHECKPOINT');",
+            "UPDATE etl_run_entities SET status='failed', last_error='RUN_INTERRUPTED', updated_at_utc=$now, row_version=row_version+1 WHERE status='extracting' AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code IN ('INTERRUPTED_NO_CHECKPOINT','UPLOAD_OUTCOME_UNKNOWN'));",
             cancellationToken, ("$now", now)).ConfigureAwait(false);
         var batches = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_batches SET status='dead_letter', last_error='RUN_INTERRUPTED' WHERE status IN ('creating','ready','retry_waiting','uploading') AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code='INTERRUPTED_NO_CHECKPOINT');",
+            "UPDATE etl_batches SET status='dead_letter', quarantine_code='RUN_BLOCKED', last_error='RUN_INTERRUPTED', row_version=row_version+1 WHERE status IN ('creating','ready','retry_waiting','uploading') AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code IN ('INTERRUPTED_NO_CHECKPOINT','UPLOAD_OUTCOME_UNKNOWN'));",
             cancellationToken).ConfigureAwait(false);
         var jobs = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_jobs SET status='blocked', updated_at_utc=$now, row_version=row_version+1 WHERE status NOT IN ('finished','cancelled','blocked') AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code='INTERRUPTED_NO_CHECKPOINT');",
+            "UPDATE etl_jobs SET status='blocked', updated_at_utc=$now, row_version=row_version+1 WHERE status NOT IN ('finished','cancelled','blocked') AND run_id IN (SELECT run_id FROM etl_runs WHERE status='blocked' AND finalize_conflict_code IN ('INTERRUPTED_NO_CHECKPOINT','UPLOAD_OUTCOME_UNKNOWN'));",
             cancellationToken, ("$now", now)).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return new EtlRecoveryResult(claims, runs, batches, entities, jobs);
+        return new EtlRecoveryResult(claims, runs + orphanRuns, batches + quarantinedBatches, entities, jobs, orphanedAttempts);
     }
 
     // ---------- shared internals ----------
@@ -970,7 +1005,7 @@ public sealed partial class SqliteAgentStore
             "UPDATE etl_run_entities SET status='failed', last_error=$error, updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status='extracting';",
             cancellationToken, ("$error", conflictCode ?? message), ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
         await ExecuteAsync(connection, transaction,
-            "UPDATE etl_batches SET status='dead_letter', last_error=$error WHERE run_id=$run AND status IN ('creating','ready','retry_waiting','uploading');",
+            "UPDATE etl_batches SET status='dead_letter', quarantine_code=$error, last_error=$error, row_version=row_version+1 WHERE run_id=$run AND status IN ('creating','ready','retry_waiting','uploading');",
             cancellationToken, ("$error", batchError), ("$run", runId.ToString("D"))).ConfigureAwait(false);
         // Unresolved work stays unresolved: the job is blocked, never finished — job
         // 'finished' is written only by a successful finalize.
@@ -1193,11 +1228,12 @@ public sealed partial class SqliteAgentStore
             "UPDATE etl_jobs SET status='blocked', updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status NOT IN ('finished','cancelled','blocked');",
             cancellationToken, ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
         // Fence FUTURE batch dispatch: any batch still pre-acknowledgement becomes
-        // dead_letter inside the same commit. This claims nothing and cannot recall an
-        // in-flight HTTP upload — it only guarantees no new local send is dispatched
-        // for a blocked run. Ownership rows/bindings are retained.
+        // dead_letter inside the same commit with the RUN_BLOCKED quarantine code (D3).
+        // This claims nothing and cannot recall an in-flight HTTP upload — it only
+        // guarantees no new local send is dispatched for a blocked run. Ownership
+        // rows/bindings are retained.
         await ExecuteAsync(connection, transaction,
-            "UPDATE etl_batches SET status='dead_letter', last_error=$error WHERE run_id=$run AND status IN ('creating','ready','retry_waiting','uploading');",
+            "UPDATE etl_batches SET status='dead_letter', quarantine_code='RUN_BLOCKED', last_error=$error, row_version=row_version+1 WHERE run_id=$run AND status IN ('creating','ready','retry_waiting','uploading');",
             cancellationToken, ("$error", code), ("$run", runId.ToString("D"))).ConfigureAwait(false);
     }
 
