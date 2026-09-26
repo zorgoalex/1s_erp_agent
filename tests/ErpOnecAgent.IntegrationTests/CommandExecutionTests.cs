@@ -28,6 +28,59 @@ public sealed class CommandExecutionTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task A07_not_before_is_judged_at_the_earliest_erp_time_in_the_ready_query()
+    {
+        var t = DateTimeOffset.UtcNow;
+        var command = MakeCommand(expiresAtUtc: null, notBeforeUtc: t.AddMinutes(1));
+        await _store.StoreCommandAsync(command, t, CancellationToken.None);
+
+        // The local clock says T+2 min, but the ERP clock may still be at T: not due yet.
+        Assert.Empty(await _store.GetReadyCommandsAsync(10, t.AddMinutes(2), t, CancellationToken.None));
+        Assert.Single(await _store.GetReadyCommandsAsync(10, t.AddMinutes(2), t.AddMinutes(2), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A07_not_before_never_holds_back_the_status_lookup_of_an_already_sent_command()
+    {
+        var t = DateTimeOffset.UtcNow;
+        var command = MakeCommand(expiresAtUtc: null, notBeforeUtc: t.AddMinutes(1));
+        await _store.StoreCommandAsync(command, t, CancellationToken.None);
+        // Sent under an earlier clock estimate: the outcome is unknown and must be looked up.
+        await ExecuteSqlAsync($"UPDATE commands_inbox SET status='unknown_result', first_sent_at_utc='{t:O}', post_attempt_count=1 WHERE command_id='{command.CommandId:D}';");
+
+        Assert.Single(await _store.GetDueSentCommandsAsync(10, t.AddMinutes(2), t, CancellationToken.None));
+        Assert.Single(await _store.GetReadyCommandsAsync(10, t.AddMinutes(2), t, CancellationToken.None));
+        Assert.NotNull(await _store.TryAcquireCommandExecutionClaimAsync(command.CommandId, "owner-a", t.AddMinutes(2), t, DateTimeOffset.MinValue, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A07_not_before_is_judged_at_the_earliest_erp_time_in_the_claim_guard()
+    {
+        var t = DateTimeOffset.UtcNow;
+        var command = MakeCommand(expiresAtUtc: null, notBeforeUtc: t.AddMinutes(1));
+        await _store.StoreCommandAsync(command, t, CancellationToken.None);
+
+        Assert.Null(await _store.TryAcquireCommandExecutionClaimAsync(command.CommandId, "owner-a", t.AddMinutes(2), t, DateTimeOffset.MinValue, CancellationToken.None));
+        Assert.NotNull(await _store.TryAcquireCommandExecutionClaimAsync(command.CommandId, "owner-a", t.AddMinutes(2), t.AddMinutes(2), DateTimeOffset.MinValue, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A07_command_not_yet_due_by_the_erp_clock_is_not_executed_even_if_the_local_clock_runs_ahead()
+    {
+        var onec = new FakeOnec();
+        // Locally the not-before passed a minute ago; the ERP clock is 3 minutes behind, so by ERP
+        // time the command is not due for another 2 minutes.
+        var service = new CommandExecutionService(_store, onec, static () => 12, notBeforeNow: static now => now.AddMinutes(-3));
+        var command = MakeCommand(expiresAtUtc: null, notBeforeUtc: DateTimeOffset.UtcNow.AddMinutes(-1));
+        await _store.StoreCommandAsync(command, DateTimeOffset.UtcNow, CancellationToken.None);
+
+        await service.ProcessAsync(await SingleReadyAsync(), NeverAdministrative, CancellationToken.None);
+
+        Assert.Equal(0, onec.ExecuteCalls);
+        Assert.Equal(0, onec.StatusCalls);
+    }
+
+    [Fact]
     public async Task A07_command_expired_by_the_erp_clock_is_not_executed_even_if_the_local_clock_lags()
     {
         var onec = new FakeOnec();
@@ -1043,11 +1096,11 @@ public sealed class CommandExecutionTests : IAsyncLifetime
         return document.RootElement.Clone();
     }
 
-    private static CommandEnvelope MakeCommand(DateTimeOffset? expiresAtUtc, string? orderingKey = null)
+    private static CommandEnvelope MakeCommand(DateTimeOffset? expiresAtUtc, string? orderingKey = null, DateTimeOffset? notBeforeUtc = null)
     {
         using var document = JsonDocument.Parse("{\"amount\":10}");
         var payload = document.RootElement.Clone();
-        return new(Guid.NewGuid(), "create_customer_order", 1, 100, orderingKey ?? "order:42", null, DateTimeOffset.UtcNow, null, expiresAtUtc, null, PayloadHasher.Compute(payload), payload);
+        return new(Guid.NewGuid(), "create_customer_order", 1, 100, orderingKey ?? "order:42", null, DateTimeOffset.UtcNow, notBeforeUtc, expiresAtUtc, null, PayloadHasher.Compute(payload), payload);
     }
 
     private sealed class FakeOnec : IOnecCommandClient

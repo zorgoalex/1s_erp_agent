@@ -236,8 +236,13 @@ public sealed class A07CommandBoundaryRedTests : IAsyncLifetime
         {
             gate.ClaimEntered.TrySetResult(true);
             await gate.ReleaseClaim.Task.ConfigureAwait(false);
-            return await inner.TryAcquireCommandExecutionClaimAsync(
-                (Guid)args![0]!, (string)args[1]!, (DateTimeOffset)args[2]!, (DateTimeOffset)args[3]!, (CancellationToken)args[4]!).ConfigureAwait(false);
+            // Both claim overloads: (id, owner, acquiredAt, staleBefore, ct) and
+            // (id, owner, acquiredAt, notBeforeNow, staleBefore, ct).
+            return args!.Length == 6
+                ? await inner.TryAcquireCommandExecutionClaimAsync(
+                    (Guid)args[0]!, (string)args[1]!, (DateTimeOffset)args[2]!, (DateTimeOffset)args[3]!, (DateTimeOffset)args[4]!, (CancellationToken)args[5]!).ConfigureAwait(false)
+                : await inner.TryAcquireCommandExecutionClaimAsync(
+                    (Guid)args[0]!, (string)args[1]!, (DateTimeOffset)args[2]!, (DateTimeOffset)args[3]!, (CancellationToken)args[4]!).ConfigureAwait(false);
         }
     }
 }

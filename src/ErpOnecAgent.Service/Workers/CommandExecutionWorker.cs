@@ -49,7 +49,8 @@ public sealed class CommandExecutionWorker(
             };
         },
         executorId: CommandExecutionIdentity.NewOwnerId(),
-        expiryNow: state.ExpiryNow);
+        expiryNow: state.ExpiryNow,
+        notBeforeNow: state.NotBeforeNow);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -66,10 +67,11 @@ public sealed class CommandExecutionWorker(
             // fetched — no post-fetch filtering and no empty-batch spin. New-work admission is
             // decided per pass via mayStartNewWork (a documented decision point, not an atomic
             // mode+network gate; in-flight calls are never cancelled on a mode change).
+            var now = DateTimeOffset.UtcNow;
             var commands = snapshot.CanExecuteCommands
-                ? await store.GetReadyCommandsAsync(options.Value.MaxConcurrency, DateTimeOffset.UtcNow, stoppingToken).ConfigureAwait(false)
+                ? await store.GetReadyCommandsAsync(options.Value.MaxConcurrency, now, state.NotBeforeNow(now), stoppingToken).ConfigureAwait(false)
                 : snapshot.CanResolveCommandResults
-                    ? await store.GetDueSentCommandsAsync(options.Value.MaxConcurrency, DateTimeOffset.UtcNow, stoppingToken).ConfigureAwait(false)
+                    ? await store.GetDueSentCommandsAsync(options.Value.MaxConcurrency, now, state.NotBeforeNow(now), stoppingToken).ConfigureAwait(false)
                     : [];
             if (commands.Count == 0) { await Task.Delay(250, stoppingToken).ConfigureAwait(false); continue; }
             await Task.WhenAll(commands.Select(command => ProcessAsync(command, stoppingToken))).ConfigureAwait(false);

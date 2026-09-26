@@ -32,8 +32,11 @@ public sealed record CommandExecutionOptions
     public int RetryMaxDelaySeconds { get; init; } = 300;
 }
 
-public sealed class CommandExecutionService(IAgentStore store, IOnecCommandClient onec, Func<int> maxOperationalAttempts, CommandExecutionHooks? hooks = null, Func<CommandExecutionOptions>? executionOptions = null, string? executorId = null, Func<DateTimeOffset, DateTimeOffset>? expiryNow = null)
+public sealed class CommandExecutionService(IAgentStore store, IOnecCommandClient onec, Func<int> maxOperationalAttempts, CommandExecutionHooks? hooks = null, Func<CommandExecutionOptions>? executionOptions = null, string? executorId = null, Func<DateTimeOffset, DateTimeOffset>? expiryNow = null, Func<DateTimeOffset, DateTimeOffset>? notBeforeNow = null)
 {
+    // A07 time: ERP-defined not-before is judged against the EARLIER of the local clock and the
+    // earliest possible ERP clock, so a local clock running ahead never starts a command early.
+    private readonly Func<DateTimeOffset, DateTimeOffset> _notBeforeNow = notBeforeNow ?? (static now => now);
     // A07 time: ERP-defined expiry is judged against the later of the local clock and the
     // latest possible ERP clock, so a lagging local clock never executes an expired command.
     private readonly Func<DateTimeOffset, DateTimeOffset> _expiryNow = expiryNow ?? (static now => now);
@@ -100,8 +103,9 @@ public sealed class CommandExecutionService(IAgentStore store, IOnecCommandClien
         // administrative side effects and expiry: an unowned pass (terminal row, future schedule, live
         // claim elsewhere) never overwrites via the expiry path either.
         var claimOwner = $"{_executorId}:{CommandExecutionIdentity.NewOwnerId()}";
+        var claimedAt = DateTimeOffset.UtcNow;
         var claim = await store.TryAcquireCommandExecutionClaimAsync(
-            command.CommandId, claimOwner, DateTimeOffset.UtcNow, NoTimeTakeover, cancellationToken).ConfigureAwait(false);
+            command.CommandId, claimOwner, acquiredAtUtc: claimedAt, notBeforeNowUtc: _notBeforeNow(claimedAt), staleBeforeUtc: NoTimeTakeover, cancellationToken: cancellationToken).ConfigureAwait(false);
         if (claim is null) return;
         try
         {

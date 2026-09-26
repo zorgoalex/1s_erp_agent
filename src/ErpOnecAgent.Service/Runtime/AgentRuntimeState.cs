@@ -156,6 +156,17 @@ public sealed class AgentRuntimeState
         }
     }
 
+    /// <summary>The "now" used for ERP-defined not-before: the earlier of the local clock and the earliest possible ERP clock.</summary>
+    public DateTimeOffset NotBeforeNow(DateTimeOffset localNowUtc)
+    {
+        lock (_clockGate)
+        {
+            if (ErpNowLocked() is not { } erpNow) return localNowUtc;
+            var earliestErpNow = erpNow - _erpClockUncertainty;
+            return earliestErpNow < localNowUtc ? earliestErpNow : localNowUtc;
+        }
+    }
+
     public IDisposable BeginCommandExecution()
     {
         Interlocked.Increment(ref _executingCommands);

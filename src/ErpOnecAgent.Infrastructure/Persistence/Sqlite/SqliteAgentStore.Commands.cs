@@ -224,12 +224,20 @@ public sealed partial class SqliteAgentStore
         payload.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null ? "null" : payload.GetRawText();
 
     public Task<IReadOnlyList<StoredCommand>> GetReadyCommandsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken) =>
-        GetReadyCommandsCoreAsync(limit, nowUtc, sentOnly: false, cancellationToken);
+        GetReadyCommandsCoreAsync(limit, nowUtc, nowUtc, sentOnly: false, cancellationToken);
+
+    public Task<IReadOnlyList<StoredCommand>> GetReadyCommandsAsync(int limit, DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, CancellationToken cancellationToken) =>
+        GetReadyCommandsCoreAsync(limit, nowUtc, notBeforeNowUtc, sentOnly: false, cancellationToken);
 
     public Task<IReadOnlyList<StoredCommand>> GetDueSentCommandsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken) =>
-        GetReadyCommandsCoreAsync(limit, nowUtc, sentOnly: true, cancellationToken);
+        GetReadyCommandsCoreAsync(limit, nowUtc, nowUtc, sentOnly: true, cancellationToken);
 
-    private async Task<IReadOnlyList<StoredCommand>> GetReadyCommandsCoreAsync(int limit, DateTimeOffset nowUtc, bool sentOnly, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<StoredCommand>> GetDueSentCommandsAsync(int limit, DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, CancellationToken cancellationToken) =>
+        GetReadyCommandsCoreAsync(limit, nowUtc, notBeforeNowUtc, sentOnly: true, cancellationToken);
+
+    // A07 time: the ERP-defined not_before_utc is judged at notBeforeNowUtc (earliest possible ERP
+    // time); the agent's own next_attempt_at_utc stays on the local clock (nowUtc).
+    private async Task<IReadOnlyList<StoredCommand>> GetReadyCommandsCoreAsync(int limit, DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, bool sentOnly, CancellationToken cancellationToken)
     {
         var result = new List<StoredCommand>();
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -256,7 +264,10 @@ public sealed partial class SqliteAgentStore
             SELECT c.command_id,c.command_type,c.payload_version,c.priority,c.ordering_key,c.correlation_id,c.payload_json,c.payload_hash,c.status,c.created_at_utc,c.received_at_utc,c.not_before_utc,c.expires_at_utc,c.attempt_count,c.next_attempt_at_utc,c.last_error_code,c.last_error_message,c.lookup_attempt_count AS lookup_attempt_count,c.post_attempt_count AS post_attempt_count,c.first_sent_at_utc AS first_sent_at_utc,c.queue_sequence AS queue_sequence
             FROM commands_inbox c
             WHERE c.status IN ('queued','retry_waiting','unknown_result')
-              AND (c.not_before_utc IS NULL OR c.not_before_utc <= $now)
+              -- A07 time: not-before gates only the FIRST send; a row with send evidence was already
+              -- admitted, and its status lookup (a read) must never be held back by a clock re-anchor.
+              AND (c.not_before_utc IS NULL OR c.not_before_utc <= $notBefore
+                   OR c.status='unknown_result' OR c.attempt_count>0 OR c.post_attempt_count>0 OR c.first_sent_at_utc IS NOT NULL)
               AND (c.next_attempt_at_utc IS NULL OR c.next_attempt_at_utc <= $now)
               AND (c.ordering_key IS NULL OR NOT EXISTS (
                     SELECT 1 FROM commands_inbox p WHERE p.ordering_key=c.ordering_key
@@ -265,7 +276,7 @@ public sealed partial class SqliteAgentStore
               {sentEvidence}
             ORDER BY c.priority DESC,c.received_at_utc,c.queue_sequence LIMIT $limit;
             """;
-        Add(command, "$now", nowUtc.ToUniversalTime().ToString("O")); Add(command, "$limit", limit);
+        Add(command, "$now", nowUtc.ToUniversalTime().ToString("O")); Add(command, "$notBefore", notBeforeNowUtc.ToUniversalTime().ToString("O")); Add(command, "$limit", limit);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -318,7 +329,10 @@ public sealed partial class SqliteAgentStore
     /// commit in ONE transaction, and the live row state is RETURNED so the caller never executes on
     /// a stale snapshot. A NULL result means "do not call 1C and do not mutate anything".
     /// </summary>
-    public async Task<ExecutionClaim?> TryAcquireCommandExecutionClaimAsync(Guid commandId, string ownerId, DateTimeOffset acquiredAtUtc, DateTimeOffset staleBeforeUtc, CancellationToken cancellationToken)
+    public Task<ExecutionClaim?> TryAcquireCommandExecutionClaimAsync(Guid commandId, string ownerId, DateTimeOffset acquiredAtUtc, DateTimeOffset staleBeforeUtc, CancellationToken cancellationToken) =>
+        TryAcquireCommandExecutionClaimAsync(commandId, ownerId, acquiredAtUtc, acquiredAtUtc, staleBeforeUtc, cancellationToken);
+
+    public async Task<ExecutionClaim?> TryAcquireCommandExecutionClaimAsync(Guid commandId, string ownerId, DateTimeOffset acquiredAtUtc, DateTimeOffset notBeforeNowUtc, DateTimeOffset staleBeforeUtc, CancellationToken cancellationToken)
     {
         ValidateOwner(ownerId);
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -331,7 +345,8 @@ public sealed partial class SqliteAgentStore
             WHERE command_id=$id
               AND status IN ('queued','retry_waiting','unknown_result')
               AND (exec_claim_owner_id IS NULL OR exec_claim_acquired_at_utc IS NULL OR exec_claim_acquired_at_utc < $staleBefore)
-              AND (not_before_utc IS NULL OR not_before_utc <= $now)
+              AND (not_before_utc IS NULL OR not_before_utc <= $notBefore
+                   OR status='unknown_result' OR attempt_count>0 OR post_attempt_count>0 OR first_sent_at_utc IS NOT NULL)
               AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= $now)
               AND (ordering_key IS NULL OR NOT EXISTS (
                     SELECT 1 FROM commands_inbox p WHERE p.ordering_key=commands_inbox.ordering_key
@@ -339,7 +354,7 @@ public sealed partial class SqliteAgentStore
                     AND p.status NOT IN ('completed','cancelled','expired','dead_letter')))
             RETURNING status,attempt_count,lookup_attempt_count,post_attempt_count,first_sent_at_utc;
             """;
-        Add(update, "$owner", ownerId); Add(update, "$now", acquiredAtUtc.ToUniversalTime().ToString("O"));
+        Add(update, "$owner", ownerId); Add(update, "$now", acquiredAtUtc.ToUniversalTime().ToString("O")); Add(update, "$notBefore", notBeforeNowUtc.ToUniversalTime().ToString("O"));
         Add(update, "$id", commandId.ToString("D")); Add(update, "$staleBefore", staleBeforeUtc.ToUniversalTime().ToString("O"));
         await using var reader = await update.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         // Claim failure => zero mutations in this transaction (rolls back) and the caller must not

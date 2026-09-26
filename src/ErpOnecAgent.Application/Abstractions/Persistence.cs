@@ -42,6 +42,12 @@ public interface IAgentStore
     Task<IReadOnlyList<CommandPayloadConflictEvent>> GetCommandPayloadConflictEventsAsync(int limit, CancellationToken cancellationToken);
     Task<IReadOnlyList<StoredCommand>> GetReadyCommandsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
     /// <summary>
+    /// A07 time: as <see cref="GetReadyCommandsAsync(int, DateTimeOffset, CancellationToken)"/>, but the
+    /// ERP-defined <c>not_before_utc</c> is judged at <paramref name="notBeforeNowUtc"/> (the earliest
+    /// possible ERP time) while the agent's own <c>next_attempt_at_utc</c> stays on <paramref name="nowUtc"/>.
+    /// </summary>
+    Task<IReadOnlyList<StoredCommand>> GetReadyCommandsAsync(int limit, DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, CancellationToken cancellationToken);
+    /// <summary>
     /// Sent-work-only variant of <see cref="GetReadyCommandsAsync"/> (A07b resolution/admission
     /// split): identical due/schedule, same-ordering-key head-of-line, ordering and LIMIT semantics,
     /// plus the durable send-evidence predicate
@@ -50,6 +56,8 @@ public interface IAgentStore
     /// The predicate is the same evidence set the execution pass uses for live-row routing.
     /// </summary>
     Task<IReadOnlyList<StoredCommand>> GetDueSentCommandsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+    /// <summary>A07 time: sent-only variant with the ERP-defined not-before judged at <paramref name="notBeforeNowUtc"/>.</summary>
+    Task<IReadOnlyList<StoredCommand>> GetDueSentCommandsAsync(int limit, DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, CancellationToken cancellationToken);
     Task<int> MarkExecutingAsync(Guid commandId, CancellationToken cancellationToken);
     Task<CommandAttemptId?> ClaimPostAttemptAsync(Guid commandId, CancellationToken cancellationToken);
     Task<CommandAttemptId?> ClaimPostAttemptAsync(Guid commandId, string claimOwner, CancellationToken cancellationToken);
@@ -63,6 +71,8 @@ public interface IAgentStore
     /// (<see cref="CommandQueueOrder.IsClaimStale"/>) stays available for explicit store-level takeover.
     /// </summary>
     Task<ExecutionClaim?> TryAcquireCommandExecutionClaimAsync(Guid commandId, string ownerId, DateTimeOffset acquiredAtUtc, DateTimeOffset staleBeforeUtc, CancellationToken cancellationToken);
+    /// <summary>A07 time: the claim guard with the ERP-defined not-before judged at <paramref name="notBeforeNowUtc"/>.</summary>
+    Task<ExecutionClaim?> TryAcquireCommandExecutionClaimAsync(Guid commandId, string ownerId, DateTimeOffset acquiredAtUtc, DateTimeOffset notBeforeNowUtc, DateTimeOffset staleBeforeUtc, CancellationToken cancellationToken);
     /// <summary>
     /// Releases ONLY the claim owned by <paramref name="ownerId"/> at the end of a pass (success,
     /// scheduling transition or cancellation), so a wrong token has no effect and a newer claim

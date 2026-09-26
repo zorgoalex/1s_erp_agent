@@ -123,6 +123,23 @@ public sealed class A07ClockAndLoadTests : IAsyncLifetime
     }
 
     [Fact]
+    public void Not_before_uses_the_earliest_possible_erp_time()
+    {
+        var state = new AgentRuntimeState();
+        var now = DateTimeOffset.UtcNow;
+        Assert.Equal(now, state.NotBeforeNow(now));
+
+        var sent = DateTimeOffset.UtcNow;
+        state.RecordErpClock(sent - TimeSpan.FromMinutes(5), sent, TimeSpan.FromMilliseconds(400));
+        now = DateTimeOffset.UtcNow;
+        AssertNear(-TimeSpan.FromMinutes(5) - TimeSpan.FromMilliseconds(200), state.NotBeforeNow(now) - now);
+
+        state.RecordErpClock(sent + TimeSpan.FromMinutes(5), sent, TimeSpan.Zero);
+        now = DateTimeOffset.UtcNow;
+        Assert.Equal(now, state.NotBeforeNow(now));
+    }
+
+    [Fact]
     public async Task The_handshake_records_the_erp_clock_and_reports_drift()
     {
         var state = ReadyState();

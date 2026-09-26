@@ -49,10 +49,6 @@ also call 1C. The queued local backlog is not included.
 
 ## Open
 
-- **`notBeforeUtc`** still uses the local clock (`GetReadyCommandsAsync` and the claim
-  guard). The conservative bound would be `min(local, ERP estimate − uncertainty)`. Whether
-  not-before is a safety rule in the ERP contract is not confirmed. If it is, it needs a
-  separate `$notBeforeNow` parameter; `next_attempt_at_utc` must stay on local time.
 - **Lease renewal (CD-R9)** is not in the confirmed contract.
 
 ## Review
@@ -89,3 +85,28 @@ It found three should-fix items, which are addressed:
 - a command expired on the ERP clock that is not executed although the local clock lags.
 
 RED on the pre-fix build: 7 tests.
+
+## Addendum 2026-09-26 — `notBeforeUtc`, option A (user decision)
+
+The ERP-defined `notBeforeUtc` is judged conservatively:
+- a command is first sent only when not-before has passed both on the local clock and on
+  the earliest possible ERP clock;
+- `AgentRuntimeState.NotBeforeNow(local)` returns `min(local, ERP estimate − uncertainty)`;
+- the ready query and the execution claim take it as a separate parameter;
+- `next_attempt_at_utc`, which the agent schedules itself, stays on the local clock;
+- a row that was already sent (`unknown_result`, or attempts / `first_sent_at_utc`
+  recorded) is never held back by not-before, because its status lookup is a read of work
+  already admitted.
+
+The independent review found no must-fix issues. Both of its should-fix items are applied:
+the not-before bypass for rows already sent, and a test on a real sent row.
+
+Tests:
+- `A07ClockAndLoadTests.Not_before_uses_the_earliest_possible_erp_time`;
+- in `CommandExecutionTests`:
+  - the ready query;
+  - the claim guard;
+  - the sent-row bypass;
+  - a service run that is not due by the ERP clock while the local clock is ahead.
+
+RED on the pre-fix build: 4 tests.
