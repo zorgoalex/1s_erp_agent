@@ -87,8 +87,8 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
 
         await migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(11, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(11, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(attemptsBefore, await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;"));
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
@@ -131,7 +131,7 @@ public sealed class EtlJobMigrationTests : IAsyncLifetime
         Assert.Equal(afterFirstRun, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
         Assert.Equal(jobsAfterFirstRun, await SnapshotRowsAsync("SELECT * FROM etl_jobs ORDER BY job_id;"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
-        Assert.Equal(11, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     private static async Task<string> ReadMigrationAsync(string fileName) =>

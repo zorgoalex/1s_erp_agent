@@ -54,8 +54,8 @@ public sealed class PayloadConflictMigrationTests : IAsyncLifetime
 
         await migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(11, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(11, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(attemptsBefore, await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;"));
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
@@ -82,7 +82,7 @@ public sealed class PayloadConflictMigrationTests : IAsyncLifetime
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
         Assert.Equal(attemptsBefore, await SnapshotRowsAsync("SELECT * FROM command_attempts ORDER BY attempt_id;"));
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
-        Assert.Equal(11, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     private static async Task<string> ReadMigrationAsync(string fileName) =>

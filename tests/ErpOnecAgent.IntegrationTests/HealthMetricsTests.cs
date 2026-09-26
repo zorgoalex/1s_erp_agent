@@ -119,6 +119,34 @@ public sealed class HealthMetricsTests : IAsyncLifetime
         Assert.Null((await _store.GetQueueMetricsAsync(CancellationToken.None)).OldestPendingResultAtUtc);
     }
 
+    [Fact]
+    public async Task An_entity_skipped_in_its_latest_finalized_run_is_failing_until_a_later_run_completes_it()
+    {
+        var first = await InsertRunAsync("succeeded");
+        await ExecuteAsync($"UPDATE etl_runs SET finished_at_utc='2026-09-26T01:00:00.0000000+00:00' WHERE run_id='{first:D}';");
+        await InsertEntityAsync(first, "clients", "done", null);
+        await InsertEntityAsync(first, "orders", "failed", "ODATA_HTTP_500");
+        // A run-termination 'failed' row without a code in an unfinished run never counts.
+        var blocked = await InsertRunAsync("blocked");
+        await InsertEntityAsync(blocked, "stock", "failed", null);
+
+        Assert.Equal(1, (await _store.GetQueueMetricsAsync(CancellationToken.None)).EtlEntitiesFailing);
+        Assert.Equal(("degraded", "ETL_ENTITIES_FAILING"),
+            HeartbeatWorker.EvaluateHealth(HealthyState(), new AgentMetrics(long.MaxValue, 0, 0, 0, 0), new StorageOptions(), TimeSpan.FromSeconds(30), new QueueMetrics(0, 0, 0, 0, EtlEntitiesFailing: 1)));
+
+        var second = await InsertRunAsync("succeeded");
+        await ExecuteAsync($"UPDATE etl_runs SET finished_at_utc='2026-09-26T02:00:00.0000000+00:00' WHERE run_id='{second:D}';");
+        await InsertEntityAsync(second, "orders", "done", null);
+
+        Assert.Equal(0, (await _store.GetQueueMetricsAsync(CancellationToken.None)).EtlEntitiesFailing);
+    }
+
+    private async Task InsertEntityAsync(Guid runId, string entity, string status, string? failureCode)
+    {
+        var code = failureCode is null ? "NULL" : $"'{failureCode}'";
+        await ExecuteAsync($"INSERT INTO etl_run_entities(run_id,entity_name,entity_definition_json,domain_fingerprint,status,base_row_present,domain_status,rows_read,batches_created,failure_code,created_at_utc,updated_at_utc,row_version) VALUES('{runId:D}','{entity}','{{}}','fp','{status}',0,'absent',0,0,{code},'2026-09-26T00:00:00.0000000+00:00','2026-09-26T00:00:00.0000000+00:00',1);");
+    }
+
     private static string Health(AgentRuntimeState state, QueueMetrics queues, TimeSpan? etlLagLimit = null) =>
         HeartbeatWorker.GetHealthState(state, new AgentMetrics(long.MaxValue, 0, 0, 0, 0), new StorageOptions(), TimeSpan.FromSeconds(30), queues, etlLagLimit);
 

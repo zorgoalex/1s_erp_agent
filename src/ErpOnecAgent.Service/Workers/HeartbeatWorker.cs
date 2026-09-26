@@ -90,9 +90,9 @@ public sealed class HeartbeatWorker(
         var now = DateTimeOffset.UtcNow;
         var snapshot = state.Snapshot;
         logger.Log(string.Equals(healthState, "healthy", StringComparison.Ordinal) ? LogLevel.Information : LogLevel.Warning,
-            "AGENT_HEALTH State={State} Reason={Reason} Mode={Mode} LocalEtlPaused={LocalEtlPaused} CommandsPending={CommandsPending} OldestCommandAgeSec={OldestCommandAge} ResultsPending={ResultsPending} OldestResultAgeSec={OldestResultAge} EtlBatchesPending={EtlBatches} EtlRunsUnresolved={EtlRunsUnresolved} DeadLetters={DeadLetters} LastEtlSuccessUtc={LastEtlSuccess} DiskFreeBytes={DiskFree} ClockOffsetSec={ClockOffset}",
+            "AGENT_HEALTH State={State} Reason={Reason} Mode={Mode} LocalEtlPaused={LocalEtlPaused} CommandsPending={CommandsPending} OldestCommandAgeSec={OldestCommandAge} ResultsPending={ResultsPending} OldestResultAgeSec={OldestResultAge} EtlBatchesPending={EtlBatches} EtlRunsUnresolved={EtlRunsUnresolved} EtlEntitiesFailing={EtlEntitiesFailing} DeadLetters={DeadLetters} LastEtlSuccessUtc={LastEtlSuccess} DiskFreeBytes={DiskFree} ClockOffsetSec={ClockOffset}",
             healthState, healthReason, snapshot.EffectiveMode, snapshot.LocalEtlPaused, queues.CommandsPending, AgeSeconds(queues.OldestPendingCommandAtUtc, now), queues.ResultsPending, AgeSeconds(queues.OldestPendingResultAtUtc, now),
-            queues.EtlBatchesPending, queues.EtlRunsUnresolved, queues.DeadLetters, state.LastEtlSuccessAtUtc, metrics.DiskFreeBytes, state.ErpClockOffset is { } offset ? Math.Round(offset.TotalSeconds, 1) : null);
+            queues.EtlBatchesPending, queues.EtlRunsUnresolved, queues.EtlEntitiesFailing, queues.DeadLetters, state.LastEtlSuccessAtUtc, metrics.DiskFreeBytes, state.ErpClockOffset is { } offset ? Math.Round(offset.TotalSeconds, 1) : null);
     }
 
     private static long? AgeSeconds(DateTimeOffset? since, DateTimeOffset now) => since is { } value ? (long)Math.Max(0, (now - value).TotalSeconds) : null;
@@ -136,6 +136,8 @@ public sealed class HeartbeatWorker(
         if (state.ClockDriftExceeds(maxClockDrift)) return ("degraded", "CLOCK_DRIFT");
         // Stage 6: runs waiting for operator resolution hold entities and schedule keys.
         if (queues is { EtlRunsUnresolved: > 0 }) return ("degraded", "ETL_RUNS_UNRESOLVED");
+        // Partial runs: an entity skipped in its latest finalized run keeps an old watermark.
+        if (queues is { EtlEntitiesFailing: > 0 }) return ("degraded", "ETL_ENTITIES_FAILING");
         if (etlLagLimit is { } lagLimit && state.LastEtlSuccessAtUtc is { } lastEtl && DateTimeOffset.UtcNow - lastEtl > lagLimit) return ("degraded", "ETL_LAG");
         return ("healthy", "OK");
     }

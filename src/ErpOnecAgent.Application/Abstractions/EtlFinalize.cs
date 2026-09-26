@@ -156,6 +156,14 @@ public abstract record EtlEntityCompletionOutcome
     public sealed record Rejected(EtlEntityCompletionRejection Reason) : EtlEntityCompletionOutcome;
 }
 
+/// <summary>Partial runs: outcome of marking one entity of a running run as failed at the source.</summary>
+public abstract record EtlEntityFailureOutcome
+{
+    private EtlEntityFailureOutcome() { }
+    public sealed record Failed(long BatchesAlreadyRegistered, long RowsAlreadyRead) : EtlEntityFailureOutcome;
+    public sealed record Rejected(EtlEntityCompletionRejection Reason) : EtlEntityFailureOutcome;
+}
+
 public enum EtlRunSealRejection
 {
     /// <summary>The run is missing, not running, or already sealed.</summary>
@@ -173,7 +181,9 @@ public enum EtlRunSealRejection
     /// <summary>The supplied extraction claim is stale, foreign, or absent — the run's live extraction fence does not match.</summary>
     ExtractionClaimLost,
     /// <summary>The run's manifest does not equal its bindings and active ownership rows at the bound epochs.</summary>
-    OwnershipSetMismatch
+    OwnershipSetMismatch,
+    /// <summary>Partial runs: every entity of the run failed; nothing can be finalized.</summary>
+    AllEntitiesFailed,
 }
 
 public abstract record EtlRunSealOutcome
@@ -223,7 +233,7 @@ public abstract record EtlRunFinalizeOutcome
 {
     private EtlRunFinalizeOutcome() { }
     /// <summary>All watermark CAS writes + succeeded run + finished job committed in one transaction.</summary>
-    public sealed record Finalized : EtlRunFinalizeOutcome;
+    public sealed record Finalized(int EntitiesFailed = 0, IReadOnlyList<string>? FailedEntities = null) : EtlRunFinalizeOutcome;
     /// <summary>A CAS/guard mismatch rolled back every watermark change; one commit wrote blocked run + conflict + blocked job.</summary>
     public sealed record Blocked(string Code, string Message) : EtlRunFinalizeOutcome;
     /// <summary>The claim identity is stale or superseded; zero writes.</summary>

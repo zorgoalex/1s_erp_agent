@@ -213,7 +213,9 @@ public interface IAgentStore
     /// bindings AND its active ownership rows — a released/re-acquired row fails closed
     /// even for the same owner). Then: row presence, generation, raw committed cursor
     /// text, and stored domain fingerprint — classifying the domain fail-closed
-    /// (absent|same proceed; changed|unknown write a 'failed' entity row and reject; a
+    /// (absent|same proceed; changed|unknown — and an incremental read without a base,
+    /// BaselineRequired — write a 'failed' entity row with its failure code and reject, so a
+    /// partial run can skip the entity; a
     /// missing source namespace or a definition conflicting with the run's frozen etl_job
     /// definition rejects with zero writes). A run without an etl_jobs row is rejected
     /// outright — O1 has no frozen identity source for jobless runs (scheduled identity
@@ -243,9 +245,18 @@ public interface IAgentStore
     Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Partial runs: marks an 'extracting' entity of the claimed, unsealed run as failed at the
+    /// source, under the same write-first fence as completion. Its already-registered batches
+    /// stay (they may be uploading) and are frozen as its expected count; its watermark is
+    /// never committed, so the next run retries it. Zero writes on any fence miss.
+    /// </summary>
+    Task<EtlEntityFailureOutcome> FailEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string failureCode, string failureMessage, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Seals extraction output in one transaction — under the run's live extraction claim
     /// fence and exact ownership gate: the validated requested manifest must equal the
-    /// entity-row set exactly, every entity must be 'done' with a valid non-empty final,
+    /// entity-row set exactly, every entity must be 'done' with a valid non-empty final — or
+    /// skipped ('failed' with a failure code, no final; not all of them),
     /// and per-entity/run counters must match the actual batch rows. On success the run
     /// becomes 'uploading' with frozen seal counts and the extraction claim is cleared —
     /// the extraction fence ends at seal; afterwards every new-path mutation API is

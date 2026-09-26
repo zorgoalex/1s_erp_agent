@@ -12,5 +12,6 @@ public enum HealthState { Healthy, Degraded, OfflineErp, OfflineOnec, StorageWar
 /// dead-letter outcome, so the inclusion point (local completion) is the only one.
 /// </summary>
 public sealed record QueueMetrics(long CommandsPending, long ResultsPending, long EtlBatchesPending, long DeadLetters, long CommandsDeadLetter = 0,
-    DateTimeOffset? OldestPendingCommandAtUtc = null, DateTimeOffset? OldestPendingResultAtUtc = null, long EtlRunsUnresolved = 0);
+    DateTimeOffset? OldestPendingCommandAtUtc = null, DateTimeOffset? OldestPendingResultAtUtc = null, long EtlRunsUnresolved = 0,
+    long EtlEntitiesFailing = 0);
 

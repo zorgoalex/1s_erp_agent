@@ -611,7 +611,7 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Begin_on_a_scheduled_incremental_without_a_baseline_is_rejected_with_zero_writes()
+    public async Task Begin_on_a_scheduled_incremental_without_a_baseline_is_rejected_and_recorded_as_a_failed_entity()
     {
         // D1: an incremental read on an entity with no committed watermark row can
         // never establish the domain — a full baseline must come first.
@@ -620,7 +620,8 @@ public sealed class EtlScheduledRunsO3Tests : IAsyncLifetime
         var outcome = await _store.BeginEtlEntityExtractionAsync(runId, claim.ExtractionClaimId, Request("clients", ScheduledMode), CancellationToken.None);
 
         Assert.Equal(EtlEntityBeginRejection.BaselineRequired, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
-        Assert.Equal(0, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId:D}'"));
+        // Partial runs: a failed, skippable entity row with its code and no expected batches.
+        Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId:D}' AND status='failed' AND failure_code='BASELINE_REQUIRED' AND expected_batch_count=0"));
         Assert.Equal("running", await RunStatusAsync(runId));
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM watermarks WHERE entity_name='clients'"));
     }

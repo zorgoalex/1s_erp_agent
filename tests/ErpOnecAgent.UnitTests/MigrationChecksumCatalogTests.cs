@@ -56,7 +56,7 @@ public sealed class MigrationChecksumCatalogTests
     public void Unlisted_version_uses_raw_resource_checksum()
     {
         var raw = Hash("future-migration");
-        Assert.Equal(raw, MigrationChecksumCatalog.ResolveRecordedChecksum(12, "012_future.sql", raw));
+        Assert.Equal(raw, MigrationChecksumCatalog.ResolveRecordedChecksum(13, "013_future.sql", raw));
     }
 
     [Fact]
@@ -89,8 +89,8 @@ public sealed class MigrationChecksumCatalogTests
     public void Stored_checksum_for_unlisted_version_must_equal_raw_resource_checksum()
     {
         var raw = Hash("future-migration");
-        Assert.True(MigrationChecksumCatalog.IsAcceptedStoredChecksum(12, "012_future.sql", raw, raw));
-        Assert.False(MigrationChecksumCatalog.IsAcceptedStoredChecksum(12, "012_future.sql", raw, V2Published));
+        Assert.True(MigrationChecksumCatalog.IsAcceptedStoredChecksum(13, "013_future.sql", raw, raw));
+        Assert.False(MigrationChecksumCatalog.IsAcceptedStoredChecksum(13, "013_future.sql", raw, V2Published));
     }
 
     [Fact]
@@ -104,7 +104,7 @@ public sealed class MigrationChecksumCatalogTests
             .Where(static name => name.Contains(".Persistence.Migrations.", StringComparison.Ordinal) && name.EndsWith(".sql", StringComparison.Ordinal))
             .OrderBy(static name => name, StringComparer.Ordinal)
             .ToArray();
-        Assert.Equal(11, resources.Length);
+        Assert.Equal(12, resources.Length);
 
         foreach (var resource in resources)
         {

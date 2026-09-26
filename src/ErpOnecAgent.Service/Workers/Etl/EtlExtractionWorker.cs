@@ -141,6 +141,8 @@ public sealed class EtlExtractionWorker(
         try
         {
             using var frozen = JsonDocument.Parse(frozenEntitiesJson);
+            var done = new List<string>();
+            var failed = new List<string>();
             foreach (var element in frozen.RootElement.EnumerateArray())
             {
                 // B3: the mode is re-checked at every entity boundary; a pause holds the claim
@@ -152,7 +154,22 @@ public sealed class EtlExtractionWorker(
                 }
                 var definitionJson = element.GetRawText();
                 var entity = element.Deserialize<EtlEntityDefinition>(JsonOptions) ?? throw new InvalidDataException("Frozen entity definition is null.");
-                if (!await ExtractEntityAsync(runId, claimId, mode, entity, definitionJson, before.SourceNamespace!, cancellationToken).ConfigureAwait(false)) return;
+                switch (await ExtractEntityAsync(runId, claimId, mode, entity, definitionJson, before.SourceNamespace!, cancellationToken).ConfigureAwait(false))
+                {
+                    case EntityResult.Done: done.Add(entity.EntityCode); break;
+                    case EntityResult.Skipped: failed.Add(entity.EntityCode); break;
+                    default: return;
+                }
+            }
+
+            // Partial runs: skipped entities are fine as long as at least one entity is done;
+            // when none is, there is nothing to deliver and the run fails as before (R1).
+            if (done.Count == 0)
+            {
+                var allFailed = "ALL_ENTITIES_FAILED: " + string.Join(", ", failed);
+                logger.LogError("ETL_RUN_FAILED RunId={RunId} Code=ALL_ENTITIES_FAILED Entities={Entities}", runId, string.Join(", ", failed));
+                await store.FailEtlRunAsync(runId, claimId, allFailed, CancellationToken.None).ConfigureAwait(false);
+                return;
             }
 
             // The after-check tolerates a short outage (bounded retries): a transient
@@ -170,7 +187,8 @@ public sealed class EtlExtractionWorker(
                 return;
             }
             var sealedOutcome = await store.SealEtlRunExtractionAsync(runId, claimId, cancellationToken).ConfigureAwait(false);
-            if (sealedOutcome is EtlRunSealOutcome.Sealed) logger.LogInformation("ETL_RUN_SEALED RunId={RunId}", runId);
+            if (sealedOutcome is EtlRunSealOutcome.Sealed)
+                logger.LogInformation("ETL_RUN_SEALED RunId={RunId} EntitiesDone={EntitiesDone} EntitiesFailed={EntitiesFailed} FailedEntities={FailedEntities}", runId, done.Count, failed.Count, string.Join(", ", failed));
             else await BlockAsync(runId, claimId, "SEAL_REFUSED", $"Sealing the extraction was refused: {sealedOutcome}.", CancellationToken.None).ConfigureAwait(false);
         }
         catch (EtlDiskReserveException ex)
@@ -194,8 +212,14 @@ public sealed class EtlExtractionWorker(
         finally { state.CurrentEtlRunId = null; }
     }
 
-    /// <summary>Returns false when the run was blocked/failed and extraction must stop.</summary>
-    private async Task<bool> ExtractEntityAsync(Guid runId, Guid claimId, string mode, EtlEntityDefinition entity, string definitionJson, string sourceNamespace, CancellationToken cancellationToken)
+    private enum EntityResult { Done, Skipped, Stop }
+
+    /// <summary>
+    /// Done: the entity completed. Skipped: it failed at its source (OData read, cursor, or a
+    /// domain/baseline refusal at Begin) and was durably marked failed — the run continues.
+    /// Stop: the run was blocked or failed (disk, spool, store refusals) and extraction ends.
+    /// </summary>
+    private async Task<EntityResult> ExtractEntityAsync(Guid runId, Guid claimId, string mode, EtlEntityDefinition entity, string definitionJson, string sourceNamespace, CancellationToken cancellationToken)
     {
         var options = etlOptions.Value;
         var upper = new EtlCursor(DateTimeOffset.UtcNow.AddSeconds(-Math.Max(0, options.SafetyLagSeconds)), null);
@@ -203,8 +227,15 @@ public sealed class EtlExtractionWorker(
             new EtlEntityExtractionRequest(entity.EntityCode, definitionJson, sourceNamespace, mode, JsonSerializer.Serialize(upper, JsonOptions)), cancellationToken).ConfigureAwait(false);
         if (begin is EtlEntityBeginOutcome.Rejected rejected)
         {
+            if (rejected.Reason is EtlEntityBeginRejection.DomainChanged or EtlEntityBeginRejection.DomainUnknown or EtlEntityBeginRejection.BaselineRequired)
+            {
+                // The store already recorded the entity as failed with its code.
+                logger.LogError("ETL_ENTITY_FAILED RunId={RunId} Entity={Entity} Code={Code} Message={Message} BatchesAlreadyRegistered=0 RowsAlreadyRead=0",
+                    runId, entity.EntityCode, ToCode(rejected.Reason.ToString()), "Refused at begin; a domain reset (D1) and/or a new baseline (start_full_sync or reload_entity) is required.");
+                return EntityResult.Skipped;
+            }
             await BlockAsync(runId, claimId, "BEGIN_" + ToCode(rejected.Reason.ToString()), $"Entity '{entity.EntityCode}' extraction was refused: {rejected.Reason}.", cancellationToken).ConfigureAwait(false);
-            return false;
+            return EntityResult.Stop;
         }
         var captured = ((EtlEntityBeginOutcome.Begun)begin).Base;
         var committed = captured.CommittedCursorJson is null ? null : JsonSerializer.Deserialize<EtlCursor>(captured.CommittedCursorJson, JsonOptions);
@@ -215,13 +246,33 @@ public sealed class EtlExtractionWorker(
         var from = committed;
         EtlCursor? last = null;
         var batches = 0;
-        await foreach (var row in odata.ReadEntityAsync(entity, committed, upper, full, cancellationToken).ConfigureAwait(false))
+        // Source phase: a failure while reading this entity from 1C or building its cursor
+        // skips the entity. Everything else (spool, disk, store) stays run-level.
+        await using var source = odata.ReadEntityAsync(entity, committed, upper, full, cancellationToken).GetAsyncEnumerator(cancellationToken);
+        while (true)
         {
+            JsonElement row;
+            try
+            {
+                if (!await source.MoveNextAsync().ConfigureAwait(false)) break;
+                row = source.Current;
+            }
+            catch (Exception ex) when (SourceFailureCode(ex, cancellationToken) is { } code)
+            {
+                return await FailEntityAsync(runId, claimId, entity.EntityCode, code, ex).ConfigureAwait(false);
+            }
+            try
+            {
+                last = CursorFrom(row, entity);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return await FailEntityAsync(runId, claimId, entity.EntityCode, "ODATA_CURSOR", ex).ConfigureAwait(false);
+            }
             rows.Add(row); approximateBytes += row.GetRawText().Length + 128;
-            last = CursorFrom(row, entity);
             if (approximateBytes >= options.TargetBatchUncompressedBytes)
             {
-                if (!await FlushAsync(runId, claimId, entity, rows, from, last, cancellationToken).ConfigureAwait(false)) return false;
+                if (!await FlushAsync(runId, claimId, entity, rows, from, last, cancellationToken).ConfigureAwait(false)) return EntityResult.Stop;
                 batches++; from = last; rows = []; approximateBytes = 0;
             }
         }
@@ -229,7 +280,7 @@ public sealed class EtlExtractionWorker(
         // zero-row batch whose ACK proves ERP saw the (empty) range.
         if (rows.Count > 0 || batches == 0)
         {
-            if (!await FlushAsync(runId, claimId, entity, rows, from, last ?? upper, cancellationToken).ConfigureAwait(false)) return false;
+            if (!await FlushAsync(runId, claimId, entity, rows, from, last ?? upper, cancellationToken).ConfigureAwait(false)) return EntityResult.Stop;
             batches++;
         }
         var final = last ?? upper;
@@ -239,9 +290,37 @@ public sealed class EtlExtractionWorker(
             // A refusal leaves the run without a way forward; it is blocked (fenced by the
             // claim, so a lost claim makes the block a no-op) instead of lingering claimed.
             await BlockAsync(runId, claimId, "ENTITY_COMPLETION_REFUSED", $"Completing entity '{entity.EntityCode}' was refused: {completed}.", CancellationToken.None).ConfigureAwait(false);
-            return false;
+            return EntityResult.Stop;
         }
-        return true;
+        return EntityResult.Done;
+    }
+
+    // Partial runs: the failure code of an exception raised while reading an entity from
+    // 1C; null for the caller's own cancellation (shutdown is never an entity failure).
+    internal static string? SourceFailureCode(Exception ex, CancellationToken cancellationToken) => ex switch
+    {
+        OperationCanceledException when cancellationToken.IsCancellationRequested => null,
+        OperationCanceledException => "ODATA_TIMEOUT",
+        HttpRequestException { StatusCode: { } status } => "ODATA_HTTP_" + ((int)status).ToString(System.Globalization.CultureInfo.InvariantCulture),
+        HttpRequestException => "ODATA_TRANSPORT",
+        InvalidDataException => "ODATA_LIMIT",
+        JsonException => "ODATA_JSON",
+        IOException => "ODATA_TRANSPORT",
+        _ => "ODATA_READ"
+    };
+
+    private async Task<EntityResult> FailEntityAsync(Guid runId, Guid claimId, string entity, string code, Exception error)
+    {
+        var outcome = await store.FailEtlEntityExtractionAsync(runId, claimId, entity, code, $"{error.GetType().Name}: {error.Message}", CancellationToken.None).ConfigureAwait(false);
+        if (outcome is EtlEntityFailureOutcome.Failed failed)
+        {
+            logger.LogError(error, "ETL_ENTITY_FAILED RunId={RunId} Entity={Entity} Code={Code} Message={Message} BatchesAlreadyRegistered={Batches} RowsAlreadyRead={Rows} — the entity is skipped, its watermark is kept, the next run retries it",
+                runId, entity, code, error.Message, failed.BatchesAlreadyRegistered, failed.RowsAlreadyRead);
+            return EntityResult.Skipped;
+        }
+        logger.LogWarning(error, "ETL_ENTITY_FAILURE_REFUSED RunId={RunId} Entity={Entity} Code={Code} Outcome={Outcome}", runId, entity, code, outcome);
+        await BlockAsync(runId, claimId, "ENTITY_FAILURE_REFUSED", $"Marking entity '{entity}' failed ({code}) was refused: {outcome}.", CancellationToken.None).ConfigureAwait(false);
+        return EntityResult.Stop;
     }
 
     private async Task<bool> FlushAsync(Guid runId, Guid claimId, EtlEntityDefinition entity, List<JsonElement> rows, EtlCursor? from, EtlCursor? to, CancellationToken cancellationToken)

@@ -154,7 +154,8 @@ public sealed class EtlDomainTransitionD1Tests : IAsyncLifetime
         var (incrementalRun, incrementalClaim) = await ClaimedScheduledRunAsync("nightly", ["clients"]);
         var incremental = await _store.BeginEtlEntityExtractionAsync(incrementalRun, incrementalClaim, IncrementalRequest("clients"), CancellationToken.None);
         Assert.Equal(EtlEntityBeginRejection.BaselineRequired, Assert.IsType<EtlEntityBeginOutcome.Rejected>(incremental).Reason);
-        Assert.Equal(0, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{incrementalRun:D}'"));
+        // Partial runs: the refusal is recorded as a failed entity (skippable), never a watermark.
+        Assert.Equal("BASELINE_REQUIRED", await ScalarStringAsync($"SELECT failure_code FROM etl_run_entities WHERE run_id='{incrementalRun:D}' AND entity_name='clients' AND status='failed'"));
         Assert.IsType<EtlRunTerminationOutcome.Applied>(
             await _store.FailEtlRunAsync(incrementalRun, incrementalClaim, "baseline required", CancellationToken.None));
         Assert.IsType<EtlRunResolutionOutcome.Resolved>(

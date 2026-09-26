@@ -80,10 +80,13 @@ public sealed class EtlCompletionWorker(
                 continue;
             }
             var finalized = await store.FinalizeEtlRunAsync(claim.RunId, claim.ClaimId, CancellationToken.None).ConfigureAwait(false);
-            if (finalized is EtlRunFinalizeOutcome.Finalized)
+            if (finalized is EtlRunFinalizeOutcome.Finalized { EntitiesFailed: var entitiesFailed, FailedEntities: var failedEntities })
             {
                 state.LastEtlSuccessAtUtc = DateTimeOffset.UtcNow;
-                logger.LogInformation("ETL_RUN_SUCCEEDED RunId={RunId}", claim.RunId);
+                if (entitiesFailed > 0)
+                    logger.LogWarning("ETL_RUN_PARTIAL RunId={RunId} EntitiesFailed={EntitiesFailed} FailedEntities={FailedEntities} — the other entities were committed; failed entities keep their watermark and are retried by the next run (details: ETL_ENTITY_FAILED)", claim.RunId, entitiesFailed, string.Join(", ", failedEntities ?? []));
+                else
+                    logger.LogInformation("ETL_RUN_SUCCEEDED RunId={RunId}", claim.RunId);
             }
             else logger.LogWarning("ETL_RUN_FINALIZE_NOT_APPLIED RunId={RunId} Outcome={Outcome}", claim.RunId, finalized);
         }

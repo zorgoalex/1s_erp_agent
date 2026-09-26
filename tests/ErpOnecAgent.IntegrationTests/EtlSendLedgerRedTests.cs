@@ -43,8 +43,8 @@ public sealed class EtlSendLedgerRedTests : IAsyncLifetime
     [Fact]
     public async Task Migration_008_creates_the_send_attempt_ledger_and_batch_send_columns()
     {
-        Assert.Equal(11, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(11, await ScalarAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(12, await ScalarAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal("008_etl_send_attempts.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=8"));
         Assert.Equal("009_etl_scheduled_runs.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=9"));
         Assert.Equal("010_etl_run_resolutions.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=10"));

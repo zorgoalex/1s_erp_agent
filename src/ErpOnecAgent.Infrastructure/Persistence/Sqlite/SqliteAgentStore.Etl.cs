@@ -237,17 +237,26 @@ public sealed partial class SqliteAgentStore
               (SELECT MIN(received_at_utc) FROM commands_inbox WHERE status IN ('queued','retry_waiting','unknown_result','executing')),
               (SELECT MIN(created_at_utc) FROM results_outbox WHERE status IN ('pending','sending','retry_waiting')),
               (SELECT COUNT(*) FROM etl_runs r WHERE r.status IN ('blocked','failed')
-                 AND NOT EXISTS (SELECT 1 FROM etl_run_resolutions x WHERE x.run_id = r.run_id));
+                 AND NOT EXISTS (SELECT 1 FROM etl_run_resolutions x WHERE x.run_id = r.run_id)),
+              (SELECT COUNT(*) FROM (
+                 SELECT e.status, e.failure_code,
+                        ROW_NUMBER() OVER (PARTITION BY e.entity_name ORDER BY r.finished_at_utc DESC, r.run_id DESC) AS latest
+                 FROM etl_run_entities e JOIN etl_runs r ON r.run_id = e.run_id
+                 WHERE r.status = 'succeeded')
+               WHERE latest = 1 AND status = 'failed' AND failure_code IS NOT NULL);
             """;
         // Stage 6: the ages of the oldest pending command/result (timestamps are stored as UTC
         // round-trip strings, so MIN orders them chronologically) and the runs waiting for R1.
         // The result age covers rows awaiting delivery only, read through ix_results_pending.
+        // Partial runs: an entity is "failing" while its latest finalized run skipped it — a
+        // partial run is 'succeeded', so without this a permanently failing entity is silent.
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
         return new QueueMetrics(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2), reader.GetInt64(3), reader.GetInt64(4),
             reader.IsDBNull(5) ? null : ParseUtc(reader.GetString(5)),
             reader.IsDBNull(6) ? null : ParseUtc(reader.GetString(6)),
-            reader.GetInt64(7));
+            reader.GetInt64(7),
+            reader.GetInt64(8));
     }
 
     private static DateTimeOffset ParseUtc(string value) =>

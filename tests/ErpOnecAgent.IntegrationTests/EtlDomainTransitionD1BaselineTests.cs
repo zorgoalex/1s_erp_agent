@@ -129,7 +129,7 @@ public sealed class EtlDomainTransitionD1BaselineTests : IAsyncLifetime
     // ---------- B1: an incremental read never establishes a domain ----------
 
     [Fact]
-    public async Task Incremental_begin_without_a_watermark_row_is_refused_and_writes_nothing()
+    public async Task Incremental_begin_without_a_watermark_row_is_refused_and_records_a_failed_entity_only()
     {
         var (runId, claim) = await ClaimedScheduledRunAsync("nightly", ["clients"]);
         var rowVersionBefore = await ScalarAsync($"SELECT row_version FROM etl_runs WHERE run_id='{runId:D}'");
@@ -139,12 +139,12 @@ public sealed class EtlDomainTransitionD1BaselineTests : IAsyncLifetime
         // BaselineRequired — a pre-D1 build BEGAN the extraction on 'absent' instead.
         var rejected = Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome);
         Assert.Equal("BaselineRequired", rejected.Reason.ToString());
-        // Zero writes: no entity row, the run keeps running with its live claim, and
-        // no watermark was minted.
-        Assert.Equal(0, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId:D}'"));
+        // Partial runs: the only writes are the fence bump and a failed, skippable entity row
+        // (BASELINE_REQUIRED, no expected batches); the run keeps running with its live claim,
+        // and no watermark was minted.
+        Assert.Equal(1, await ScalarAsync($"SELECT COUNT(*) FROM etl_run_entities WHERE run_id='{runId:D}' AND status='failed' AND failure_code='BASELINE_REQUIRED' AND expected_batch_count=0 AND final_watermark_json IS NULL"));
         Assert.Equal("running", await RunStatusAsync(runId));
-        // The fence bump is the one write Begin makes before refusing; it is rolled back too.
-        Assert.Equal(rowVersionBefore, await ScalarAsync($"SELECT row_version FROM etl_runs WHERE run_id='{runId:D}'"));
+        Assert.Equal(rowVersionBefore + 1, await ScalarAsync($"SELECT row_version FROM etl_runs WHERE run_id='{runId:D}'"));
         Assert.Equal(claim.ToString("D"), await ScalarStringAsync($"SELECT extraction_claim_id FROM etl_runs WHERE run_id='{runId:D}'"));
         Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM watermarks"));
 

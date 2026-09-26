@@ -68,7 +68,7 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
         var outboxBefore = await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;");
         var jobsBefore = await SnapshotRowsAsync("SELECT * FROM etl_jobs ORDER BY job_id;");
         var runsBefore = await SnapshotRowsAsync($"SELECT {RunColumnsV8} FROM etl_runs ORDER BY run_id;");
-        var entitiesBefore = await SnapshotRowsAsync("SELECT * FROM etl_run_entities ORDER BY run_id, entity_name;");
+        var entitiesBefore = await SnapshotRowsAsync("SELECT run_id,entity_name,entity_definition_json,domain_fingerprint,status,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,watermark_from_json,snapshot_upper_bound_json,final_watermark_json,expected_batch_count,rows_read,batches_created,last_error,created_at_utc,updated_at_utc,row_version FROM etl_run_entities ORDER BY run_id, entity_name;");
         var batchesBefore = await SnapshotRowsAsync($"SELECT {BatchColumnsV8} FROM etl_batches ORDER BY batch_id;");
         var sendAttemptsBefore = await SnapshotRowsAsync("SELECT * FROM etl_batch_send_attempts ORDER BY attempt_id;");
         var ownershipBefore = await SnapshotRowsAsync("SELECT * FROM etl_entity_ownership ORDER BY entity_name;");
@@ -81,8 +81,8 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(11, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(11, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         // Every pre-existing row in every table survives byte-identical — the live
         // 'admitted' attempt row, the in-flight 'uploading' batch, retained ownership.
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
@@ -90,7 +90,7 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
         Assert.Equal(outboxBefore, await SnapshotRowsAsync("SELECT * FROM results_outbox ORDER BY result_id;"));
         Assert.Equal(jobsBefore, await SnapshotRowsAsync("SELECT * FROM etl_jobs ORDER BY job_id;"));
         Assert.Equal(runsBefore, await SnapshotRowsAsync($"SELECT {RunColumnsV8} FROM etl_runs ORDER BY run_id;"));
-        Assert.Equal(entitiesBefore, await SnapshotRowsAsync("SELECT * FROM etl_run_entities ORDER BY run_id, entity_name;"));
+        Assert.Equal(entitiesBefore, await SnapshotRowsAsync("SELECT run_id,entity_name,entity_definition_json,domain_fingerprint,status,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,watermark_from_json,snapshot_upper_bound_json,final_watermark_json,expected_batch_count,rows_read,batches_created,last_error,created_at_utc,updated_at_utc,row_version FROM etl_run_entities ORDER BY run_id, entity_name;"));
         Assert.Equal(batchesBefore, await SnapshotRowsAsync($"SELECT {BatchColumnsV8} FROM etl_batches ORDER BY batch_id;"));
         Assert.Equal(sendAttemptsBefore, await SnapshotRowsAsync("SELECT * FROM etl_batch_send_attempts ORDER BY attempt_id;"));
         Assert.Equal(ownershipBefore, await SnapshotRowsAsync("SELECT * FROM etl_entity_ownership ORDER BY entity_name;"));
@@ -132,7 +132,7 @@ public sealed class EtlScheduledRunsMigrationTests : IAsyncLifetime
 
         Assert.Equal(runsAfterFirst, await SnapshotRowsAsync("SELECT * FROM etl_runs ORDER BY run_id;"));
         Assert.Equal(ledgerAfterFirst, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
-        Assert.Equal(11, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     [Fact]
