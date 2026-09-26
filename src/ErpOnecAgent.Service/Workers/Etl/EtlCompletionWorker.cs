@@ -18,10 +18,23 @@ public sealed class EtlCompletionWorker(
     AgentRuntimeState state,
     IOptions<EtlOptions> options,
     IOptions<AgentOptions> agentOptions,
-    ILogger<EtlCompletionWorker> logger) : BackgroundService
+    ILogger<EtlCompletionWorker> logger,
+    IOptions<ErpOptions>? erpOptions = null) : BackgroundService
 {
-    /// <summary>A crashed sender's claim is reclaimable only after this period (startup recovery releases it sooner).</summary>
-    internal static readonly TimeSpan ClaimHold = TimeSpan.FromMinutes(5);
+    /// <summary>
+    /// A crashed sender's claim is reclaimable only after this period (startup recovery releases
+    /// it sooner). It always outlasts one completion call on the transfer channel, so a claim can
+    /// never expire — and be re-claimed and re-sent — while its own call is still in flight.
+    /// </summary>
+    internal static TimeSpan ClaimHoldFor(ErpOptions? erp)
+    {
+        var minimum = TimeSpan.FromMinutes(5);
+        if (erp is null) return minimum;
+        var call = ErpOnecAgent.Infrastructure.ErpApi.ErpClientRegistration.TransferHttpClientTimeout(erp) + TimeSpan.FromMinutes(1);
+        return call > minimum ? call : minimum;
+    }
+
+    private readonly TimeSpan _claimHold = ClaimHoldFor(erpOptions?.Value);
     private readonly string _owner = $"{agentOptions.Value.AgentId}:complete:{Environment.ProcessId}";
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,7 +60,7 @@ public sealed class EtlCompletionWorker(
         var handled = 0;
         foreach (var candidate in await store.GetDueRunCompletionsAsync(4, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false))
         {
-            var claimed = await store.TryClaimRunCompletionAsync(candidate.RunId, _owner, DateTimeOffset.UtcNow + ClaimHold, options.Value.MaxRunCompletionAttempts, cancellationToken).ConfigureAwait(false);
+            var claimed = await store.TryClaimRunCompletionAsync(candidate.RunId, _owner, DateTimeOffset.UtcNow + _claimHold, options.Value.MaxRunCompletionAttempts, cancellationToken).ConfigureAwait(false);
             if (claimed is EtlRunClaimOutcome.Blocked blocked)
             {
                 logger.LogWarning("ETL_RUN_BLOCKED_AT_COMPLETION RunId={RunId} Code={Code}", candidate.RunId, blocked.Code);

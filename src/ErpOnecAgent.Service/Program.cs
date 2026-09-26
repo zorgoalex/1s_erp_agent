@@ -112,7 +112,7 @@ static void ConfigureOptions(IServiceCollection services, IConfiguration configu
         .Validate(static value => IsSafeLocalDirectory(value.DataDirectory), "DataDirectory must be a local, non-temporary, non-cloud-synchronized path.").ValidateOnStart();
     services.AddOptions<ErpOptions>().Bind(configuration.GetSection(ErpOptions.SectionName))
         .Validate(static value => IsSecureErpUrl(value), "ERP BaseUrl must use HTTPS; HTTP is allowed only on loopback with AllowInsecureLoopbackForTesting.")
-        .Validate(static value => value.LongPollSeconds is >= 1 and <= 120 && value.RequestTimeoutSeconds > value.LongPollSeconds, "ERP timeout values are invalid.")
+        .Validate(static value => value.LongPollSeconds is >= 1 and <= 120 && value.RequestTimeoutSeconds > value.LongPollSeconds && value.TransferTimeoutSeconds is >= 30 and <= 3600, "ERP timeout values are invalid.")
         .Validate(static value => !value.RequireClientCertificate || !string.IsNullOrWhiteSpace(value.ClientCertificateThumbprint), "mTLS certificate thumbprint is required.").ValidateOnStart();
     services.AddOptions<OnecOptions>().Bind(configuration.GetSection(OnecOptions.SectionName))
         .Validate(static value => Uri.TryCreate(value.ODataBaseUrl, UriKind.Absolute, out _) && Uri.TryCreate(value.CommandApiBaseUrl, UriKind.Absolute, out _), "1C endpoints must be absolute URLs.")

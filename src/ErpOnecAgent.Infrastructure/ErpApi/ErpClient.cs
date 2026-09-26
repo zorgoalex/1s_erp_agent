@@ -29,16 +29,20 @@ public sealed class ErpClient : IErpClient
         HttpClient httpClient,
         AgentOptions agentOptions,
         Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>? sendAsync,
-        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>? longPollSendAsync)
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>? longPollSendAsync,
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>? transferSendAsync = null)
     {
         _httpClient = httpClient;
         _agent = agentOptions;
         _sendAsync = sendAsync ?? SendViaHttpClientAsync;
         _longPollSendAsync = longPollSendAsync ?? _sendAsync;
+        _transferSendAsync = transferSendAsync ?? _sendAsync;
     }
 
     private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _sendAsync;
     private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _longPollSendAsync;
+    // Batch upload and run completion: the single-attempt ETL transfer channel.
+    private readonly Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> _transferSendAsync;
 
     public Task<SessionStartResponse> StartSessionAsync(SessionStartRequest request, CancellationToken cancellationToken) =>
         SendJsonAsync<SessionStartResponse>(HttpMethod.Post, "session/start", request, cancellationToken);
@@ -68,7 +72,7 @@ public sealed class ErpClient : IErpClient
         request.Content = new StreamContent(content);
         request.Content.Headers.ContentType = new("application/x-ndjson");
         request.Content.Headers.ContentEncoding.Add("gzip");
-        using var response = await _sendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await _transferSendAsync(request, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         var ack = JsonSerializer.Deserialize<BatchAcknowledgement>(body, JsonOptions)
@@ -77,7 +81,7 @@ public sealed class ErpClient : IErpClient
     }
 
     public async Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken) =>
-        await SendNoContentAsync(HttpMethod.Post, $"etl/runs/{runId:D}/complete", JsonContent.Create(summary, options: JsonOptions), cancellationToken).ConfigureAwait(false);
+        await CompleteEtlRunRawAsync(runId, JsonSerializer.Serialize(summary, JsonOptions), cancellationToken).ConfigureAwait(false);
 
     /// <inheritdoc cref="IErpClient.CompleteEtlRunRawAsync"/>
     public async Task CompleteEtlRunRawAsync(Guid runId, string completePayloadJson, CancellationToken cancellationToken)
@@ -90,7 +94,7 @@ public sealed class ErpClient : IErpClient
         // throwOnInvalidBytes: a lone surrogate fails closed instead of silently becoming U+FFFD.
         request.Content = new ByteArrayContent(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetBytes(completePayloadJson));
         request.Content.Headers.ContentType = new("application/json") { CharSet = "utf-8" };
-        using var response = await _sendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await _transferSendAsync(request, cancellationToken).ConfigureAwait(false);
         await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
     }
 

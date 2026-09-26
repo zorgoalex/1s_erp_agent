@@ -26,6 +26,8 @@ public sealed class ErpOptions
     public bool RequireClientCertificate { get; init; } = true;
     public bool AllowInsecureLoopbackForTesting { get; init; }
     public int RequestTimeoutSeconds { get; init; } = 60;
+    /// <summary>Budget of one ETL transfer call (batch upload up to 100 MB, run completion). Single attempt, never retried.</summary>
+    public int TransferTimeoutSeconds { get; init; } = 300;
 }
 
 public sealed class OnecOptions
