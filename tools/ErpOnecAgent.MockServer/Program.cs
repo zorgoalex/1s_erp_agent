@@ -15,6 +15,9 @@ var onecJournal = new ConcurrentDictionary<Guid, (string Hash, OnecCommandRespon
 var odata = new ConcurrentDictionary<string, IReadOnlyList<JsonElement>>(StringComparer.Ordinal);
 var mockCommandTypes = new[] { "create_customer_order" };
 var mockVersions = new[] { 1 };
+// E2E evidence: when outputDir is set, every batch (gz + headers) and every completion body is kept.
+var outputDir = builder.Configuration["outputDir"];
+if (!string.IsNullOrWhiteSpace(outputDir)) Directory.CreateDirectory(outputDir);
 
 app.MapPost("/mock/commands", (JsonElement command) => { commands.Enqueue(command.Clone()); return Results.Accepted(); });
 app.MapGet("/mock/results/{id:guid}", (Guid id) => results.TryGetValue(id, out var result) ? Results.Json(result) : Results.NotFound());
@@ -39,9 +42,23 @@ app.MapPost(erp + "/etl/batches", async (HttpRequest request, CancellationToken 
     buffer.Position = 0; var rows = 0;
     await using (var gzip = new GZipStream(buffer, CompressionMode.Decompress, leaveOpen: true)) using (var reader = new StreamReader(gzip)) while (await reader.ReadLineAsync(cancellationToken) is not null) rows++;
     var batchId = Guid.Parse(request.Headers["X-Batch-Id"].ToString());
+    if (!string.IsNullOrWhiteSpace(outputDir))
+    {
+        await File.WriteAllBytesAsync(Path.Combine(outputDir, $"batch-{batchId:D}.ndjson.gz"), compressed, cancellationToken);
+        var headers = request.Headers.Where(static h => h.Key.StartsWith("X-", StringComparison.OrdinalIgnoreCase)).ToDictionary(static h => h.Key, static h => h.Value.ToString());
+        await File.WriteAllTextAsync(Path.Combine(outputDir, $"batch-{batchId:D}.headers.json"), JsonSerializer.Serialize(new { headers, rows, checksumValid = valid }), cancellationToken);
+    }
     return Results.Json(new BatchAcknowledgement(batchId, "acknowledged", rows, valid, DateTimeOffset.UtcNow));
 });
-app.MapPost(erp + "/etl/runs/{id:guid}/complete", (Guid id) => Results.NoContent());
+app.MapPost(erp + "/etl/runs/{id:guid}/complete", async (Guid id, HttpRequest request, CancellationToken cancellationToken) =>
+{
+    if (!string.IsNullOrWhiteSpace(outputDir))
+    {
+        using var reader = new StreamReader(request.Body);
+        await File.WriteAllTextAsync(Path.Combine(outputDir, $"complete-{id:D}.json"), await reader.ReadToEndAsync(cancellationToken), cancellationToken);
+    }
+    return Results.NoContent();
+});
 
 var onec = "/erp-integration/v1";
 app.MapGet(onec + "/health", () => Results.Json(new OnecHealthResponse("ok", "1C", "mock", "mock", DateTimeOffset.UtcNow)));

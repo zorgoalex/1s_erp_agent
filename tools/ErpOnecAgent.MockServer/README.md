@@ -9,3 +9,4 @@ dotnet run --project tools/ErpOnecAgent.MockServer
 - `POST /mock/commands` — поставить command envelope в очередь ERP.
 - `GET /mock/results/{commandId}` — прочитать доставленный результат.
 - `POST /mock/odata/{entity}` — задать JSON-массив строк сущности.
+- `--outputDir <path>` — сохранять каждый пакет (`batch-{id}.ndjson.gz`, заголовки `batch-{id}.headers.json`) и каждое тело `complete` (`complete-{runId}.json`) для E2E-проверок.
