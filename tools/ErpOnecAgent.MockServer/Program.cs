@@ -45,7 +45,7 @@ app.MapPost(erp + "/etl/batches", async (HttpRequest request, CancellationToken 
     if (!string.IsNullOrWhiteSpace(outputDir))
     {
         await File.WriteAllBytesAsync(Path.Combine(outputDir, $"batch-{batchId:D}.ndjson.gz"), compressed, cancellationToken);
-        var headers = request.Headers.Where(static h => h.Key.StartsWith("X-", StringComparison.OrdinalIgnoreCase)).ToDictionary(static h => h.Key, static h => h.Value.ToString());
+        var headers = request.Headers.Where(static h => MockEvidence.SavedBatchHeaders.Contains(h.Key)).ToDictionary(static h => h.Key, static h => h.Value.ToString(), StringComparer.OrdinalIgnoreCase);
         await File.WriteAllTextAsync(Path.Combine(outputDir, $"batch-{batchId:D}.headers.json"), JsonSerializer.Serialize(new { headers, rows, checksumValid = valid }), cancellationToken);
     }
     return Results.Json(new BatchAcknowledgement(batchId, "acknowledged", rows, valid, DateTimeOffset.UtcNow));
@@ -76,3 +76,12 @@ app.MapGet("/odata/{entity}", (string entity) => Results.Json(new { value = odat
 app.Run();
 
 public partial class Program;
+
+internal static class MockEvidence
+{
+    // E2E evidence: only these request headers are ever written to disk (never Authorization or cookies).
+    internal static readonly HashSet<string> SavedBatchHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "X-Batch-Id", "X-Run-Id", "X-Entity", "X-Content-SHA256", "X-Schema-Version", "X-Row-Count", "X-Source-Namespace", "X-Source-Generation"
+    };
+}
