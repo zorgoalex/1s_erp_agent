@@ -85,6 +85,38 @@ public sealed class ErpApiErrorTests
         Assert.False(ex.Is(HttpStatusCode.Conflict, ErpApiException.ResultConflict));
     }
 
+    [Fact]
+    public async Task The_failure_names_the_request_id_erp_echoed_or_the_agent_sent()
+    {
+        var echoed = await Assert.ThrowsAsync<ErpApiException>(() => Client(new EchoHandler("erp-req-42")).AcknowledgeResultAsync(Guid.NewGuid(), "{}", CancellationToken.None));
+        Assert.Equal("erp-req-42", echoed.RequestId);
+        Assert.Contains("X-Request-Id=erp-req-42", echoed.Message, StringComparison.Ordinal);
+
+        var handler = new EchoHandler(null);
+        var sent = await Assert.ThrowsAsync<ErpApiException>(() => Client(handler).AcknowledgeResultAsync(Guid.NewGuid(), "{}", CancellationToken.None));
+        Assert.Equal(handler.SentRequestId, sent.RequestId);
+        Assert.True(Guid.TryParse(sent.RequestId, out _));
+
+        var forged = await Assert.ThrowsAsync<ErpApiException>(() => Client(new EchoHandler("bad id; Level=Fatal")).AcknowledgeResultAsync(Guid.NewGuid(), "{}", CancellationToken.None));
+        Assert.Null(forged.RequestId);
+    }
+
+    private static ErpClient Client(HttpMessageHandler handler) =>
+        new(new HttpClient(handler) { BaseAddress = new Uri("https://erp.test/api/integration/1c-agents/v1/") }, Options.Create(new AgentOptions { AgentId = "agent-1", SiteId = "site-1" }));
+
+    private sealed class EchoHandler(string? echo) : HttpMessageHandler
+    {
+        public string? SentRequestId { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            SentRequestId = request.Headers.GetValues("X-Request-Id").Single();
+            var response = new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("{}", Encoding.UTF8, "application/json"), RequestMessage = request };
+            if (echo is not null) response.Headers.TryAddWithoutValidation("X-Request-Id", echo);
+            return Task.FromResult(response);
+        }
+    }
+
     private static ErpClient Client(HttpStatusCode status, string body, int? retryAfterSeconds = null)
     {
         var http = new HttpClient(new StaticHandler(status, body, retryAfterSeconds)) { BaseAddress = new Uri("https://erp.test/api/integration/1c-agents/v1/") };

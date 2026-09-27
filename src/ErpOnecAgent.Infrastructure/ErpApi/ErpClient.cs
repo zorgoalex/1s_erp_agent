@@ -181,7 +181,15 @@ public sealed class ErpClient : IErpClient
             { Date: { } date } => date - DateTimeOffset.UtcNow,
             _ => (TimeSpan?)null
         };
-        throw new ErpApiException(response.StatusCode, code, retryAfter is { } value && value > TimeSpan.Zero ? value : null);
+        throw new ErpApiException(response.StatusCode, code, retryAfter is { } value && value > TimeSpan.Zero ? value : null, RequestIdOf(response));
+    }
+
+    // ERP's echo first, else the id this agent sent; bounded to a plain token so a log line cannot be forged.
+    private static string? RequestIdOf(HttpResponseMessage response)
+    {
+        var value = response.Headers.TryGetValues("X-Request-Id", out var echoed) ? echoed.FirstOrDefault()
+            : response.RequestMessage?.Headers.TryGetValues("X-Request-Id", out var sent) == true ? sent.FirstOrDefault() : null;
+        return value is { Length: > 0 and <= 128 } && value.All(static c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' or ':') ? value : null;
     }
 
     private static async Task<string?> ReadApiErrorCodeAsync(HttpResponseMessage response, CancellationToken cancellationToken)

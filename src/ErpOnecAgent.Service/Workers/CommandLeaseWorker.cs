@@ -24,6 +24,8 @@ public sealed class CommandLeaseWorker(
     // early is capped at a few requests per second instead of a busy loop.
     internal static readonly TimeSpan EmptyLeaseMinimumCycle = TimeSpan.FromMilliseconds(250);
     private readonly CommandWorkSignals _signals = signals ?? new CommandWorkSignals();
+    internal static TimeSpan IdleRecheck { get; set; } = TimeSpan.FromSeconds(15);
+    private bool _idleWithoutCommandTypes;
 
     private readonly CommandIntakeService intake = new(erp, store);
 
@@ -36,6 +38,17 @@ public sealed class CommandLeaseWorker(
             {
                 await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken).ConfigureAwait(false); continue;
             }
+            // No command type is allowed (ERP configuration commandTypes: [] or an empty local
+            // allowlist): there is nothing to lease, so no long poll is issued (agreed with ERP,
+            // to-onec/0015 — before E2 the lease endpoint does not exist).
+            if (dynamicConfiguration.Snapshot.CommandTypes.Count == 0)
+            {
+                if (!_idleWithoutCommandTypes) logger.LogInformation("COMMAND_LEASE_IDLE — no command types are allowed; leasing paused until the configuration allows some");
+                _idleWithoutCommandTypes = true;
+                await Task.Delay(IdleRecheck, stoppingToken).ConfigureAwait(false);
+                continue;
+            }
+            _idleWithoutCommandTypes = false;
             try
             {
                 var sessionId = await sessions.GetSessionAsync(stoppingToken).ConfigureAwait(false);

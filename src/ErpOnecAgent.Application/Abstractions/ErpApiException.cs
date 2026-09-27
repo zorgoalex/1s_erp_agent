@@ -8,9 +8,9 @@ namespace ErpOnecAgent.Application.Abstractions;
 /// Derives from <see cref="HttpRequestException"/>, so existing handling of ERP failures is
 /// unchanged; callers that understand a specific agreed code can act on it.
 /// </summary>
-public sealed class ErpApiException(HttpStatusCode statusCode, string? apiErrorCode, TimeSpan? retryAfter)
+public sealed class ErpApiException(HttpStatusCode statusCode, string? apiErrorCode, TimeSpan? retryAfter, string? requestId = null)
     : HttpRequestException(
-        $"ERP API returned {(int)statusCode}{(apiErrorCode is null ? string.Empty : " " + apiErrorCode)} (body withheld).",
+        $"ERP API returned {(int)statusCode}{(apiErrorCode is null ? string.Empty : " " + apiErrorCode)} (body withheld).{(requestId is null ? string.Empty : " X-Request-Id=" + requestId)}",
         null,
         statusCode)
 {
@@ -23,6 +23,9 @@ public sealed class ErpApiException(HttpStatusCode statusCode, string? apiErrorC
 
     public string? ApiErrorCode { get; } = apiErrorCode;
     public TimeSpan? RetryAfter { get; } = retryAfter;
+
+    /// <summary>The X-Request-Id of the failed call (ERP's echo when present, otherwise the one the agent sent); ERP audits by it.</summary>
+    public string? RequestId { get; } = requestId;
 
     public bool Is(HttpStatusCode status, string code) =>
         StatusCode == status && string.Equals(ApiErrorCode, code, StringComparison.Ordinal);

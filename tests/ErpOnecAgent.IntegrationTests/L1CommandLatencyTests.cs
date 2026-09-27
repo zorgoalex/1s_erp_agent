@@ -147,6 +147,37 @@ public sealed class L1CommandLatencyTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task No_lease_is_issued_while_no_command_type_is_allowed()
+    {
+        var state = ReadyState();
+        var erp = new FakeErp { EmptyHold = TimeSpan.Zero };
+        using var sessions = new ErpSessionManager(erp, AgentOptions(), state);
+        var configuration = new DynamicConfigurationState(Options.Create(new CommandOptions { SupportedTypes = [] }), Options.Create(new EtlOptions { Entities = [], IntervalMinutes = 60 }));
+        using var worker = new CommandLeaseWorker(erp, _store, sessions, state, configuration,
+            Options.Create(new ErpOptions { RequireClientCertificate = false, LongPollSeconds = 1 }),
+            Options.Create(new CommandOptions { MaxConcurrency = 4, SupportedTypes = [] }),
+            NullLogger<CommandLeaseWorker>.Instance);
+        var recheck = CommandLeaseWorker.IdleRecheck;
+        CommandLeaseWorker.IdleRecheck = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            await worker.StartAsync(CancellationToken.None);
+            await Task.Delay(500);
+            Assert.Equal(0, erp.LeaseCalls);
+
+            // ERP allows a command type: leasing starts on the next recheck.
+            configuration.Apply(2, new RemoteAgentConfiguration { Mode = "Normal", CommandTypes = ["synthetic"], EtlEntities = [], EtlIntervalMinutes = 60 }, state);
+            await erp.WaitForCallsAsync(1);
+            Assert.True(erp.LeaseCalls >= 1);
+        }
+        finally
+        {
+            CommandLeaseWorker.IdleRecheck = recheck;
+            await StopAsync(worker);
+        }
+    }
+
+    [Fact]
     public async Task After_a_held_empty_poll_the_next_lease_goes_out_at_once()
     {
         var state = ReadyState();
