@@ -19,7 +19,7 @@ public sealed class DiagnosticsCollector(IAgentStore store, IOptions<AgentOption
         {
             agent = new { agent.Value.AgentId, agent.Value.SiteId, agent.Value.Environment, agent.Value.DataDirectory },
             erp = new { erp.Value.BaseUrl, erp.Value.ApiVersion, certificateConfigured = !string.IsNullOrWhiteSpace(erp.Value.ClientCertificateThumbprint) },
-            oneC = new { onec.Value.ODataBaseUrl, onec.Value.CommandApiBaseUrl, credentialConfigured = !string.IsNullOrWhiteSpace(onec.Value.CredentialSecretName) }
+            oneC = new { onec.Value.ODataBaseUrl, onec.Value.CommandApiBaseUrl, credentialConfigured = !string.IsNullOrWhiteSpace(onec.Value.CredentialSecretName), separateCommandCredential = !string.IsNullOrWhiteSpace(onec.Value.CommandCredentialSecretName) }
         }, Pretty), cancellationToken).ConfigureAwait(false);
         await WriteAsync(archive, "sqlite-integrity.txt", await store.IntegrityCheckAsync(cancellationToken).ConfigureAwait(false), cancellationToken).ConfigureAwait(false);
         await WriteAsync(archive, "queue-summary.json", JsonSerializer.Serialize(await store.GetQueueMetricsAsync(cancellationToken).ConfigureAwait(false), Pretty), cancellationToken).ConfigureAwait(false);

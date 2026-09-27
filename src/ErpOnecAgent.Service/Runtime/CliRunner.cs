@@ -20,7 +20,14 @@ public static class CliRunner
             Console.Write("1C username: "); var username = Console.ReadLine();
             Console.Write("1C password: "); var password = ReadPassword(); Console.WriteLine();
             if (string.IsNullOrWhiteSpace(username) || string.IsNullOrEmpty(password)) throw new InvalidOperationException("Username and password are required.");
-            var name = services.GetRequiredService<IOptions<OnecOptions>>().Value.CredentialSecretName;
+            var onecOptions = services.GetRequiredService<IOptions<OnecOptions>>().Value;
+            var name = (Value(args, "--purpose") ?? "read") switch
+            {
+                "read" => onecOptions.CredentialSecretName,
+                "command" => onecOptions.CommandCredentialSecretName is { Length: > 0 } commandName ? commandName
+                    : throw new ArgumentException("Set OneC:CommandCredentialSecretName before storing a command credential."),
+                _ => throw new ArgumentException("--purpose read|command")
+            };
             await services.GetRequiredService<ISecretStore>().SaveAsync(name, JsonSerializer.Serialize(new { username, password }), cancellationToken).ConfigureAwait(false);
             Console.WriteLine($"Stored DPAPI-protected credential '{name}'."); return 0;
         }
@@ -49,6 +56,7 @@ public static class CliRunner
             _ = services.GetRequiredService<IOptions<StorageOptions>>().Value;
             if (erp.RequireClientCertificate) using (CertificateLoader.LoadClientCertificate(erp.ClientCertificateThumbprint)) { }
             if (await services.GetRequiredService<ISecretStore>().ReadAsync(onec.CredentialSecretName, cancellationToken).ConfigureAwait(false) is null) throw new InvalidOperationException("1C credential is not configured.");
+            if (await services.GetRequiredService<ISecretStore>().ReadAsync(onec.EffectiveCommandCredentialSecretName, cancellationToken).ConfigureAwait(false) is null) throw new InvalidOperationException("1C command credential is not configured.");
             await store.InitializeAsync(cancellationToken).ConfigureAwait(false);
             Console.WriteLine("Configuration is valid."); return 0;
         }

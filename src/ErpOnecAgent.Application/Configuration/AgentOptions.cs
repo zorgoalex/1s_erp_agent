@@ -35,7 +35,20 @@ public sealed class OnecOptions
     public const string SectionName = "OneC";
     public string ODataBaseUrl { get; init; } = string.Empty;
     public string CommandApiBaseUrl { get; init; } = string.Empty;
+    /// <summary>The read credential: OData, health and identity (ERPIntegration_ODataRead).</summary>
     public string CredentialSecretName { get; init; } = "onec-main";
+
+    /// <summary>
+    /// E5: the command credential for commands/execute and commands/{id}
+    /// (ERPIntegration_CommandWrite + БазовыеПраваБСП), so the OData user stays read-only.
+    /// Null: commands use <see cref="CredentialSecretName"/> (the pre-E5 single credential).
+    /// </summary>
+    public string? CommandCredentialSecretName { get; init; }
+
+    /// <summary>The secret used for command calls.</summary>
+    public string EffectiveCommandCredentialSecretName =>
+        string.IsNullOrWhiteSpace(CommandCredentialSecretName) ? CredentialSecretName : CommandCredentialSecretName;
+
     public int HealthTimeoutSeconds { get; init; } = 5;
     public int RequestTimeoutSeconds { get; init; } = 30;
 

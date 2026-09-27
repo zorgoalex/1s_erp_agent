@@ -34,6 +34,13 @@ public sealed class BootstrapService(
         }
         if (await secrets.ReadAsync(onecOptions.Value.CredentialSecretName, cancellationToken).ConfigureAwait(false) is null)
             throw new InvalidOperationException($"1C credential '{onecOptions.Value.CredentialSecretName}' is not configured. Run --store-onec-credential interactively before starting the service.");
+        // E5: the separate command credential, when configured, must exist too.
+        var commandSecret = onecOptions.Value.EffectiveCommandCredentialSecretName;
+        if (!string.Equals(commandSecret, onecOptions.Value.CredentialSecretName, StringComparison.Ordinal)
+            && await secrets.ReadAsync(commandSecret, cancellationToken).ConfigureAwait(false) is null)
+            throw new InvalidOperationException($"1C command credential '{commandSecret}' is not configured. Run --store-onec-credential --purpose command interactively before starting the service.");
+        if (string.Equals(commandSecret, onecOptions.Value.CredentialSecretName, StringComparison.Ordinal))
+            logger.LogWarning("ONEC_SINGLE_CREDENTIAL — OData and commands use one 1C credential '{Secret}'; configure OneC:CommandCredentialSecretName so the OData user stays read-only", commandSecret);
         // The database-presence guard runs whenever the store is backed by a file database
         // (always in the service); in-process test hosts that inject a store without the
         // factory skip it.

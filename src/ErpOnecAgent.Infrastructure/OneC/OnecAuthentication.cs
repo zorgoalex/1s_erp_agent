@@ -9,10 +9,18 @@ namespace ErpOnecAgent.Infrastructure.OneC;
 
 public sealed class OnecAuthentication(ISecretStore secrets, IOptions<OnecOptions> options)
 {
-    public async Task ApplyAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    /// <summary>Applies the read credential (OData, health, identity).</summary>
+    public Task ApplyAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        ApplySecretAsync(request, options.Value.CredentialSecretName, cancellationToken);
+
+    /// <summary>E5: applies the command credential (commands/execute, commands/{id}).</summary>
+    public Task ApplyCommandAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        ApplySecretAsync(request, options.Value.EffectiveCommandCredentialSecretName, cancellationToken);
+
+    private async Task ApplySecretAsync(HttpRequestMessage request, string secretName, CancellationToken cancellationToken)
     {
-        var secret = await secrets.ReadAsync(options.Value.CredentialSecretName, cancellationToken).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(secret)) throw new InvalidOperationException($"1C credential secret '{options.Value.CredentialSecretName}' is not configured.");
+        var secret = await secrets.ReadAsync(secretName, cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(secret)) throw new InvalidOperationException($"1C credential secret '{secretName}' is not configured.");
         string user; string password;
         if (secret.TrimStart().StartsWith('{'))
         {

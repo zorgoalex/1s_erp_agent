@@ -51,10 +51,22 @@ Bootstrap-настройки находятся в `appsettings.json`. Секр�
 
 Фактические рекомендации для исследованной базы 1С приведены в [odata-dataset-mapping.md](odata-dataset-mapping.md).
 
+### Учётные записи 1С
+
+Службе нужны две учётные записи 1С. Каждая хранится в DPAPI под своим именем секрета:
+
+| Настройка | Для чего | Роли 1С |
+|---|---|---|
+| `OneC:CredentialSecretName` (по умолчанию `onec-main`) | OData, `health`, `identity` | только чтение: `ERPIntegration_ODataRead` |
+| `OneC:CommandCredentialSecretName` (например, `onec-command`) | `commands/execute` и `commands/{id}` | `ERPIntegration_CommandWrite` + `БазовыеПраваБСП` |
+
+Если `CommandCredentialSecretName` не задан, команды идут под учётной записью OData, как до E5. При запуске служба тогда пишет предупреждение `ONEC_SINGLE_CREDENTIAL`. Эта учётная запись должна иметь право записи, поэтому для рабочей установки задайте отдельную.
+
 Перед запуском:
 
 ```powershell
 ErpOnecAgent.exe --store-onec-credential
+ErpOnecAgent.exe --store-onec-credential --purpose command
 ErpOnecAgent.exe --validate-config
 ErpOnecAgent.exe --test-erp
 ErpOnecAgent.exe --test-onec

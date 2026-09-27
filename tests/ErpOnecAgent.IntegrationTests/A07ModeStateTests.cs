@@ -585,6 +585,41 @@ public sealed class A07ModeStateTests : IAsyncLifetime
         Assert.Equal(1, settings.RootElement.GetProperty("Etl").GetProperty("MaxConcurrentBatchUploads").GetInt32());
     }
 
+    [Fact]
+    public async Task E5_bootstrap_refuses_to_start_when_the_configured_command_credential_is_missing()
+    {
+        var state = new AgentRuntimeState();
+        using var controller = new LocalEtlPauseController(_store, state);
+        var bootstrap = new BootstrapService(
+            _store,
+            new FakeSpoolStore(),
+            new OnlySecretStore("test-secret"),
+            new SingleInstanceLock(),
+            state,
+            NewConfiguration(),
+            controller,
+            AgentOptions("e5-bootstrap"),
+            Options.Create(new ErpOptions { RequireClientCertificate = false }),
+            Options.Create(new OnecOptions { CredentialSecretName = "test-secret", CommandCredentialSecretName = "command-secret" }),
+            NullLogger<BootstrapService>.Instance);
+        try
+        {
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => bootstrap.StartAsync(CancellationToken.None));
+            Assert.Contains("command-secret", error.Message, StringComparison.Ordinal);
+            Assert.False(state.IsReady);
+        }
+        finally
+        {
+            await bootstrap.StopAsync(CancellationToken.None);
+        }
+    }
+
+    private sealed class OnlySecretStore(string name) : ISecretStore
+    {
+        public Task SaveAsync(string secretName, string secret, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<string?> ReadAsync(string secretName, CancellationToken cancellationToken) => Task.FromResult<string?>(secretName == name ? "synthetic" : null);
+    }
+
     private static RemoteAgentConfiguration Remote(string mode) => new()
     {
         Mode = mode,

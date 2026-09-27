@@ -19,14 +19,14 @@ public sealed class OnecCommandClient(HttpClient httpClient, OnecAuthentication 
         var content = new ByteArrayContent(JsonSerializer.SerializeToUtf8Bytes(body, JsonOptions));
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
         using var request = new HttpRequestMessage(HttpMethod.Post, "commands/execute") { Content = content };
-        await authentication.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
+        await authentication.ApplyCommandAsync(request, cancellationToken).ConfigureAwait(false);
         return await SendAsync(request, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<OnecExecutionResult> GetStatusAsync(Guid commandId, CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, $"commands/{commandId:D}");
-        await authentication.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
+        await authentication.ApplyCommandAsync(request, cancellationToken).ConfigureAwait(false);
         return await SendAsync(request, cancellationToken).ConfigureAwait(false);
     }
 
