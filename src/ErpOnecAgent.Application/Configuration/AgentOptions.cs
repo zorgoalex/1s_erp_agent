@@ -123,7 +123,8 @@ public sealed class EtlOptions
     public int ODataPageRetries { get; init; } = 3;
     /// <summary>A10c: first retry delay; doubles per attempt.</summary>
     public int ODataRetryBaseDelayMilliseconds { get; init; } = 1000;
-    public IReadOnlyList<EtlEntityDefinition> Entities { get; init; } = [];
+    /// <summary>Set after binding by the service (EtlEntityConfiguration): the binder cannot build the positional record reliably.</summary>
+    public IReadOnlyList<EtlEntityDefinition> Entities { get; set; } = [];
     /// <summary>
     /// V1: verify every full read (readScope "full") with $count before and after and an
     /// independent key-only pass; the verdict goes into complete as completeness. A failed or
