@@ -1,10 +1,16 @@
 openapi: 3.1.0
 info:
   title: ERP 1C Agent API
-  version: 1.0.0
-  description: Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
+  version: 1.1.0
+  description: >-
+    Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
+    1.1.0 (2026-09-28) reflects the decisions agreed over agent-bridge (to-erp/0001-0009,
+    to-onec/0001-0010): ApiError codes (E2), source identity and generation labels, the
+    always-v2 run completion (E3), heartbeat state/config fields (E4) and the batch lookup (E6).
+    Every addition is optional for older agents; the agent announces E3 with the capability
+    `etl.source-labels.v1`.
 servers:
-  - url: https://erp.example.com/api/integration/1c-agents/v1
+  - url: https://onec-agent.example.com:8443/api/integration/1c-agents/v1
 security:
   - mutualTLS: []
 paths:
@@ -17,6 +23,12 @@ paths:
   /commands/lease:
     post:
       operationId: leaseCommand
+      description: >-
+        Long poll. ERP holds the request for up to maxWaitSeconds and answers as soon as a command
+        is available. ERP never hands out a command before its notBeforeUtc, and not while
+        currentLoad.executing >= currentLoad.capacity. The agent re-issues the lease at once after
+        each answer; an empty answer earlier than maxWaitSeconds is rate-limited by the agent to
+        one request per 250 ms.
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LeaseRequest' } } } }
       responses:
         '200': { description: Lease response, content: { application/json: { schema: { $ref: '#/components/schemas/LeaseResponse' } } } }
@@ -29,11 +41,16 @@ paths:
   /commands/{commandId}/lease/renew:
     post:
       operationId: renewCommandLease
+      description: Reserved; the agent does not call it yet.
       parameters: [ { $ref: '#/components/parameters/CommandId' } ]
       responses: { '204': { description: Lease renewed }, '409': { $ref: '#/components/responses/Conflict' } }
   /commands/{commandId}/result:
     put:
       operationId: putCommandResult
+      description: >-
+        Idempotent. Re-sending the same result is 204. A DIFFERENT result for a command that
+        already has one is 409 with ApiError.code RESULT_CONFLICT: the agent stops delivery,
+        keeps the result as evidence and raises a critical incident.
       parameters: [ { $ref: '#/components/parameters/CommandId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CommandResult' } } } }
       responses: { '204': { description: Idempotent result ACK }, '409': { $ref: '#/components/responses/Conflict' } }
@@ -45,35 +62,107 @@ paths:
   /etl/batches:
     post:
       operationId: uploadEtlBatch
+      description: >-
+        One gzip NDJSON batch. The agent uploads one batch at a time by default. Limits:
+        compressed <= 100 MB, uncompressed <= 256 MiB, rows <= 1,000,000, row <= 8 MB.
+        Any non-2xx after the request was sent is an unknown outcome for the agent (the batch is
+        quarantined and the run blocked; resolution via R1), EXCEPT 503 BATCH_NOT_STORED_RETRYABLE,
+        which attests nothing was stored: the agent resends the same batch (same batchId and
+        Idempotency-Key) after max(Retry-After, backoff), capped at 15 min, within 5 attempts.
       parameters:
         - { name: Idempotency-Key, in: header, required: true, schema: { type: string, format: uuid } }
         - { name: X-Content-SHA256, in: header, required: true, schema: { type: string } }
         - { name: X-Batch-Id, in: header, required: true, schema: { type: string, format: uuid } }
         - { name: X-Run-Id, in: header, required: true, schema: { type: string, format: uuid } }
         - { name: X-Entity, in: header, required: true, schema: { type: string } }
+        - { name: X-Schema-Version, in: header, required: true, schema: { type: integer } }
+        - { name: X-Row-Count, in: header, required: true, schema: { type: integer } }
+        - { name: Content-Encoding, in: header, required: true, schema: { type: string, const: gzip } }
+        - name: X-Source-Namespace
+          in: header
+          required: false
+          description: >-
+            1c-identity:v1:{databaseId}:{exportEpoch}:{test|production} recorded for the run at its
+            first read from 1C. Absent only for runs that began reading before the agent upgrade.
+            A mismatch with the bound source is 409 SOURCE_IDENTITY_MISMATCH.
+          schema: { type: string, pattern: '^1c-identity:v1:[0-9a-f-]{36}:[0-9a-f-]{36}:(test|production)$' }
+        - name: X-Source-Generation
+          in: header
+          required: false
+          description: >-
+            The configuration.sourceGeneration token frozen when the run was created. Absent for
+            runs created before a token existed; ERP then fixes the generation at the run's first
+            batch. A closed generation is 409 RUN_GENERATION_CLOSED.
+          schema: { $ref: '#/components/schemas/SourceGenerationToken' }
       requestBody: { required: true, content: { application/x-ndjson: { schema: { type: string, format: binary } } } }
       responses:
         '200': { description: Batch ACK, content: { application/json: { schema: { $ref: '#/components/schemas/BatchAck' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
+        '413': { description: BATCH_LIMIT_EXCEEDED, content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } } }
+        '503':
+          description: BATCH_NOT_STORED_RETRYABLE — nothing was stored; the agent may resend.
+          headers: { Retry-After: { schema: { type: integer } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } }
+  /etl/batches/{batchId}:
+    get:
+      operationId: getEtlBatch
+      description: >-
+        Batch lookup (V-4, agent E6). Used only by the operator command --etl-check-batches before
+        a manual R1 resolution; never by the upload path.
+      parameters: [ { name: batchId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses:
+        '200': { description: 'ERP stored the batch; the original ACK', content: { application/json: { schema: { $ref: '#/components/schemas/BatchAck' } } } }
+        '404': { description: ERP has not stored the batch }
   /etl/runs/{runId}/complete:
     post:
       operationId: completeEtlRun
+      description: >-
+        Idempotent; the agent resends the exact stored bytes. Bodies built by E3+ agents are
+        always RunCompletionV2. Bodies stored by older agents are replayed as they were
+        (RunCompletionV1 or RunCompletionPartialV1). Refusals without retries (the run is blocked):
+        422 BATCH_PAYLOAD_INVALID, 409 SOURCE_IDENTITY_MISMATCH, 409 RUN_GENERATION_CLOSED.
+        A pilot ERP only DIAGNOSES keys missing from a readScope=full entity; it never deletes
+        them automatically (onec user decision 2026-09-28).
       parameters: [ { name: runId, in: path, required: true, schema: { type: string, format: uuid } } ]
-      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
-      responses: { '204': { description: Idempotent run completion ACK } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { $ref: '#/components/schemas/RunCompletionV2' }
+                - { $ref: '#/components/schemas/RunCompletionPartialV1' }
+                - { $ref: '#/components/schemas/RunCompletionV1' }
+      responses:
+        '204': { description: Idempotent run completion ACK }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { description: BATCH_PAYLOAD_INVALID, content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } } }
   /configuration:
     get:
       operationId: getAgentConfiguration
       parameters: [ { name: currentVersion, in: query, required: true, schema: { type: integer, format: int64 } } ]
-      responses: { '200': { description: Versioned configuration, content: { application/json: { schema: { type: object, additionalProperties: true } } } }, '304': { description: Unchanged } }
+      responses:
+        '200': { description: Versioned configuration, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteConfigurationResponse' } } } }
+        '304': { description: Unchanged }
 components:
   securitySchemes:
     mutualTLS: { type: mutualTLS }
   parameters:
     CommandId: { name: commandId, in: path, required: true, schema: { type: string, format: uuid } }
   responses:
-    Conflict: { description: Idempotency or payload conflict, content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } } }
+    Conflict: { description: 'Idempotency, payload, identity or generation conflict', content: { application/json: { schema: { $ref: '#/components/schemas/ApiError' } } } }
   schemas:
+    SourceIdentity:
+      type: object
+      required: [databaseId, exportEpoch, environment]
+      properties:
+        databaseId: { type: string, format: uuid }
+        exportEpoch: { type: string, format: uuid }
+        environment: { type: string, enum: [test, production] }
+    SourceGenerationToken:
+      type: string
+      description: Opaque; 1..128 printable ASCII characters without spaces (ERP uses a UUID).
+      pattern: '^[!-~]{1,128}$'
     SessionStartRequest:
       type: object
       required: [agentId, siteId, agentVersion, localSchemaVersion, capabilities, systemTimeUtc]
@@ -82,14 +171,20 @@ components:
         siteId: { type: string }
         agentVersion: { type: string }
         localSchemaVersion: { type: integer }
-        capabilities: { type: array, items: { type: string } }
+        capabilities:
+          type: array
+          items: { type: string }
+          description: commands.long-poll.v1, commands.result.v1, etl.ndjson-gzip.v1, onec.odata.v1, etl.source-labels.v1
         systemTimeUtc: { type: string, format: date-time }
+        sourceIdentity:
+          description: The bound 1C source; null without a configured binding (treated as absent).
+          anyOf: [ { $ref: '#/components/schemas/SourceIdentity' }, { type: 'null' } ]
     SessionStartResponse:
       type: object
       required: [sessionId, serverTimeUtc, accepted, minimumAgentVersion, configVersion, maintenanceMode]
       properties:
         sessionId: { type: string, format: uuid }
-        serverTimeUtc: { type: string, format: date-time }
+        serverTimeUtc: { type: string, format: date-time, description: The agent estimates ERP clock offset from it (RTT/2). }
         accepted: { type: boolean }
         minimumAgentVersion: { type: string }
         configVersion: { type: integer, format: int64 }
@@ -125,7 +220,13 @@ components:
         expiresAtUtc: { type: [string, 'null'], format: date-time }
         requestedBy: { type: [object, 'null'], additionalProperties: true }
         payloadHash: { type: string, description: Base64 SHA-256 of canonical payload JSON }
-        payload: { type: object, additionalProperties: true }
+        payload:
+          type: object
+          additionalProperties: true
+          description: >-
+            Limits enforced by the agent (the 1C HTTP-service parser minus the envelope):
+            canonical JSON <= 61440 bytes, depth <= 31, nodes <= 4089, properties per object <= 128;
+            no duplicate or case-variant duplicate names, no unpaired surrogates.
     ReceivedAck:
       type: object
       required: [leaseId, receivedAtUtc, payloadHash]
@@ -139,7 +240,14 @@ components:
       properties:
         agentId: { type: string }
         version: { type: string }
-        state: { type: string }
+        state: { type: string, enum: [healthy, degraded, offline_onec, storage_critical, maintenance, incompatible_version] }
+        stateReason:
+          type: [string, 'null']
+          description: >-
+            Why state is not healthy; null when healthy. E.g. COMPATIBILITY_REJECTED,
+            MODE_MAINTENANCE, SQLITE_LIMIT, SPOOL_LIMIT, DISK_RESERVE, ONEC_UNAVAILABLE,
+            ONEC_COMMAND_API_UNAVAILABLE, ONEC_ODATA_UNAVAILABLE, CLOCK_DRIFT, ETL_RUNS_UNRESOLVED,
+            ETL_ENTITIES_FAILING, ETL_LAG.
         uptimeSeconds: { type: integer, format: int64 }
         oneC:
           type: object
@@ -175,6 +283,12 @@ components:
           type: object
           properties:
             expiresAtUtc: { type: [string, 'null'], format: date-time }
+        sourceIdentity: { anyOf: [ { $ref: '#/components/schemas/SourceIdentity' }, { type: 'null' } ] }
+        activeConfigVersion: { type: [integer, 'null'], format: int64, description: Null before any remote configuration is active. }
+        rejectedConfigVersion: { type: [integer, 'null'], format: int64, description: The last refused version while it is newer than the active one. }
+        rejectedReason:
+          type: [string, 'null']
+          enum: [CONFIG_JSON_INVALID, CONFIG_HASH_MISMATCH, CONFIG_VERSION_ROLLBACK, CONFIG_INVALID, CONFIG_APPLY_FAILED, null]
     CommandResult:
       type: object
       required: [commandId, status, completedAtUtc, resultVersion]
@@ -195,11 +309,124 @@ components:
         rowsAccepted: { type: integer }
         checksumValid: { type: boolean }
         acknowledgedAtUtc: { type: string, format: date-time }
+    RunCompletionV2:
+      type: object
+      additionalProperties: false
+      required: [runId, status, mode, rowsRead, batchesCreated, batchesAcknowledged, completedAtUtc, entitiesFailed, entities]
+      description: Property order as listed. sourceIdentity/sourceGeneration are omitted when the run has none (transition, see /etl/batches headers).
+      properties:
+        runId: { type: string, format: uuid }
+        status: { type: string, enum: [succeeded, partial_success] }
+        mode: { type: string, enum: [bootstrap_full, entity_reload, incremental] }
+        sourceIdentity: { $ref: '#/components/schemas/SourceIdentity' }
+        sourceGeneration: { $ref: '#/components/schemas/SourceGenerationToken' }
+        rowsRead: { type: integer, format: int64 }
+        batchesCreated: { type: integer, format: int64 }
+        batchesAcknowledged: { type: integer, format: int64 }
+        completedAtUtc: { type: string, format: date-time }
+        entitiesFailed: { type: integer }
+        entities: { type: array, items: { $ref: '#/components/schemas/RunCompletionEntityV2' } }
+    RunCompletionEntityV2:
+      type: object
+      additionalProperties: false
+      required: [entity, status, readScope, rowsRead, batchesCreated, errorCode, errorMessage]
+      properties:
+        entity: { type: string }
+        status: { type: string, enum: [done, failed] }
+        readScope:
+          type: string
+          enum: [full, delta]
+          description: >-
+            full — read without a date filter (every entity of a full mode, and an incremental
+            entity without updatedAtField); delta — read with a date filter. Describes the query,
+            not verified completeness.
+        rowsRead: { type: integer, format: int64 }
+        batchesCreated: { type: integer, format: int64 }
+        errorCode: { type: [string, 'null'], description: 'e.g. ODATA_HTTP_500, ODATA_TIMEOUT, BASELINE_REQUIRED, DOMAIN_CHANGED' }
+        errorMessage: { type: [string, 'null'] }
+    RunCompletionPartialV1:
+      type: object
+      additionalProperties: false
+      description: Stored by pre-E3 agents for partial runs; replayed byte for byte.
+      required: [runId, status, rowsRead, batchesCreated, batchesAcknowledged, completedAtUtc, entitiesFailed, entities]
+      properties:
+        runId: { type: string, format: uuid }
+        status: { type: string, const: partial_success }
+        rowsRead: { type: integer, format: int64 }
+        batchesCreated: { type: integer, format: int64 }
+        batchesAcknowledged: { type: integer, format: int64 }
+        completedAtUtc: { type: string, format: date-time }
+        entitiesFailed: { type: integer }
+        entities:
+          type: array
+          items:
+            type: object
+            required: [entity, status, rowsRead, batchesCreated, errorCode, errorMessage]
+            properties:
+              entity: { type: string }
+              status: { type: string, enum: [done, failed] }
+              rowsRead: { type: integer, format: int64 }
+              batchesCreated: { type: integer, format: int64 }
+              errorCode: { type: [string, 'null'] }
+              errorMessage: { type: [string, 'null'] }
+    RunCompletionV1:
+      type: object
+      additionalProperties: false
+      description: Stored by pre-E3 agents for successful runs; replayed byte for byte.
+      required: [runId, status, rowsRead, batchesCreated, batchesAcknowledged, completedAtUtc]
+      properties:
+        runId: { type: string, format: uuid }
+        status: { type: string, const: succeeded }
+        rowsRead: { type: integer, format: int64 }
+        batchesCreated: { type: integer, format: int64 }
+        batchesAcknowledged: { type: integer, format: int64 }
+        completedAtUtc: { type: string, format: date-time }
+    RemoteConfigurationResponse:
+      type: object
+      required: [configVersion, configHash, configuration]
+      properties:
+        configVersion: { type: integer, format: int64, description: '> 0 and strictly greater than the active version; gaps allowed.' }
+        configHash: { type: string, description: Base64 SHA-256 of the canonical configuration JSON }
+        configuration: { $ref: '#/components/schemas/RemoteAgentConfiguration' }
+    RemoteAgentConfiguration:
+      type: object
+      required: [mode, commandTypes, etlEntities, etlIntervalMinutes]
+      properties:
+        mode: { type: string, enum: [Normal, PauseCommands, PauseEtl, Drain, Maintenance, Disabled] }
+        commandTypes: { type: array, items: { type: string } }
+        etlEntities: { type: array, items: { $ref: '#/components/schemas/EtlEntityDefinition' } }
+        etlIntervalMinutes: { type: integer, minimum: 1 }
+        sourceGeneration: { $ref: '#/components/schemas/SourceGenerationToken' }
+    EtlEntityDefinition:
+      type: object
+      required: [entityCode, odataPath, keyField, select, syncMode, pageSize, overlapMinutes]
+      properties:
+        entityCode: { type: string }
+        odataPath: { type: string }
+        keyField: { type: string }
+        keyFields: { type: [array, 'null'], items: { type: string } }
+        updatedAtField: { type: [string, 'null'] }
+        updatedAtEdmType: { type: string, enum: ['Edm.DateTime', 'Edm.DateTimeOffset'] }
+        deletedField: { type: [string, 'null'] }
+        select: { type: array, items: { type: string }, minItems: 1 }
+        syncMode: { type: string, description: incremental or manual_only }
+        pageSize: { type: integer, minimum: 1, maximum: 10000 }
+        overlapMinutes: { type: integer }
+        schemaVersion: { type: integer }
+        odataVersion: { type: integer, enum: [3, 4] }
+        enabled: { type: boolean }
     ApiError:
       type: object
       required: [code, message, retryable]
       properties:
-        code: { type: string }
+        code:
+          type: string
+          pattern: '^[A-Z0-9_]{1,64}$'
+          description: >-
+            The agent reads the first top-level code within the first 4 KiB of the body and acts on
+            RESULT_CONFLICT (409), BATCH_PAYLOAD_INVALID (422), SOURCE_IDENTITY_MISMATCH (409),
+            RUN_GENERATION_CLOSED (409), BATCH_NOT_STORED_RETRYABLE (503). The message is never
+            logged or stored by the agent.
         message: { type: string }
         retryable: { type: boolean }
         details: { type: [object, 'null'], additionalProperties: true }
