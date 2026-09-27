@@ -4,8 +4,12 @@ using ErpOnecAgent.Service.Runtime;
 
 namespace ErpOnecAgent.Service.Workers;
 
-public sealed class ResultDeliveryWorker(IAgentStore store, IErpClient erp, AgentRuntimeState state, ILogger<ResultDeliveryWorker> logger) : BackgroundService
+public sealed class ResultDeliveryWorker(IAgentStore store, IErpClient erp, AgentRuntimeState state, ILogger<ResultDeliveryWorker> logger, CommandWorkSignals? signals = null) : BackgroundService
 {
+    // Fallback re-check: retry times and rows written without a signal.
+    private static readonly TimeSpan IdleRecheck = TimeSpan.FromMilliseconds(500);
+    private readonly CommandWorkSignals _signals = signals ?? new CommandWorkSignals();
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -16,7 +20,7 @@ public sealed class ResultDeliveryWorker(IAgentStore store, IErpClient erp, Agen
                 continue;
             }
             var results = await store.GetPendingResultsAsync(25, DateTimeOffset.UtcNow, stoppingToken).ConfigureAwait(false);
-            if (results.Count == 0) { await Task.Delay(500, stoppingToken).ConfigureAwait(false); continue; }
+            if (results.Count == 0) { await _signals.Results.WaitAsync(IdleRecheck, stoppingToken).ConfigureAwait(false); continue; }
             foreach (var result in results)
             {
                 try

@@ -51,7 +51,7 @@ static async Task<int> RunAsync(string[] args)
         sp.GetRequiredService<IOptions<StorageOptions>>().Value.MinimumReservedBytesForCommands));
     builder.Services.AddSingleton<ISecretStore>(sp => new DpapiSecretStore(Path.Combine(sp.GetRequiredService<IOptions<AgentOptions>>().Value.DataDirectory, "secrets")));
     builder.Services.AddSingleton<OnecAuthentication>();
-    builder.Services.AddSingleton<AgentRuntimeState>(); builder.Services.AddSingleton<DynamicConfigurationState>(); builder.Services.AddSingleton<LocalEtlPauseController>(); builder.Services.AddSingleton<SingleInstanceLock>(); builder.Services.AddSingleton<ErpSessionManager>(); builder.Services.AddSingleton<AgentMetricsCollector>();
+    builder.Services.AddSingleton<AgentRuntimeState>(); builder.Services.AddSingleton<CommandWorkSignals>(); builder.Services.AddSingleton<DynamicConfigurationState>(); builder.Services.AddSingleton<LocalEtlPauseController>(); builder.Services.AddSingleton<SingleInstanceLock>(); builder.Services.AddSingleton<ErpSessionManager>(); builder.Services.AddSingleton<AgentMetricsCollector>();
     builder.Services.AddSingleton<DiagnosticsCollector>();
 
     builder.Services.AddErpApi();

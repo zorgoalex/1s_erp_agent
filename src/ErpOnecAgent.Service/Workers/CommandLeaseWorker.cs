@@ -16,8 +16,15 @@ public sealed class CommandLeaseWorker(
     DynamicConfigurationState dynamicConfiguration,
     IOptions<ErpOptions> erpOptions,
     IOptions<CommandOptions> commandOptions,
-    ILogger<CommandLeaseWorker> logger) : BackgroundService
+    ILogger<CommandLeaseWorker> logger,
+    CommandWorkSignals? signals = null) : BackgroundService
 {
+    // Minimum cycle for an EMPTY lease answer. A conforming ERP holds the request for
+    // LongPollSeconds, so the next lease goes out at once; an endpoint that answers empty
+    // early is capped at a few requests per second instead of a busy loop.
+    internal static readonly TimeSpan EmptyLeaseMinimumCycle = TimeSpan.FromMilliseconds(250);
+    private readonly CommandWorkSignals _signals = signals ?? new CommandWorkSignals();
+
     private readonly CommandIntakeService intake = new(erp, store);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -34,18 +41,21 @@ public sealed class CommandLeaseWorker(
                 var sessionId = await sessions.GetSessionAsync(stoppingToken).ConfigureAwait(false);
                 var options = commandOptions.Value;
                 var supportedTypes = dynamicConfiguration.Snapshot.CommandTypes;
+                var leaseStarted = System.Diagnostics.Stopwatch.GetTimestamp();
                 var lease = await erp.LeaseCommandAsync(new LeaseRequest(sessionId, supportedTypes, erpOptions.Value.LongPollSeconds, new LeaseLoad(state.ExecutingCommands, options.MaxConcurrency)), stoppingToken).ConfigureAwait(false);
                 state.LastErpSuccessAtUtc = DateTimeOffset.UtcNow; failureCount = 0;
-                // A conforming ERP holds this request for LongPollSeconds. The
-                // small floor also prevents a faulty/non-long-polling endpoint
-                // from turning an empty queue into a CPU/network busy loop.
                 if (!lease.HasCommand)
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(250), stoppingToken).ConfigureAwait(false);
+                    var rest = EmptyLeaseMinimumCycle - System.Diagnostics.Stopwatch.GetElapsedTime(leaseStarted);
+                    if (rest > TimeSpan.Zero) await Task.Delay(rest, stoppingToken).ConfigureAwait(false);
                     continue;
                 }
                 if (lease.LeaseId is null || lease.Command is null) throw new InvalidDataException("ERP lease response is missing leaseId or command.");
                 var result = await intake.IntakeAsync(lease.LeaseId.Value, lease.Command, supportedTypes, options.MaxPayloadBytes, DateTimeOffset.UtcNow, stoppingToken).ConfigureAwait(false);
+                // Stored (or rejected with a stored result): wake execution and delivery now
+                // instead of at their next timed re-check.
+                _signals.Commands.Pulse();
+                _signals.Results.Pulse();
                 if (result.Outcome == StoreCommandOutcome.PayloadConflict)
                 {
                     logger.LogCritical("COMMAND_PAYLOAD_CONFLICT CommandId={CommandId}", result.CommandId);

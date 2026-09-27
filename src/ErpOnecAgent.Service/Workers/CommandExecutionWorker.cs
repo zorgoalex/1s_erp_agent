@@ -20,8 +20,13 @@ public sealed class CommandExecutionWorker(
     LocalEtlPauseController localPause,
     DiagnosticsCollector diagnostics,
     IOptions<CommandOptions> options,
-    ILogger<CommandExecutionWorker> logger) : BackgroundService
+    ILogger<CommandExecutionWorker> logger,
+    CommandWorkSignals? signals = null) : BackgroundService
 {
+    // Fallback re-check: retry/not-before times and rows found without a signal.
+    private static readonly TimeSpan IdleRecheck = TimeSpan.FromMilliseconds(250);
+    private readonly CommandWorkSignals _signals = signals ?? new CommandWorkSignals();
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly CommandExecutionService execution = new(
         store,
@@ -73,7 +78,7 @@ public sealed class CommandExecutionWorker(
                 : snapshot.CanResolveCommandResults
                     ? await store.GetDueSentCommandsAsync(options.Value.MaxConcurrency, now, state.NotBeforeNow(now), stoppingToken).ConfigureAwait(false)
                     : [];
-            if (commands.Count == 0) { await Task.Delay(250, stoppingToken).ConfigureAwait(false); continue; }
+            if (commands.Count == 0) { await _signals.Commands.WaitAsync(IdleRecheck, stoppingToken).ConfigureAwait(false); continue; }
             await Task.WhenAll(commands.Select(command => ProcessAsync(command, stoppingToken))).ConfigureAwait(false);
         }
     }
@@ -90,6 +95,11 @@ public sealed class CommandExecutionWorker(
         {
             logger.LogError(ex, "COMMAND_TECHNICAL_FAILED CommandId={CommandId}", stored.Envelope.CommandId);
             await store.MarkUnknownResultAsync(stored.Envelope.CommandId, "UNHANDLED_EXECUTION_ERROR", ex.Message, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            // A pass may have committed a result to the outbox: wake delivery now.
+            _signals.Results.Pulse();
         }
     }
 
