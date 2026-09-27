@@ -14,7 +14,11 @@ public sealed class OnecCommandClient(HttpClient httpClient, OnecAuthentication 
     public async Task<OnecExecutionResult> ExecuteAsync(CommandEnvelope command, CancellationToken cancellationToken)
     {
         var body = new ExecuteCommandRequest(command.CommandId, command.CommandType, command.PayloadVersion, command.PayloadHash, command.CorrelationId, command.CreatedAtUtc, command.Payload);
-        using var request = new HttpRequestMessage(HttpMethod.Post, "commands/execute") { Content = JsonContent.Create(body, options: JsonOptions) };
+        // A byte body carries Content-Length: the 1C extension's HTTP service was verified only
+        // with a fixed length, never with Transfer-Encoding: chunked (JsonContent streams).
+        var content = new ByteArrayContent(JsonSerializer.SerializeToUtf8Bytes(body, JsonOptions));
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json") { CharSet = "utf-8" };
+        using var request = new HttpRequestMessage(HttpMethod.Post, "commands/execute") { Content = content };
         await authentication.ApplyAsync(request, cancellationToken).ConfigureAwait(false);
         return await SendAsync(request, cancellationToken).ConfigureAwait(false);
     }

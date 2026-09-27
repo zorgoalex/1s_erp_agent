@@ -61,7 +61,9 @@ public sealed class CommandOptions
     public const string SectionName = "Commands";
     public int MaxConcurrency { get; init; } = 1;
     public int DefaultTimeoutSeconds { get; init; } = 30;
-    public int MaxPayloadBytes { get; init; } = 1_048_576;
+    /// <summary>Canonical command payload limit agreed with ERP. The effective limit never exceeds
+    /// 61440 (CommandPayloadPolicy clamps it), so an older 1 MiB override still starts.</summary>
+    public int MaxPayloadBytes { get; init; } = 61_440;
     public int MaxOperationalAttempts { get; init; } = 12;
     /// <summary>
     /// Maximum status-lookup (resolution) attempts before the outcome stays explicitly unknown and is dead-lettered for manual investigation.

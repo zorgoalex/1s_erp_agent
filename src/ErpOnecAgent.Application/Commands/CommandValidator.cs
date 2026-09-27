@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.Json;
 using ErpOnecAgent.Domain.Commands;
 using ErpOnecAgent.Domain.Common;
@@ -26,8 +25,10 @@ public static class CommandValidator
             return new(false, "INVALID_PAYLOAD", "Command payload is required.");
         if (string.IsNullOrWhiteSpace(command.PayloadHash))
             return new(false, "PAYLOAD_HASH_MISMATCH", "payloadHash is required.");
-        if (Encoding.UTF8.GetByteCount(command.Payload.GetRawText()) > maxPayloadBytes)
-            return new(false, "PAYLOAD_TOO_LARGE", "Command payload exceeds configured limit.");
+        // Limits agreed with ERP and the 1C extension: canonical size, depth, nodes, properties,
+        // unambiguous names and well-formed strings — before the hash is even computed.
+        if (CommandPayloadPolicy.Check(command.Payload, maxPayloadBytes) is { } rejected)
+            return rejected;
         if (!PayloadHasher.Matches(command.Payload, command.PayloadHash))
             return new(false, "PAYLOAD_HASH_MISMATCH", "Payload checksum does not match payloadHash.");
         return ValidationResult.Success;
