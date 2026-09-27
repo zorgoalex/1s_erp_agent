@@ -51,7 +51,9 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         if (httpClient.Timeout != Timeout.InfiniteTimeSpan) attempt.CancelAfter(httpClient.Timeout);
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(entity.ODataPath + "/$count", UriKind.Relative));
-        request.Headers.TryAddWithoutValidation("Accept", "text/plain, application/json");
+        // 1C answers $count as text/plain but REFUSES Accept: text/plain with 406 (found by E2E);
+        // application/json is accepted and still yields the plain number.
+        request.Headers.TryAddWithoutValidation("Accept", "application/json");
         request.Headers.TryAddWithoutValidation("OData-Version", entity.ODataVersion.ToString(CultureInfo.InvariantCulture));
         await authentication.ApplyAsync(request, attempt.Token).ConfigureAwait(false);
         using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attempt.Token).ConfigureAwait(false);

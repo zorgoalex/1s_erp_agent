@@ -60,6 +60,8 @@ public sealed class ReadCompletenessV1Tests
         Assert.Equal("/odata/Catalog_Clients/$count", request.RequestUri!.AbsolutePath);
         Assert.Equal(string.Empty, request.RequestUri.Query);
         Assert.NotNull(request.Headers.Authorization);
+        // 1C refuses Accept: text/plain on $count with 406.
+        Assert.Equal("application/json", string.Join(",", request.Headers.Accept.Select(static a => a.ToString())));
     }
 
     [Theory]
