@@ -171,6 +171,9 @@ public interface IAgentStore
     /// </summary>
     Task<EtlScheduledRunEnsureOutcome> EnsureScheduledEtlRunAsync(EtlScheduledRunRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
+    /// <summary>E6: the run's batches that are neither acknowledged nor deleted, oldest first, with their last send outcome. Read-only.</summary>
+    Task<IReadOnlyList<EtlUnacknowledgedBatch>> GetUnacknowledgedRunBatchesAsync(Guid runId, CancellationToken cancellationToken);
+
     /// <summary>
     /// O3: claims a pending scheduled run through the SAME transaction shape as
     /// <see cref="TryClaimEtlJobAsync"/> — elder-manifest quarantine, elder-overlap

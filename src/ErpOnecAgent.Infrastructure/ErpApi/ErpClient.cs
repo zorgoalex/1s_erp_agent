@@ -109,6 +109,18 @@ public sealed class ErpClient : IErpClient
     public async Task SendHeartbeatAsync(HeartbeatRequest request, CancellationToken cancellationToken) =>
         await SendNoContentAsync(HttpMethod.Post, "heartbeat", JsonContent.Create(request, options: JsonOptions), cancellationToken).ConfigureAwait(false);
 
+    public async Task<EtlBatchRemoteStatus> GetBatchStatusAsync(Guid batchId, CancellationToken cancellationToken)
+    {
+        using var request = CreateRequest(HttpMethod.Get, $"etl/batches/{batchId:D}");
+        using var response = await _sendAsync(request, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return new EtlBatchRemoteStatus(false, null);
+        await EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+        var ack = await response.Content.ReadFromJsonAsync<BatchAcknowledgement>(JsonOptions, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException("ERP returned an empty batch acknowledgement.");
+        if (ack.BatchId != batchId) throw new InvalidDataException("ERP returned the acknowledgement of a different batch.");
+        return new EtlBatchRemoteStatus(true, ack);
+    }
+
     public async Task<RemoteConfigurationResponse?> GetConfigurationAsync(long currentVersion, CancellationToken cancellationToken)
     {
         using var request = CreateRequest(HttpMethod.Get, "configuration?currentVersion=" + currentVersion.ToString(System.Globalization.CultureInfo.InvariantCulture));

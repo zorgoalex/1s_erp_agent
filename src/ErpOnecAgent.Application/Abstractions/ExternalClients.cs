@@ -31,6 +31,14 @@ public interface IErpClient
     /// </summary>
     Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, EtlBatchSourceLabels labels, Stream content, CancellationToken cancellationToken) =>
         UploadBatchWithEvidenceAsync(batch, content, cancellationToken);
+
+    /// <summary>
+    /// E6 (spec В-4): asks ERP whether it stored a batch. <c>200</c> returns the original ACK,
+    /// <c>404</c> means not stored; anything else throws. Read-only; used by the operator
+    /// before an R1 resolution, never by the upload path.
+    /// </summary>
+    Task<EtlBatchRemoteStatus> GetBatchStatusAsync(Guid batchId, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("This ERP client cannot look up batches.");
     Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken);
 
     /// <summary>
@@ -80,3 +88,6 @@ public sealed record BatchUploadResponse(BatchAcknowledgement Ack, byte[] Body, 
 
 /// <summary>E3: the run's source labels sent with each ETL batch; null values are not sent.</summary>
 public sealed record EtlBatchSourceLabels(string? SourceNamespace, string? SourceGeneration);
+
+/// <summary>E6: ERP's answer about one batch — stored (with its original ACK) or not.</summary>
+public sealed record EtlBatchRemoteStatus(bool Stored, BatchAcknowledgement? Acknowledgement);

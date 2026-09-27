@@ -12,6 +12,30 @@ namespace ErpOnecAgent.Infrastructure.Persistence.Sqlite;
 // ownership. It never commits watermarks and never finishes the job.
 public sealed partial class SqliteAgentStore
 {
+    /// <inheritdoc cref="IAgentStore.GetUnacknowledgedRunBatchesAsync"/>
+    public async Task<IReadOnlyList<EtlUnacknowledgedBatch>> GetUnacknowledgedRunBatchesAsync(Guid runId, CancellationToken cancellationToken)
+    {
+        var batches = new List<EtlUnacknowledgedBatch>();
+        await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT b.batch_id, b.entity_name, b.status, b.quarantine_code,
+                   (SELECT COUNT(*) FROM etl_batch_send_attempts a WHERE a.batch_id=b.batch_id),
+                   (SELECT a.outcome FROM etl_batch_send_attempts a WHERE a.batch_id=b.batch_id ORDER BY a.attempt_no DESC LIMIT 1)
+            FROM etl_batches b
+            WHERE b.run_id=$run AND b.status NOT IN ('acknowledged','deleted')
+            ORDER BY b.created_at_utc, b.batch_id;
+            """;
+        Add(command, "$run", runId.ToString("D"));
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            batches.Add(new EtlUnacknowledgedBatch(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetString(2),
+                NullableString(reader, 3), (int)reader.GetInt64(4), NullableString(reader, 5)));
+        }
+        return batches;
+    }
+
     /// <inheritdoc cref="IAgentStore.ResolveEtlRunAsync"/>
     public async Task<EtlRunResolutionOutcome> ResolveEtlRunAsync(EtlRunResolutionRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken)
     {

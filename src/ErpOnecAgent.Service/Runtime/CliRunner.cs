@@ -10,7 +10,7 @@ namespace ErpOnecAgent.Service.Runtime;
 public static class CliRunner
 {
     public static bool HasCommand(string[] args) => args.Any(static arg => arg is "--validate-config" or "--test-erp" or "--test-onec" or "--migrate" or "--integrity-check" or "--collect-diagnostics" or "--store-onec-credential" or "--version"
-        or "--etl-resolve-run" or "--etl-reset-domain");
+        or "--etl-resolve-run" or "--etl-reset-domain" or "--etl-check-batches");
 
     public static async Task<int> RunAsync(IServiceProvider services, string[] args, CancellationToken cancellationToken)
     {
@@ -34,6 +34,8 @@ public static class CliRunner
             Console.Error.WriteLine(missing);
             return 4;
         }
+        if (args.Contains("--etl-check-batches", StringComparer.Ordinal))
+            return await CheckRunBatchesAsync(services.GetRequiredService<IErpClient>(), store, Value(args, "--etl-check-batches"), Console.Out, cancellationToken).ConfigureAwait(false);
         // Maintenance commands take the instance lock before anything touches the database.
         if (args.Contains("--etl-resolve-run", StringComparer.Ordinal) || args.Contains("--etl-reset-domain", StringComparer.Ordinal))
             return await RunEtlMaintenanceAsync(services, store, args, cancellationToken).ConfigureAwait(false);
@@ -129,6 +131,41 @@ public static class CliRunner
             default:
                 return 1;
         }
+    }
+
+    // E6 (spec В-4): read-only evidence for R1. For every batch of the run that ERP has not
+    // acknowledged to the agent, asks ERP whether it stored it. Nothing is written locally; the
+    // operator copies the summary into --etl-resolve-run --verification. Exit 0 when every
+    // batch was answered, 2 when a lookup failed.
+    internal static async Task<int> CheckRunBatchesAsync(IErpClient erp, IAgentStore store, string? runText, TextWriter output, CancellationToken cancellationToken)
+    {
+        if (!Guid.TryParse(runText, out var runId)) throw new ArgumentException("--etl-check-batches <runId> is required.");
+        await store.InitializeAsync(cancellationToken).ConfigureAwait(false);
+        var batches = await store.GetUnacknowledgedRunBatchesAsync(runId, cancellationToken).ConfigureAwait(false);
+        if (batches.Count == 0)
+        {
+            await output.WriteLineAsync($"Run {runId:D}: no unacknowledged batches.").ConfigureAwait(false);
+            return 0;
+        }
+        int stored = 0, missing = 0, failed = 0;
+        foreach (var batch in batches)
+        {
+            string answer;
+            try
+            {
+                var status = await erp.GetBatchStatusAsync(batch.BatchId, cancellationToken).ConfigureAwait(false);
+                if (status.Stored) { stored++; answer = $"STORED rowsAccepted={status.Acknowledgement!.RowsAccepted} checksumValid={status.Acknowledgement.ChecksumValid}"; }
+                else { missing++; answer = "NOT_STORED"; }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                failed++;
+                answer = ex is ErpApiException api ? $"LOOKUP_FAILED http={(int?)api.StatusCode} code={api.ApiErrorCode}" : "LOOKUP_FAILED " + ex.GetType().Name;
+            }
+            await output.WriteLineAsync($"{batch.BatchId:D} entity={batch.EntityName} local={batch.Status}/{batch.QuarantineCode ?? "-"} attempts={batch.SendAttempts} last={batch.LastOutcome ?? "-"} erp={answer}").ConfigureAwait(false);
+        }
+        await output.WriteLineAsync($"Run {runId:D}: {batches.Count} unacknowledged; ERP stored {stored}, not stored {missing}, lookup failed {failed}. Verification text: \"GET etl/batches: stored {stored}, not stored {missing}, failed {failed}\"").ConfigureAwait(false);
+        return failed == 0 ? 0 : 2;
     }
 
     private static string? Value(string[] args, string name)

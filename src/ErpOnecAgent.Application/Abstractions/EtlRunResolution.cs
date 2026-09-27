@@ -1,5 +1,8 @@
 namespace ErpOnecAgent.Application.Abstractions;
 
+/// <summary>E6: a batch of a run that ERP has not acknowledged to the agent — what the operator checks at ERP before R1.</summary>
+public sealed record EtlUnacknowledgedBatch(Guid BatchId, string EntityName, string Status, string? QuarantineCode, int SendAttempts, string? LastOutcome);
+
 // R1 DARK storage contract: attested manual resolution of failed/blocked ETL runs
 // (etl-ownership-upload-design.md §8, migration 010). The store verifies the durable
 // preconditions; the exclusive-maintenance procedure (workers stopped AND drained) and
