@@ -404,6 +404,61 @@ public sealed class A07CompatibilityHeartbeatTests : IAsyncLifetime
         }
     }
 
+    // ---- Startup: the first heartbeat waits for the first 1C check ----
+
+    [Fact]
+    public async Task The_first_heartbeat_waits_for_the_first_onec_check_instead_of_reporting_offline()
+    {
+        var state = ReadyState(AgentMode.Normal);
+        state.ExpectOnecCheck();
+        var erp = new FakeErp();
+        using var sessions = new ErpSessionManager(erp, AgentOptions("hb-first"), state);
+        using var worker = CreateHeartbeatWorker(erp, sessions, state);
+
+        try
+        {
+            await worker.StartAsync(CancellationToken.None);
+            await Task.Delay(400);
+            Assert.False(erp.HeartbeatObserved.Task.IsCompleted, "No heartbeat may go out before the first 1C check.");
+
+            state.OnecCommandApiAvailable = true;
+            state.OnecODataAvailable = true;
+            state.MarkOnecChecked();
+
+            Assert.True(await Task.WhenAny(erp.HeartbeatObserved.Task, Task.Delay(BoundedWait)) == erp.HeartbeatObserved.Task);
+            Assert.Equal("healthy", erp.LastHeartbeat!.State);
+        }
+        finally
+        {
+            await StopWorkerAsync(worker);
+        }
+    }
+
+    [Fact]
+    public async Task A_first_onec_check_that_never_completes_delays_the_heartbeat_only_up_to_the_bound()
+    {
+        var state = ReadyState(AgentMode.Normal);
+        state.ExpectOnecCheck();
+        var erp = new FakeErp();
+        using var sessions = new ErpSessionManager(erp, AgentOptions("hb-bound"), state);
+        using var worker = CreateHeartbeatWorker(erp, sessions, state);
+        var wait = HeartbeatWorker.FirstOnecCheckWait;
+        HeartbeatWorker.FirstOnecCheckWait = TimeSpan.FromMilliseconds(300);
+
+        try
+        {
+            await worker.StartAsync(CancellationToken.None);
+
+            Assert.True(await Task.WhenAny(erp.HeartbeatObserved.Task, Task.Delay(BoundedWait)) == erp.HeartbeatObserved.Task);
+            Assert.Equal("offline_onec", erp.LastHeartbeat!.State);
+        }
+        finally
+        {
+            HeartbeatWorker.FirstOnecCheckWait = wait;
+            await StopWorkerAsync(worker);
+        }
+    }
+
     // ---- E4: stateReason and configuration versions in heartbeat ----
 
     private static readonly JsonSerializerOptions E4Json = new(JsonSerializerDefaults.Web);

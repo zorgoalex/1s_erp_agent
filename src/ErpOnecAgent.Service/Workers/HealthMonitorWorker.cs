@@ -13,6 +13,14 @@ public sealed class HealthMonitorWorker(
     IOptions<OnecOptions> onecOptions,
     ILogger<HealthMonitorWorker> logger) : BackgroundService
 {
+    private readonly bool _announced = Announce(state);
+
+    private static bool Announce(AgentRuntimeState state)
+    {
+        state.ExpectOnecCheck();
+        return true;
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -43,6 +51,7 @@ public sealed class HealthMonitorWorker(
                 state.LastOnecError = ex.Message.Length > 512 ? ex.Message[..512] : ex.Message;
                 logger.LogWarning(ex, "1C health check failed");
             }
+            state.MarkOnecChecked();
             if (previousCommand != state.OnecCommandApiAvailable || previousOdata != state.OnecODataAvailable)
                 logger.LogInformation("1C health changed OData={ODataAvailable} CommandApi={CommandApiAvailable}", state.OnecODataAvailable, state.OnecCommandApiAvailable);
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(5, options.Value.HealthCheckIntervalSeconds)), stoppingToken).ConfigureAwait(false);

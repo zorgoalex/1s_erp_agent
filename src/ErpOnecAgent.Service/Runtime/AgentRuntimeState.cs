@@ -184,6 +184,26 @@ public sealed class AgentRuntimeState
     public Guid? CurrentEtlRunId { get; set; }
     public bool OnecODataAvailable { get; set; }
     public bool OnecCommandApiAvailable { get; set; }
+
+    // Startup: the 1C availability flags are false until the first health check has run, so a
+    // heartbeat sent before it would report offline_onec (a false critical alert in ERP, seen on
+    // stage). A health monitor announces the pending check; the first heartbeat waits for it.
+    private readonly TaskCompletionSource _firstOnecCheck = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _onecCheckExpected;
+
+    /// <summary>Called by the 1C health monitor at construction: a first check will follow.</summary>
+    public void ExpectOnecCheck() => Interlocked.Exchange(ref _onecCheckExpected, 1);
+
+    /// <summary>Called after every 1C health check (success or failure).</summary>
+    public void MarkOnecChecked() => _firstOnecCheck.TrySetResult();
+
+    /// <summary>Waits for the first 1C check when one is expected, at most <paramref name="timeout"/>.</summary>
+    public async Task WaitForFirstOnecCheckAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (Volatile.Read(ref _onecCheckExpected) == 0 || _firstOnecCheck.Task.IsCompleted) return;
+        await Task.WhenAny(_firstOnecCheck.Task, Task.Delay(timeout, cancellationToken)).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+    }
     public string? LastOnecError { get; set; }
 
     public void RestoreLocalEtlPause(bool paused)

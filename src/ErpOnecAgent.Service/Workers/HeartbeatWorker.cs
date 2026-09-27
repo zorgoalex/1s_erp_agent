@@ -27,6 +27,8 @@ public sealed class HeartbeatWorker(
     private int? _lastCertificateWarning;
     private string? _lastHealthState;
     private long _lastHealthSummary;
+    private bool _firstHeartbeatSent;
+    internal static TimeSpan FirstOnecCheckWait { get; set; } = TimeSpan.FromSeconds(30);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -36,6 +38,12 @@ public sealed class HeartbeatWorker(
             {
                 await Task.Delay(250, stoppingToken).ConfigureAwait(false);
                 continue;
+            }
+            if (!_firstHeartbeatSent)
+            {
+                // The first heartbeat reports the result of the first 1C check, not its absence.
+                await state.WaitForFirstOnecCheckAsync(FirstOnecCheckWait, stoppingToken).ConfigureAwait(false);
+                _firstHeartbeatSent = true;
             }
             try
             {
