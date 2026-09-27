@@ -71,3 +71,25 @@ ErpOnecAgent.exe --validate-config
 ErpOnecAgent.exe --test-erp
 ErpOnecAgent.exe --test-onec
 ```
+
+### Сертификат агента для mTLS
+
+ERP принимает самоподписанный клиентский сертификат агента: ERP регистрирует его отпечаток.
+Сертификат создаётся на машине агента в PowerShell, запущенном от администратора:
+
+```powershell
+.\installer\powershell\new-agent-certificate.ps1 -AgentId <agentId> -OutputDirectory C:\temp\agent-cert -GrantServiceAccess
+```
+
+Что делает скрипт:
+- создаёт ключ RSA 3072 без права экспорта в `LocalMachine\My`, назначение — проверка
+  подлинности клиента, срок — 2 года;
+- с `-GrantServiceAccess` даёт виртуальной учётной записи службы `NT SERVICE\ErpOnecAgent`
+  право чтения закрытого ключа;
+- пишет **только публичный** сертификат `agent-<agentId>.pem` и выводит отпечатки.
+
+Дальше:
+- отправьте в ERP файл `.pem`, а также `agentId` и `siteId`;
+- в `Erp:ClientCertificateThumbprint` укажите выведенный отпечаток SHA-1.
+
+Закрытый ключ машину не покидает.
