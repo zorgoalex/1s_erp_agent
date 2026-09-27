@@ -584,6 +584,16 @@ public sealed partial class SqliteAgentStore
         return results;
     }
 
+    public async Task<bool> MarkResultConflictAsync(Guid commandId, string reason, CancellationToken cancellationToken)
+    {
+        await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE results_outbox SET status='dead_letter', next_attempt_at_utc=NULL, last_error=$reason WHERE command_id=$id AND status IN ('pending','retry_waiting','sending');";
+        Add(command, "$reason", reason);
+        Add(command, "$id", commandId.ToString("D"));
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+    }
+
     public async Task<bool> MarkResultRetryAsync(Guid commandId, string errorMessage, DateTimeOffset retryAtUtc, CancellationToken cancellationToken)
     {
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);

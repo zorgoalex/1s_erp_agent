@@ -119,6 +119,21 @@ public sealed class EtlUploadWorker(
         // After the ERP call the outcome must reach the ledger: the write is retried a few
         // times (a busy database), and if it still fails the attempt stays sent-but-unrecorded,
         // which startup recovery orphans and quarantines — never a resend.
+        if (result.Error is ErpApiException notStored && notStored.Is(System.Net.HttpStatusCode.ServiceUnavailable, ErpApiException.BatchNotStoredRetryable))
+        {
+            // ERP ATTESTS it stored nothing for this batch (its GET etl/batches/{id} answers 404),
+            // so the attempt is ledger-proven unsent, exactly like a precheck failure: the same
+            // batch (same batchId and Idempotency-Key) is sent again after max(Retry-After,
+            // backoff), within the durable attempt bound. Should ERP have stored it after all,
+            // the replay under the same Idempotency-Key returns the original ACK.
+            var backoff = CommandPolicy.BackoffDelay(claim.AttemptNo, TimeSpan.FromSeconds(5), TimeSpan.FromMinutes(5));
+            var wait = notStored.RetryAfter is { } retryAfter && retryAfter > backoff ? retryAfter : backoff;
+            if (wait > MaxNotStoredRetryWait) wait = MaxNotStoredRetryWait;
+            var retried = await RecordOutcomeAsync(due.BatchId, () => store.RetryClaimedBatchSendAsync(due.BatchId, claim.AttemptId,
+                "REMOTE_NOT_STORED: ERP answered 503 BATCH_NOT_STORED_RETRYABLE", DateTimeOffset.UtcNow + wait, CancellationToken.None)).ConfigureAwait(false);
+            logger.LogWarning("ETL_BATCH_NOT_STORED_RETRY BatchId={BatchId} RetryIn={RetryIn} Outcome={Outcome}", due.BatchId, wait, retried);
+            return true;
+        }
         if (result.Response is null)
         {
             var failed = await RecordOutcomeAsync(due.BatchId, () => store.FailClaimedBatchSendAsync(due.BatchId, claim.AttemptId, $"{result.Error!.GetType().Name}: {result.Error.Message}", result.HttpStatus, CancellationToken.None)).ConfigureAwait(false);
@@ -150,6 +165,9 @@ public sealed class EtlUploadWorker(
             throw;
         }
     }
+
+    /// <summary>A Retry-After from ERP is honoured up to this bound, so a bad value cannot park a run for days.</summary>
+    internal static readonly TimeSpan MaxNotStoredRetryWait = TimeSpan.FromMinutes(15);
 
     internal static TimeSpan StoreWriteRetryDelay = TimeSpan.FromMilliseconds(500);
     internal const int StoreWriteAttempts = 3;

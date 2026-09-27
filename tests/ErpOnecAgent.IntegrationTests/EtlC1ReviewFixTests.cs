@@ -544,6 +544,91 @@ public sealed class EtlC1ReviewFixTests : IAsyncLifetime
 
     // ---------- fakes ----------
 
+    // ---------- E2: agreed ERP error codes ----------
+
+    [Fact]
+    public async Task E2_a_batch_erp_attests_it_did_not_store_is_retried_not_quarantined()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (runId, batches) = await SealedRunWithFileAsync(spool);
+        var batchId = batches[0].BatchId;
+        var erp = new FakeErpClient
+        {
+            Handler = (_, _, _) => Task.FromException<BatchUploadResponse>(new ErpApiException(System.Net.HttpStatusCode.ServiceUnavailable, ErpApiException.BatchNotStoredRetryable, TimeSpan.FromMinutes(10)))
+        };
+        var before = DateTimeOffset.UtcNow;
+
+        Assert.Equal(1, await UploadWorker(_store, spool, erp).RunOnceAsync(CancellationToken.None));
+
+        Assert.Equal("retry_waiting", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batchId:D}'"));
+        Assert.Equal("precheck_failed", await ScalarStringAsync($"SELECT outcome FROM etl_batch_send_attempts WHERE batch_id='{batchId:D}'"));
+        Assert.StartsWith("REMOTE_NOT_STORED", await ScalarStringAsync($"SELECT last_error FROM etl_batch_send_attempts WHERE batch_id='{batchId:D}'"));
+        // Retry-After (10 min) outranks the first backoff step.
+        var next = DateTimeOffset.Parse((await ScalarStringAsync($"SELECT next_attempt_at_utc FROM etl_batches WHERE batch_id='{batchId:D}'"))!, System.Globalization.CultureInfo.InvariantCulture);
+        Assert.True(next >= before + TimeSpan.FromMinutes(9), $"next attempt {next:O}");
+        Assert.NotEqual("blocked", await ScalarStringAsync($"SELECT status FROM etl_runs WHERE run_id='{runId:D}'"));
+    }
+
+    [Theory]
+    [InlineData(503, null)]
+    [InlineData(503, "SOMETHING_ELSE")]
+    [InlineData(500, "BATCH_NOT_STORED_RETRYABLE")]
+    public async Task E2_any_other_failure_after_sending_still_quarantines_the_batch(int status, string? code)
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (_, batches) = await SealedRunWithFileAsync(spool);
+        var batchId = batches[0].BatchId;
+        var erp = new FakeErpClient
+        {
+            Handler = (_, _, _) => Task.FromException<BatchUploadResponse>(new ErpApiException((System.Net.HttpStatusCode)status, code, null))
+        };
+
+        await UploadWorker(_store, spool, erp).RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal("dead_letter", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batchId:D}'"));
+        Assert.Equal("UPLOAD_OUTCOME_UNKNOWN", await ScalarStringAsync($"SELECT quarantine_code FROM etl_batches WHERE batch_id='{batchId:D}'"));
+    }
+
+    [Fact]
+    public async Task E2_repeated_not_stored_answers_stop_at_the_attempt_bound()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (runId, batches) = await SealedRunWithFileAsync(spool);
+        var batchId = batches[0].BatchId;
+        var erp = new FakeErpClient
+        {
+            Handler = (_, _, _) => Task.FromException<BatchUploadResponse>(new ErpApiException(System.Net.HttpStatusCode.ServiceUnavailable, ErpApiException.BatchNotStoredRetryable, null))
+        };
+        var worker = UploadWorker(_store, spool, erp);
+
+        for (var i = 0; i < 10; i++)
+        {
+            await ExecuteSqlAsync($"UPDATE etl_batches SET next_attempt_at_utc='2000-01-01T00:00:00.0000000+00:00' WHERE batch_id='{batchId:D}';");
+            await worker.RunOnceAsync(CancellationToken.None);
+        }
+
+        Assert.Equal(5, erp.UploadCalls);
+        Assert.Equal("blocked", await ScalarStringAsync($"SELECT status FROM etl_runs WHERE run_id='{runId:D}'"));
+        Assert.Equal("UPLOAD_ATTEMPTS_EXHAUSTED", await ScalarStringAsync($"SELECT quarantine_code FROM etl_batches WHERE batch_id='{batchId:D}'"));
+    }
+
+    [Fact]
+    public async Task E2_an_absurd_retry_after_is_capped()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (_, batches) = await SealedRunWithFileAsync(spool);
+        var batchId = batches[0].BatchId;
+        var erp = new FakeErpClient
+        {
+            Handler = (_, _, _) => Task.FromException<BatchUploadResponse>(new ErpApiException(System.Net.HttpStatusCode.ServiceUnavailable, ErpApiException.BatchNotStoredRetryable, TimeSpan.FromDays(365)))
+        };
+
+        await UploadWorker(_store, spool, erp).RunOnceAsync(CancellationToken.None);
+
+        var next = DateTimeOffset.Parse((await ScalarStringAsync($"SELECT next_attempt_at_utc FROM etl_batches WHERE batch_id='{batchId:D}'"))!, System.Globalization.CultureInfo.InvariantCulture);
+        Assert.True(next <= DateTimeOffset.UtcNow + TimeSpan.FromMinutes(16), $"next attempt {next:O}");
+    }
+
     private sealed class FakeErpClient : IErpClient
     {
         private int _uploadCalls;

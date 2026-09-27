@@ -81,7 +81,7 @@ public sealed class ErpLongPollResilienceTests
         var client = provider.GetRequiredService<IErpClient>();
 
         // 503 is transient, so any retry strategy would replay the non-idempotent lease POST.
-        await Assert.ThrowsAsync<HttpRequestException>(() => client.LeaseCommandAsync(NewLeaseRequest(), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<HttpRequestException>(() => client.LeaseCommandAsync(NewLeaseRequest(), CancellationToken.None));
 
         Assert.Equal(1, probe.Requests); // exactly one send, no automatic replay
     }

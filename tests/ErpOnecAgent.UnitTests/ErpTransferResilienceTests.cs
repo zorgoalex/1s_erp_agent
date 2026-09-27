@@ -63,7 +63,7 @@ public sealed class ErpTransferResilienceTests
         await using var provider = NewServices(transfer);
         var client = provider.GetRequiredService<IErpClient>();
 
-        await Assert.ThrowsAsync<HttpRequestException>(() => client.UploadBatchAsync(Batch(), new MemoryStream([1]), CancellationToken.None));
+        await Assert.ThrowsAnyAsync<HttpRequestException>(() => client.UploadBatchAsync(Batch(), new MemoryStream([1]), CancellationToken.None));
 
         Assert.Equal(1, transfer.Requests);
     }
@@ -117,6 +117,25 @@ public sealed class ErpTransferResilienceTests
 
         // Bounded by the transfer budget (2 s attempt + 15 s HttpClient margin), never a hang.
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(25), $"a stalled ACK body hung the upload: {stopwatch.Elapsed}");
+    }
+
+    [Fact]
+    public async Task A_not_stored_answer_keeps_its_code_through_the_transfer_channel()
+    {
+        var transfer = new ProbeHandler((_, _) =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{\"code\":\"BATCH_NOT_STORED_RETRYABLE\"}", Encoding.UTF8, "application/json") };
+            response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(20));
+            return Task.FromResult(response);
+        });
+        await using var provider = NewServices(transfer);
+        var client = provider.GetRequiredService<IErpClient>();
+
+        var ex = await Assert.ThrowsAsync<ErpApiException>(() => client.UploadBatchWithEvidenceAsync(Batch(), new MemoryStream([1]), CancellationToken.None));
+
+        Assert.True(ex.Is(HttpStatusCode.ServiceUnavailable, ErpApiException.BatchNotStoredRetryable));
+        Assert.Equal(TimeSpan.FromSeconds(20), ex.RetryAfter);
+        Assert.Equal(1, transfer.Requests);
     }
 
     [Fact]

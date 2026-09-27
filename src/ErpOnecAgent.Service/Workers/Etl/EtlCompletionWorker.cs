@@ -72,6 +72,14 @@ public sealed class EtlCompletionWorker(
             {
                 await erp.CompleteEtlRunRawAsync(claim.RunId, claim.CompletePayloadJson, cancellationToken).ConfigureAwait(false);
             }
+            catch (ErpApiException ex) when (IsPermanentCompletionRefusal(ex))
+            {
+                // Agreed permanent refusals: re-sending the same body can never succeed. The run
+                // is blocked (watermarks untouched) and resolved by an operator through R1.
+                var refusedBlocked = await store.BlockRunCompletionAsync(claim.RunId, claim.ClaimId, ex.ApiErrorCode!, $"ERP refused the run completion: {(int?)ex.StatusCode} {ex.ApiErrorCode}.", CancellationToken.None).ConfigureAwait(false);
+                logger.LogError("ETL_RUN_COMPLETION_REFUSED RunId={RunId} Status={Status} Code={Code} Blocked={Blocked}", claim.RunId, (int?)ex.StatusCode, ex.ApiErrorCode, refusedBlocked);
+                continue;
+            }
             catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
             {
                 var next = DateTimeOffset.UtcNow + CommandPolicy.BackoffDelay(claim.Attempt, TimeSpan.FromSeconds(10), TimeSpan.FromMinutes(10));
@@ -92,4 +100,9 @@ public sealed class EtlCompletionWorker(
         }
         return handled;
     }
+
+    internal static bool IsPermanentCompletionRefusal(ErpApiException ex) =>
+        ex.Is(System.Net.HttpStatusCode.UnprocessableEntity, ErpApiException.BatchPayloadInvalid)
+        || ex.Is(System.Net.HttpStatusCode.Conflict, ErpApiException.SourceIdentityMismatch)
+        || ex.Is(System.Net.HttpStatusCode.Conflict, ErpApiException.RunGenerationClosed);
 }

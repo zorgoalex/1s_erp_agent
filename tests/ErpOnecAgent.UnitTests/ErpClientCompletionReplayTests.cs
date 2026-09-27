@@ -47,7 +47,7 @@ public sealed class ErpClientCompletionReplayTests
     {
         var client = NewClient([], HttpStatusCode.ServiceUnavailable);
 
-        var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.CompleteEtlRunRawAsync(RunId, "{}", CancellationToken.None));
+        var ex = await Assert.ThrowsAnyAsync<HttpRequestException>(() => client.CompleteEtlRunRawAsync(RunId, "{}", CancellationToken.None));
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, ex.StatusCode);
     }
@@ -70,7 +70,7 @@ public sealed class ErpClientCompletionReplayTests
         var http = new HttpClient(new BodyHandler(HttpStatusCode.BadRequest, "secret-token=abc; customer=Ivanov")) { BaseAddress = new Uri("https://erp.test/api/") };
         var client = new ErpClient(http, Options.Create(new AgentOptions { AgentId = "agent-1", SiteId = "site-1" }));
 
-        var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.CompleteEtlRunRawAsync(RunId, "{}", CancellationToken.None));
+        var ex = await Assert.ThrowsAnyAsync<HttpRequestException>(() => client.CompleteEtlRunRawAsync(RunId, "{}", CancellationToken.None));
 
         Assert.DoesNotContain("secret-token", ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("Ivanov", ex.Message, StringComparison.Ordinal);

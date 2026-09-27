@@ -142,12 +142,86 @@ public sealed class ErpClient : IErpClient
 
     // Stage 6 redaction: the ERP response body is never copied into the exception message,
     // which is logged and may be persisted (e.g. as a completion retry error); only the status
-    // and the body size are reported.
+    // and the agreed machine-readable code are reported.
+    /// <summary>The prefix of an error body read to find <c>ApiError.code</c>; the rest is never read.</summary>
+    internal const int MaxErrorBodyBytes = 4096;
+
+    /// <summary>Bound on reading an error body: after ResponseHeadersRead no HTTP timeout applies.</summary>
+    internal static readonly TimeSpan ErrorBodyReadTimeout = TimeSpan.FromSeconds(5);
+
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         if (response.IsSuccessStatusCode) return;
-        var body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
-        throw new HttpRequestException($"ERP API returned {(int)response.StatusCode} ({body.Length} body bytes withheld).", null, response.StatusCode);
+        // Only the agreed machine-readable code is extracted (bounded read, strict shape); the
+        // body is never logged or kept — it may carry ERP data.
+        var code = await ReadApiErrorCodeAsync(response, cancellationToken).ConfigureAwait(false);
+        var retryAfter = response.Headers.RetryAfter switch
+        {
+            { Delta: { } delta } => delta,
+            { Date: { } date } => date - DateTimeOffset.UtcNow,
+            _ => (TimeSpan?)null
+        };
+        throw new ErpApiException(response.StatusCode, code, retryAfter is { } value && value > TimeSpan.Zero ? value : null);
+    }
+
+    private static async Task<string?> ReadApiErrorCodeAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        bounded.CancelAfter(ErrorBodyReadTimeout);
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(bounded.Token).ConfigureAwait(false);
+            var buffer = new byte[MaxErrorBodyBytes];
+            var read = 0;
+            while (read < buffer.Length)
+            {
+                var n = await stream.ReadAsync(buffer.AsMemory(read), bounded.Token).ConfigureAwait(false);
+                if (n == 0) break;
+                read += n;
+            }
+            return ExtractCode(buffer.AsSpan(0, read), isFinalBlock: read < buffer.Length);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null; // a stalled error body: no code, the status still decides
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Streams the body prefix and returns the first top-level string property <c>code</c> when
+    /// it is well formed ([A-Z0-9_]{1,64}). A prefix cut inside a later property is fine: the code
+    /// is usually first, and a truncated tail is simply the end of what is looked at.
+    /// </summary>
+    internal static string? ExtractCode(ReadOnlySpan<byte> prefix, bool isFinalBlock)
+    {
+        var reader = new Utf8JsonReader(prefix, isFinalBlock, default);
+        try
+        {
+            if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject) return null;
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndObject) return null;
+                if (reader.TokenType != JsonTokenType.PropertyName) return null;
+                var isCode = reader.ValueTextEquals("code"u8);
+                if (!reader.Read()) return null;
+                if (isCode)
+                {
+                    if (reader.TokenType != JsonTokenType.String) return null;
+                    var code = reader.GetString();
+                    return code is { Length: >= 1 and <= 64 } && code.All(static c => c is >= 'A' and <= 'Z' or >= '0' and <= '9' or '_') ? code : null;
+                }
+                if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray && !reader.TrySkip()) return null;
+            }
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 }
 

@@ -97,6 +97,12 @@ public interface IAgentStore
     Task<IReadOnlyList<PendingResult>> GetPendingResultsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
     Task<bool> MarkResultRetryAsync(Guid commandId, string errorMessage, DateTimeOffset retryAtUtc, CancellationToken cancellationToken);
     Task<bool> AcknowledgeResultAsync(Guid commandId, DateTimeOffset acknowledgedAtUtc, CancellationToken cancellationToken);
+    /// <summary>
+    /// ERP answered the result PUT with 409 RESULT_CONFLICT (a different result is already on
+    /// record): the outbox row stops being delivered (dead_letter with the reason) and stays as
+    /// evidence for the operator. Returns false when the row was not deliverable.
+    /// </summary>
+    Task<bool> MarkResultConflictAsync(Guid commandId, string reason, CancellationToken cancellationToken);
 
     /// <summary>
     /// Atomically accepts one durable manual ETL job under the CURRENT persisted execution claim of
@@ -330,6 +336,12 @@ public interface IAgentStore
     /// COMPLETION_ATTEMPTS_EXHAUSTED plus a blocked job.
     /// </summary>
     Task<EtlRunCompletionRetryOutcome> MarkRunCompletionRetryAsync(Guid runId, Guid claimId, string errorMessage, DateTimeOffset nextAttemptAtUtc, int maxAttempts, CancellationToken cancellationToken);
+    /// <summary>
+    /// ERP permanently refused the completion (e.g. 422 BATCH_PAYLOAD_INVALID, 409
+    /// SOURCE_IDENTITY_MISMATCH): under the exact completion claim the run is blocked with the
+    /// code — no further sends, watermarks untouched, resolution through R1. False on a lost claim.
+    /// </summary>
+    Task<bool> BlockRunCompletionAsync(Guid runId, Guid claimId, string code, string message, CancellationToken cancellationToken);
 
     /// <summary>
     /// Explicit dead-process recovery — startup-only, exclusive-host precondition, NOT

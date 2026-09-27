@@ -790,6 +790,27 @@ public sealed partial class SqliteAgentStore
         return new EtlRunFinalizeOutcome.Blocked(conflictCode, message);
     }
 
+    /// <inheritdoc cref="IAgentStore.BlockRunCompletionAsync"/>
+    public async Task<bool> BlockRunCompletionAsync(Guid runId, Guid claimId, string code, string message, CancellationToken cancellationToken)
+    {
+        if (claimId == Guid.Empty) throw new ArgumentException("A claim identity is required.", nameof(claimId));
+        ArgumentException.ThrowIfNullOrWhiteSpace(code);
+        await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        var now = UtcNow();
+        var fence = await ExecuteAsync(connection, transaction,
+            "UPDATE etl_runs SET row_version=row_version+1, updated_at_utc=$now WHERE run_id=$run AND status='completing' AND completion_claim_id=$claim;",
+            cancellationToken, ("$now", now), ("$run", runId.ToString("D")), ("$claim", claimId.ToString("D"))).ConfigureAwait(false);
+        if (fence == 0)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return false;
+        }
+        await CommitBlockedRunAsync(connection, transaction, runId, code, message, now, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return true;
+    }
+
     /// <inheritdoc cref="IAgentStore.MarkRunCompletionRetryAsync"/>
     public async Task<EtlRunCompletionRetryOutcome> MarkRunCompletionRetryAsync(Guid runId, Guid claimId, string errorMessage, DateTimeOffset nextAttemptAtUtc, int maxAttempts, CancellationToken cancellationToken)
     {

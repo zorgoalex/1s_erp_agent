@@ -230,9 +230,10 @@ public sealed partial class SqliteAgentStore
         command.CommandText = """
             SELECT
               (SELECT COUNT(*) FROM commands_inbox WHERE status IN ('queued','retry_waiting','unknown_result','executing')),
-              (SELECT COUNT(*) FROM results_outbox WHERE status <> 'acknowledged'),
+              (SELECT COUNT(*) FROM results_outbox WHERE status NOT IN ('acknowledged','dead_letter')),
               (SELECT COUNT(*) FROM etl_batches WHERE status IN ('ready','uploading','retry_waiting')),
-              (SELECT COUNT(*) FROM commands_inbox WHERE result_status='dead_letter') + (SELECT COUNT(*) FROM etl_batches WHERE status='dead_letter'),
+              (SELECT COUNT(*) FROM commands_inbox WHERE result_status='dead_letter') + (SELECT COUNT(*) FROM etl_batches WHERE status='dead_letter')
+                + (SELECT COUNT(*) FROM results_outbox WHERE status='dead_letter'),
               (SELECT COUNT(*) FROM commands_inbox WHERE result_status='dead_letter'),
               (SELECT MIN(received_at_utc) FROM commands_inbox WHERE status IN ('queued','retry_waiting','unknown_result','executing')),
               (SELECT MIN(created_at_utc) FROM results_outbox WHERE status IN ('pending','sending','retry_waiting')),
