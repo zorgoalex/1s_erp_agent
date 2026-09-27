@@ -71,7 +71,11 @@ public sealed class HeartbeatWorker(
                     new(state.LastEtlSuccessAtUtc, state.CurrentEtlRunId),
                     new(metrics.DiskFreeBytes, metrics.WorkingSetBytes, metrics.CpuPercent, metrics.SqliteSizeBytes, metrics.SpoolSizeBytes),
                     new(certificateExpiry),
-                    ErpSessionManager.BoundSourceIdentity(onecOptions));
+                    ErpSessionManager.BoundSourceIdentity(onecOptions),
+                    healthReason == "OK" ? null : healthReason,
+                    configuration is { Version: > 0 } ? configuration.Version : null,
+                    configuration?.Rejection?.Version,
+                    configuration?.Rejection?.Reason);
                 await erp.SendHeartbeatAsync(request, stoppingToken).ConfigureAwait(false);
                 state.LastErpSuccessAtUtc = DateTimeOffset.UtcNow;
             }

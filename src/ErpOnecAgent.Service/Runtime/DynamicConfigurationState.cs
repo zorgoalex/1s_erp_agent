@@ -14,9 +14,13 @@ public sealed record DynamicConfigurationSnapshot(
     AgentMode Mode,
     string? SourceGeneration = null);
 
+/// <summary>E4: the last remote configuration the agent refused, reported in heartbeat.</summary>
+public sealed record ConfigurationRejection(long Version, string Reason);
+
 public sealed class DynamicConfigurationState
 {
     private readonly object _gate = new();
+    private ConfigurationRejection? _rejection;
     private long _version;
     private IReadOnlyList<string> _commandTypes;
     private IReadOnlyList<EtlEntityDefinition> _entities;
@@ -48,6 +52,21 @@ public sealed class DynamicConfigurationState
     public int IntervalMinutes => Snapshot.IntervalMinutes;
     public AgentMode Mode => Snapshot.Mode;
     public string? SourceGeneration => Snapshot.SourceGeneration;
+
+    /// <summary>E4: the last refused version newer than the active one; null once a version at least as new is active.</summary>
+    public ConfigurationRejection? Rejection
+    {
+        get
+        {
+            lock (_gate) return _rejection is { } rejection && rejection.Version > _version ? rejection : null;
+        }
+    }
+
+    public void RecordRejection(long version, string reason)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        lock (_gate) _rejection = new(version, reason);
+    }
 
     public DynamicConfigurationSnapshot Prepare(long version, RemoteAgentConfiguration configuration)
     {

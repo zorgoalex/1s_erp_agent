@@ -456,12 +456,17 @@ public sealed class ConfigurationActivationTests : IAsyncLifetime
         {
             await worker.StartAsync(CancellationToken.None);
             await control.SaveCompleted.Task.WaitAsync(WaitTimeout);
+            // E4: the refusal is kept for heartbeat as a stable code.
+            var deadline = DateTime.UtcNow + WaitTimeout;
+            while (configuration.Rejection is null && DateTime.UtcNow < deadline) await Task.Delay(20);
         }
         finally
         {
             await worker.StopAsync(CancellationToken.None).WaitAsync(WaitTimeout);
         }
 
+        Assert.Equal(8, configuration.Rejection?.Version);
+        Assert.StartsWith("CONFIG_", configuration.Rejection?.Reason, StringComparison.Ordinal);
         var active = await _store.GetActiveConfigSnapshotAsync(CancellationToken.None);
         Assert.NotNull(active);
         Assert.Equal(7, active.Version);

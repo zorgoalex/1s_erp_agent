@@ -52,11 +52,22 @@ public sealed class ConfigurationWorker(IErpClient erp, IAgentStore store, ErpSe
                     try { await store.SaveConfigSnapshotAsync(pending.Version, pending.Json, pending.Hash, "rejected", CancellationToken.None).ConfigureAwait(false); }
                     catch (Exception snapshotError) { logger.LogError(snapshotError, "Failed to persist rejected remote configuration Version={ConfigVersion}", pending.Version); }
                 }
-                logger.LogWarning(ex, "CONFIG_REJECTED Version={ConfigVersion}", pending?.Version);
+                if (pending is not null) configuration.RecordRejection(pending.Version, RejectionReason(ex));
+                logger.LogWarning(ex, "CONFIG_REJECTED Version={ConfigVersion} Reason={Reason}", pending?.Version, pending is null ? null : RejectionReason(ex));
             }
             await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken).ConfigureAwait(false);
         }
     }
 
     private sealed record RemoteConfigurationResponseHolder(long Version, string Hash, string Json);
+
+    // E4: a stable code for ERP; exception text can carry configuration details and is never sent.
+    internal static string RejectionReason(Exception ex) => ex switch
+    {
+        JsonException => "CONFIG_JSON_INVALID",
+        InvalidDataException when ex.Message.Contains("hash mismatch", StringComparison.OrdinalIgnoreCase) => "CONFIG_HASH_MISMATCH",
+        InvalidDataException when ex.Message.Contains("rollback", StringComparison.OrdinalIgnoreCase) => "CONFIG_VERSION_ROLLBACK",
+        InvalidDataException => "CONFIG_INVALID",
+        _ => "CONFIG_APPLY_FAILED"
+    };
 }

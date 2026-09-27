@@ -404,6 +404,103 @@ public sealed class A07CompatibilityHeartbeatTests : IAsyncLifetime
         }
     }
 
+    // ---- E4: stateReason and configuration versions in heartbeat ----
+
+    private static readonly JsonSerializerOptions E4Json = new(JsonSerializerDefaults.Web);
+
+    [Fact]
+    public async Task E4_heartbeat_reports_state_reason_active_and_rejected_configuration()
+    {
+        var state = ReadyState(AgentMode.Maintenance);
+        var erp = new FakeErp { SessionResponses = [Rejected()] };
+        using var sessions = new ErpSessionManager(erp, AgentOptions("hb-e4"), state);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => sessions.GetSessionAsync(CancellationToken.None));
+        var configuration = new DynamicConfigurationState(Options.Create(new CommandOptions()), Options.Create(new EtlOptions()));
+        configuration.Apply(5, new RemoteAgentConfiguration { Mode = "Maintenance", CommandTypes = [], EtlEntities = [], EtlIntervalMinutes = 60 }, state);
+        configuration.RecordRejection(7, "CONFIG_INVALID");
+        var agent = AgentOptions("hb-e4");
+        using var worker = new HeartbeatWorker(
+            erp,
+            _store,
+            sessions,
+            state,
+            new AgentMetricsCollector(new FakeSpoolStore(), agent),
+            agent,
+            Options.Create(new ErpOptions { RequireClientCertificate = false }),
+            Options.Create(new StorageOptions()),
+            NullLogger<HeartbeatWorker>.Instance,
+            configuration);
+
+        try
+        {
+            await worker.StartAsync(CancellationToken.None);
+            Assert.True(await Task.WhenAny(erp.HeartbeatObserved.Task, Task.Delay(BoundedWait)) == erp.HeartbeatObserved.Task);
+
+            var heartbeat = erp.LastHeartbeat!;
+            Assert.Equal("COMPATIBILITY_REJECTED", heartbeat.StateReason);
+            Assert.Equal(5, heartbeat.ActiveConfigVersion);
+            Assert.Equal(7, heartbeat.RejectedConfigVersion);
+            Assert.Equal("CONFIG_INVALID", heartbeat.RejectedReason);
+            using var json = JsonDocument.Parse(JsonSerializer.Serialize(heartbeat, E4Json));
+            Assert.Equal("COMPATIBILITY_REJECTED", json.RootElement.GetProperty("stateReason").GetString());
+            Assert.Equal(7, json.RootElement.GetProperty("rejectedConfigVersion").GetInt64());
+        }
+        finally
+        {
+            await StopWorkerAsync(worker);
+        }
+    }
+
+    [Fact]
+    public void E4_a_rejection_is_reported_only_while_it_is_newer_than_the_active_version()
+    {
+        var state = ReadyState(AgentMode.Normal);
+        var configuration = new DynamicConfigurationState(Options.Create(new CommandOptions()), Options.Create(new EtlOptions()));
+        Assert.Null(configuration.Rejection);
+
+        configuration.RecordRejection(3, "CONFIG_HASH_MISMATCH");
+        Assert.Equal(new ConfigurationRejection(3, "CONFIG_HASH_MISMATCH"), configuration.Rejection);
+
+        configuration.Apply(3, new RemoteAgentConfiguration { Mode = "Normal", CommandTypes = [], EtlEntities = [], EtlIntervalMinutes = 60 }, state);
+        Assert.Null(configuration.Rejection);
+    }
+
+    [Fact]
+    public void E4_rejection_reasons_are_stable_codes_without_exception_text()
+    {
+        Assert.Equal("CONFIG_JSON_INVALID", ConfigurationWorker.RejectionReason(new JsonException("secret detail")));
+        Assert.Equal("CONFIG_HASH_MISMATCH", ConfigurationWorker.RejectionReason(new InvalidDataException("Remote configuration hash mismatch.")));
+        Assert.Equal("CONFIG_VERSION_ROLLBACK", ConfigurationWorker.RejectionReason(new InvalidDataException("Remote configuration rollback is not allowed without an explicit administrative workflow.")));
+        Assert.Equal("CONFIG_INVALID", ConfigurationWorker.RejectionReason(new InvalidDataException("Remote ETL entity 'x' is invalid.")));
+        Assert.Equal("CONFIG_APPLY_FAILED", ConfigurationWorker.RejectionReason(new InvalidOperationException("db")));
+    }
+
+    [Fact]
+    public async Task E4_a_healthy_heartbeat_sends_no_state_reason()
+    {
+        var state = ReadyState(AgentMode.Normal);
+        state.OnecCommandApiAvailable = true;
+        state.OnecODataAvailable = true;
+        var erp = new FakeErp();
+        using var sessions = new ErpSessionManager(erp, AgentOptions("hb-e4-ok"), state);
+        using var worker = CreateHeartbeatWorker(erp, sessions, state);
+
+        try
+        {
+            await worker.StartAsync(CancellationToken.None);
+            Assert.True(await Task.WhenAny(erp.HeartbeatObserved.Task, Task.Delay(BoundedWait)) == erp.HeartbeatObserved.Task);
+
+            Assert.Equal("healthy", erp.LastHeartbeat!.State);
+            Assert.Null(erp.LastHeartbeat.StateReason);
+            Assert.Null(erp.LastHeartbeat.ActiveConfigVersion);
+            Assert.Null(erp.LastHeartbeat.RejectedConfigVersion);
+        }
+        finally
+        {
+            await StopWorkerAsync(worker);
+        }
+    }
+
     // ---- helpers ----
 
     private static Func<CancellationToken, Task<SessionStartResponse>> Rejected() =>

@@ -39,7 +39,11 @@ public sealed record HeartbeatRequest(
     EtlHeartbeat Etl,
     MachineHeartbeat Machine,
     CertificateHeartbeat Certificate,
-    SourceIdentity? SourceIdentity = null);
+    SourceIdentity? SourceIdentity = null,
+    string? StateReason = null,
+    long? ActiveConfigVersion = null,
+    long? RejectedConfigVersion = null,
+    string? RejectedReason = null);
 
 public sealed record OnecHeartbeat(bool ODataAvailable, bool CommandApiAvailable, DateTimeOffset? LastSuccessAtUtc, string? LastError);
 public sealed record QueueHeartbeat(long CommandsPending, long ResultsPending, long EtlBatchesPending, long DeadLetters);
