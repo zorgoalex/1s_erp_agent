@@ -53,7 +53,9 @@ public sealed class ConfigurationWorker(IErpClient erp, IAgentStore store, ErpSe
                     catch (Exception snapshotError) { logger.LogError(snapshotError, "Failed to persist rejected remote configuration Version={ConfigVersion}", pending.Version); }
                 }
                 if (pending is not null) configuration.RecordRejection(pending.Version, RejectionReason(ex));
-                logger.LogWarning(ex, "CONFIG_REJECTED Version={ConfigVersion} Reason={Reason}", pending?.Version, pending is null ? null : RejectionReason(ex));
+                // Nothing was received (transport or HTTP failure): not a rejection, nothing is recorded.
+                if (pending is null) logger.LogWarning(ex, "CONFIG_FETCH_FAILED");
+                else logger.LogWarning(ex, "CONFIG_REJECTED Version={ConfigVersion} Reason={Reason}", pending.Version, RejectionReason(ex));
             }
             await Task.Delay(TimeSpan.FromMinutes(1), stoppingToken).ConfigureAwait(false);
         }
