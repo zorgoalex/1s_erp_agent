@@ -499,6 +499,92 @@ public sealed class A07ModeStateTests : IAsyncLifetime
         DataDirectory = Path.GetTempPath()
     });
 
+    [Fact]
+    public async Task E3_bootstrap_drops_an_unusable_restored_generation_token_instead_of_failing()
+    {
+        var remote = new RemoteAgentConfiguration
+        {
+            Mode = "Normal",
+            CommandTypes = ["synthetic"],
+            EtlIntervalMinutes = 60,
+            EtlEntities = [new EtlEntityDefinition("synthetic", "Synthetic", "Id", null, null, ["Id"], "incremental", 10, 3)],
+            SourceGeneration = "has space"
+        };
+        var configurationJson = JsonSerializer.Serialize(remote, JsonOptions);
+        await _store.SaveConfigSnapshotAsync(21, configurationJson, Hash(configurationJson), "validated", CancellationToken.None);
+        await _store.ActivateConfigSnapshotAsync(21, CancellationToken.None);
+        var state = new AgentRuntimeState();
+        var configuration = NewConfiguration();
+        using var controller = new LocalEtlPauseController(_store, state);
+        var bootstrap = new BootstrapService(
+            _store,
+            new FakeSpoolStore(),
+            new FakeSecretStore(),
+            new SingleInstanceLock(),
+            state,
+            configuration,
+            controller,
+            AgentOptions("e3-token"),
+            Options.Create(new ErpOptions { RequireClientCertificate = false }),
+            Options.Create(new OnecOptions { CredentialSecretName = "test-secret" }),
+            NullLogger<BootstrapService>.Instance);
+        try
+        {
+            await bootstrap.StartAsync(CancellationToken.None);
+
+            Assert.True(state.IsReady);
+            Assert.Equal(21, configuration.Version);
+            Assert.Null(configuration.SourceGeneration);
+        }
+        finally
+        {
+            await bootstrap.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData("gen-1", true)]
+    [InlineData("", false)]
+    [InlineData("a b", false)]
+    [InlineData("x\ny", false)]
+    [InlineData("поколение", false)]
+    public void E3_remote_generation_token_is_validated_and_published(string? token, bool valid)
+    {
+        var configuration = NewConfiguration();
+        var state = new AgentRuntimeState();
+        var remote = new RemoteAgentConfiguration
+        {
+            Mode = "Normal",
+            CommandTypes = ["synthetic"],
+            EtlIntervalMinutes = 60,
+            EtlEntities = [],
+            SourceGeneration = token
+        };
+
+        if (!valid)
+        {
+            Assert.Throws<InvalidDataException>(() => configuration.Prepare(5, remote));
+            return;
+        }
+        configuration.Publish(configuration.Prepare(5, remote), state);
+        Assert.Equal(token, configuration.Snapshot.SourceGeneration);
+        // A later configuration without a token clears it.
+        configuration.Publish(configuration.Prepare(6, new RemoteAgentConfiguration { Mode = "Normal", CommandTypes = ["synthetic"], EtlIntervalMinutes = 60, EtlEntities = [] }), state);
+        Assert.Null(configuration.SourceGeneration);
+    }
+
+    [Fact]
+    public void E3_one_batch_upload_at_a_time_by_default()
+    {
+        Assert.Equal(1, new EtlOptions().MaxConcurrentBatchUploads);
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "src", "ErpOnecAgent.Service", "appsettings.json"))) directory = directory.Parent;
+        Assert.NotNull(directory);
+        using var settings = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory.FullName, "src", "ErpOnecAgent.Service", "appsettings.json")));
+        Assert.Equal(1, settings.RootElement.GetProperty("Etl").GetProperty("MaxConcurrentBatchUploads").GetInt32());
+    }
+
     private static RemoteAgentConfiguration Remote(string mode) => new()
     {
         Mode = mode,

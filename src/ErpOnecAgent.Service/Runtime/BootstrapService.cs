@@ -74,6 +74,14 @@ public sealed class BootstrapService(
             {
                 throw new InvalidDataException("Active remote configuration body is invalid.", ex);
             }
+            // E3: a config activated by a pre-E3 agent may carry a token the old agent ignored.
+            // Restoring it must not stop the service: an unusable token is dropped (runs then
+            // go without one) until ERP sends a new configuration.
+            if (restored.SourceGeneration is not null && !ErpOnecAgent.Application.Etl.SourceGenerationToken.IsValid(restored.SourceGeneration))
+            {
+                logger.LogWarning("CONFIG_SOURCE_GENERATION_IGNORED Version={ConfigVersion} — the restored token is not 1..128 printable ASCII; runs are created without a generation token", active.Version);
+                restored = new RemoteAgentConfiguration { Mode = restored.Mode, CommandTypes = restored.CommandTypes, EtlEntities = restored.EtlEntities, EtlIntervalMinutes = restored.EtlIntervalMinutes };
+            }
             var prepared = configuration.Prepare(active.Version, restored);
             configuration.Publish(prepared, runtime);
         }

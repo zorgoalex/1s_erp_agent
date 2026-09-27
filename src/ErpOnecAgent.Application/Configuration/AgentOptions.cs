@@ -92,7 +92,8 @@ public sealed class EtlOptions
     public int DefaultPageSize { get; init; } = 500;
     public int OverlapMinutes { get; init; } = 10;
     public int MaxConcurrentRequests { get; init; } = 1;
-    public int MaxConcurrentBatchUploads { get; init; } = 2;
+    /// <summary>E3: one upload at a time by default (agreed with ERP, to-erp/0003 §3).</summary>
+    public int MaxConcurrentBatchUploads { get; init; } = 1;
     /// <summary>Durable bound on ADMITTED batch send attempts (O2 send ledger, decision D1). Uncertain outcomes never retry, so this bounds ledger-proven-unsent (precheck_failed) admissions; persisted on the batch at first claim with identical-value enforcement.</summary>
     public int MaxBatchUploadAttempts { get; init; } = 5;
     /// <summary>C1: bound on completion sends of one run (F1 completion_max_attempts); exhaustion blocks the run.</summary>
@@ -131,4 +132,6 @@ public sealed class RemoteAgentConfiguration
     public IReadOnlyList<string> CommandTypes { get; init; } = [];
     public IReadOnlyList<EtlEntityDefinition> EtlEntities { get; init; } = [];
     public int EtlIntervalMinutes { get; init; } = 60;
+    /// <summary>E3: opaque ERP source generation token; frozen on each run at creation.</summary>
+    public string? SourceGeneration { get; init; }
 }

@@ -106,7 +106,11 @@ public enum EtlEntityBeginRejection
     /// <summary>A scheduled run's supplied definition does not equal its frozen resolved definition for this entity, or its frozen identity is unusable.</summary>
     RunDefinitionMismatch,
     /// <summary>D1: an incremental read found no committed watermark for the entity — a full baseline (bootstrap_full or entity_reload) must establish the domain first. Zero writes.</summary>
-    BaselineRequired
+    BaselineRequired,
+    /// <summary>E3: the source namespace is not the canonical <c>1c-identity:v1:{databaseId}:{exportEpoch}:{environment}</c> form. Zero writes.</summary>
+    SourceNamespaceInvalid,
+    /// <summary>E3: the run already recorded a different source namespace at its first Begin. Zero writes.</summary>
+    SourceNamespaceMismatch
 }
 
 public abstract record EtlEntityBeginOutcome
@@ -184,6 +188,8 @@ public enum EtlRunSealRejection
     OwnershipSetMismatch,
     /// <summary>Partial runs: every entity of the run failed; nothing can be finalized.</summary>
     AllEntitiesFailed,
+    /// <summary>E3: a post-013 run with entity rows has no recorded source namespace (fail closed).</summary>
+    SourceNamespaceMissing,
 }
 
 public abstract record EtlRunSealOutcome

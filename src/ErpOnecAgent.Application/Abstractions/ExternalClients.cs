@@ -24,6 +24,13 @@ public interface IErpClient
         var ack = await UploadBatchAsync(batch, content, cancellationToken).ConfigureAwait(false);
         return new BatchUploadResponse(ack, JsonSerializer.SerializeToUtf8Bytes(ack, JsonSerializerOptions.Web), 200);
     }
+
+    /// <summary>
+    /// E3: the upload carrying the run's source labels as <c>X-Source-Namespace</c> /
+    /// <c>X-Source-Generation</c> (each only when set). The default (test doubles) ignores them.
+    /// </summary>
+    Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, EtlBatchSourceLabels labels, Stream content, CancellationToken cancellationToken) =>
+        UploadBatchWithEvidenceAsync(batch, content, cancellationToken);
     Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken);
 
     /// <summary>
@@ -70,3 +77,6 @@ public interface IOnecIdentityClient
 
 /// <summary>C1: a parsed batch ACK with the exact response body bytes and HTTP status it came from.</summary>
 public sealed record BatchUploadResponse(BatchAcknowledgement Ack, byte[] Body, int HttpStatus);
+
+/// <summary>E3: the run's source labels sent with each ETL batch; null values are not sent.</summary>
+public sealed record EtlBatchSourceLabels(string? SourceNamespace, string? SourceGeneration);

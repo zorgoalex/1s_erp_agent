@@ -21,7 +21,7 @@ namespace ReviewProbes;
 /// </summary>
 public abstract class ProbeFixture : IAsyncLifetime
 {
-    protected const string SourceNamespace = "onec-infobase-a";
+    protected const string SourceNamespace = "1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:test";
     protected const string JobMode = "bootstrap_full";
     protected static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     protected static readonly EtlCursor FinalCursor =

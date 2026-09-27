@@ -24,7 +24,7 @@ namespace ErpOnecAgent.IntegrationTests;
 /// </summary>
 public sealed class EtlSendLedgerO2Tests : IAsyncLifetime
 {
-    private const string SourceNamespace = "onec-infobase-a";
+    private const string SourceNamespace = "1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:test";
     private const string QueryMode = "bootstrap_full";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly EtlCursor FinalClients = new(DateTimeOffset.Parse("2026-09-19T09:59:00.0000000+00:00", CultureInfo.InvariantCulture), "A10");

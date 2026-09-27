@@ -21,8 +21,8 @@ namespace ErpOnecAgent.IntegrationTests;
 /// </summary>
 public sealed class EtlFinalizeStorageTests : IAsyncLifetime
 {
-    private const string SourceNamespace = "onec-infobase-a";
-    private const string OtherNamespace = "onec-infobase-b";
+    private const string SourceNamespace = "1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:test";
+    private const string OtherNamespace = "1c-identity:v1:11111111-1111-1111-1111-111111111111:33333333-3333-3333-3333-333333333333:test";
     // O1: extraction requires a claimed durable job — job modes are bounded to
     // 'bootstrap_full'/'entity_reload', so the default run/request mode is bootstrap_full.
     private const string QueryMode = "bootstrap_full";
@@ -1559,6 +1559,269 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
     }
 
     // ---------- helpers ----------
+
+    // ---------- E3: source labels and the always-v2 completion body ----------
+
+    [Fact]
+    public async Task E3_first_begin_records_the_namespace_and_a_different_one_is_refused_with_zero_writes()
+    {
+        var runId = await NewRunAsync("clients", "orders");
+
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.Equal(SourceNamespace, await ScalarStringAsync($"SELECT source_namespace FROM etl_runs WHERE run_id='{runId:D}'"));
+
+        var mismatch = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("orders", sourceNamespace: OtherNamespace), CancellationToken.None);
+
+        Assert.Equal(EtlEntityBeginRejection.SourceNamespaceMismatch, Assert.IsType<EtlEntityBeginOutcome.Rejected>(mismatch).Reason);
+        Assert.Null(await EntityRowAsync(runId, "orders"));
+        Assert.Equal(SourceNamespace, await ScalarStringAsync($"SELECT source_namespace FROM etl_runs WHERE run_id='{runId:D}'"));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("orders"), CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("onec-infobase-a")]
+    [InlineData("1c-identity:v1:11111111-1111-1111-1111-11111111111A:22222222-2222-2222-2222-222222222222:test")]
+    [InlineData("1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:prod")]
+    [InlineData("1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:test:extra")]
+    [InlineData("1c-identity:v1:00000000-0000-0000-0000-000000000000:22222222-2222-2222-2222-222222222222:test")]
+    public async Task E3_a_non_canonical_namespace_is_refused_before_any_write(string sourceNamespace)
+    {
+        var runId = await NewRunAsync("clients");
+        var versionBefore = await ScalarAsync($"SELECT row_version FROM etl_runs WHERE run_id='{runId:D}'");
+
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", sourceNamespace: sourceNamespace), CancellationToken.None);
+
+        Assert.Equal(EtlEntityBeginRejection.SourceNamespaceInvalid, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
+        Assert.Null(await EntityRowAsync(runId, "clients"));
+        Assert.Null(await ScalarStringAsync($"SELECT source_namespace FROM etl_runs WHERE run_id='{runId:D}'"));
+        Assert.Equal(versionBefore, await ScalarAsync($"SELECT row_version FROM etl_runs WHERE run_id='{runId:D}'"));
+    }
+
+    [Fact]
+    public async Task E3_a_first_entity_refused_at_begin_still_records_the_namespace()
+    {
+        var runId = await NewRunAsync("clients");
+        await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 3, fingerprint: "other-domain");
+
+        var outcome = await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None);
+
+        Assert.Equal(EtlEntityBeginRejection.DomainChanged, Assert.IsType<EtlEntityBeginOutcome.Rejected>(outcome).Reason);
+        Assert.Equal(SourceNamespace, await ScalarStringAsync($"SELECT source_namespace FROM etl_runs WHERE run_id='{runId:D}'"));
+    }
+
+    [Fact]
+    public async Task E3_a_legacy_run_records_and_compares_nothing()
+    {
+        var runId = await NewRunAsync("clients", "orders");
+        await ExecuteSqlAsync("UPDATE etl_runs SET legacy_source_identity=1 WHERE run_id=$run;", ("$run", runId.ToString("D")));
+
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("orders", sourceNamespace: OtherNamespace), CancellationToken.None));
+
+        Assert.Null(await ScalarStringAsync($"SELECT source_namespace FROM etl_runs WHERE run_id='{runId:D}'"));
+    }
+
+    [Fact]
+    public async Task E3_source_labels_are_immutable_in_storage()
+    {
+        var runId = await NewRunAsync("clients");
+        var run = runId.ToString("D");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 1);
+
+        var relabel = await Assert.ThrowsAsync<SqliteException>(() => ExecuteSqlAsync("UPDATE etl_runs SET source_namespace=$ns WHERE run_id=$run;", ("$ns", OtherNamespace), ("$run", run)));
+        Assert.Contains("immutable", relabel.Message, StringComparison.Ordinal);
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteSqlAsync("UPDATE etl_runs SET source_namespace=NULL WHERE run_id=$run;", ("$run", run)));
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteSqlAsync("UPDATE etl_runs SET source_generation='gen-late' WHERE run_id=$run;", ("$run", run)));
+        // Unrelated columns still update, and re-writing the same value is allowed.
+        await ExecuteSqlAsync("UPDATE etl_runs SET last_error='x', source_namespace=$ns WHERE run_id=$run;", ("$ns", SourceNamespace), ("$run", run));
+        Assert.Equal(SourceNamespace, await ScalarStringAsync($"SELECT source_namespace FROM etl_runs WHERE run_id='{run}'"));
+    }
+
+    [Theory]
+    [InlineData("UPDATE etl_runs SET source_namespace='onec-infobase-a' WHERE run_id=$run;")]
+    [InlineData("UPDATE etl_runs SET legacy_source_identity=2 WHERE run_id=$run;")]
+    [InlineData("UPDATE etl_runs SET complete_payload_shape=3 WHERE run_id=$run;")]
+    public async Task E3_label_checks_reject_invalid_values(string sql)
+    {
+        var runId = await NewPendingRunAsync();
+
+        await Assert.ThrowsAsync<SqliteException>(() => ExecuteSqlAsync(sql, ("$run", runId.ToString("D"))));
+    }
+
+    [Fact]
+    public async Task E3_seal_fails_closed_when_a_post_013_run_has_no_namespace()
+    {
+        var runId = await NewRunAsync("clients");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 1);
+        // Only out-of-band tampering can produce this state: the trigger forbids it.
+        await ExecuteSqlAsync("DROP TRIGGER trg_etl_runs_source_labels_immutable;");
+        await ExecuteSqlAsync("UPDATE etl_runs SET source_namespace=NULL WHERE run_id=$run;", ("$run", runId.ToString("D")));
+
+        var outcome = await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None);
+
+        Assert.Equal(EtlRunSealRejection.SourceNamespaceMissing, Assert.IsType<EtlRunSealOutcome.Rejected>(outcome).Reason);
+    }
+
+    [Fact]
+    public async Task E3_the_completion_body_is_v2_with_identity_and_full_read_scope()
+    {
+        var runId = await NewRunAsync("clients", "orders");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 5);
+        await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 7);
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+
+        var claimed = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow.AddMinutes(5), 8, CancellationToken.None));
+
+        using var payload = JsonDocument.Parse(claimed.Claim.CompletePayloadJson);
+        var root = payload.RootElement;
+        Assert.Equal(
+            ["runId", "status", "mode", "sourceIdentity", "rowsRead", "batchesCreated", "batchesAcknowledged", "completedAtUtc", "entitiesFailed", "entities"],
+            root.EnumerateObject().Select(static p => p.Name).ToArray());
+        Assert.Equal("succeeded", root.GetProperty("status").GetString());
+        Assert.Equal("bootstrap_full", root.GetProperty("mode").GetString());
+        var identity = root.GetProperty("sourceIdentity");
+        Assert.Equal("11111111-1111-1111-1111-111111111111", identity.GetProperty("databaseId").GetString());
+        Assert.Equal("22222222-2222-2222-2222-222222222222", identity.GetProperty("exportEpoch").GetString());
+        Assert.Equal("test", identity.GetProperty("environment").GetString());
+        Assert.Equal(0, root.GetProperty("entitiesFailed").GetInt64());
+        var entities = root.GetProperty("entities").EnumerateArray().ToArray();
+        Assert.Equal(["clients", "orders"], entities.Select(static e => e.GetProperty("entity").GetString()!).ToArray());
+        Assert.All(entities, static e =>
+        {
+            Assert.Equal(["entity", "status", "readScope", "rowsRead", "batchesCreated", "errorCode", "errorMessage"], e.EnumerateObject().Select(static p => p.Name).ToArray());
+            Assert.Equal("done", e.GetProperty("status").GetString());
+            Assert.Equal("full", e.GetProperty("readScope").GetString());
+            Assert.Equal(JsonValueKind.Null, e.GetProperty("errorCode").ValueKind);
+        });
+        Assert.Equal("2", await ScalarStringAsync($"SELECT CAST(complete_payload_shape AS TEXT) FROM etl_runs WHERE run_id='{runId:D}'"));
+    }
+
+    [Fact]
+    public async Task E3_a_scheduled_incremental_run_freezes_its_token_and_reports_delta_and_full_scopes()
+    {
+        var noDate = MakeEntities()[1] with { UpdatedAtField = null };
+        var noDateJson = JsonSerializer.Serialize(noDate, JsonOptions);
+        var created = Assert.IsType<EtlScheduledRunEnsureOutcome.Created>(await _store.EnsureScheduledEtlRunAsync(
+            new EtlScheduledRunRequest("nightly", "incremental", [MakeEntities()[0], noDate], 7, "gen-1"), DateTimeOffset.UtcNow, CancellationToken.None));
+        var runId = created.RunId;
+        var claim = Assert.IsType<EtlScheduledRunClaimOutcome.Claimed>(await _store.TryClaimScheduledRunAsync(runId, "scheduler-1", DateTimeOffset.UtcNow, CancellationToken.None)).Claim;
+        _extractionClaims[runId] = claim.ExtractionClaimId;
+        await SeedWatermarkAsync("clients", CursorJson(CursorX), 1, EtlDomainFingerprint.Compute(SourceNamespace, "clients", DefinitionJson("clients"), "incremental"));
+        await SeedWatermarkAsync("orders", CursorJson(CursorY), 1, EtlDomainFingerprint.Compute(SourceNamespace, "orders", noDateJson, "incremental"));
+
+        // A later configuration token never relabels a created run.
+        Assert.IsType<EtlScheduledRunEnsureOutcome.ActiveExisting>(await _store.EnsureScheduledEtlRunAsync(
+            new EtlScheduledRunRequest("nightly", "incremental", [MakeEntities()[0], noDate], 8, "gen-2"), DateTimeOffset.UtcNow, CancellationToken.None));
+        Assert.Equal("gen-1", await ScalarStringAsync($"SELECT source_generation FROM etl_runs WHERE run_id='{runId:D}'"));
+
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 2, queryMode: "incremental");
+        await BeginExtractCompleteAsync(runId, "orders", CursorJson(FinalOrders), batchRows: 3, definitionJson: noDateJson, queryMode: "incremental");
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+
+        var claimed = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow.AddMinutes(5), 8, CancellationToken.None));
+
+        using var payload = JsonDocument.Parse(claimed.Claim.CompletePayloadJson);
+        Assert.Equal("incremental", payload.RootElement.GetProperty("mode").GetString());
+        Assert.Equal("gen-1", payload.RootElement.GetProperty("sourceGeneration").GetString());
+        var scopes = payload.RootElement.GetProperty("entities").EnumerateArray()
+            .ToDictionary(static e => e.GetProperty("entity").GetString()!, static e => e.GetProperty("readScope").GetString());
+        Assert.Equal("delta", scopes["clients"]);
+        Assert.Equal("full", scopes["orders"]);
+    }
+
+    [Fact]
+    public async Task E3_due_batch_uploads_carry_the_run_labels()
+    {
+        var created = Assert.IsType<EtlScheduledRunEnsureOutcome.Created>(await _store.EnsureScheduledEtlRunAsync(
+            new EtlScheduledRunRequest("nightly", "incremental", [MakeEntities()[0]], 7, "gen-7"), DateTimeOffset.UtcNow, CancellationToken.None));
+        var runId = created.RunId;
+        _extractionClaims[runId] = Assert.IsType<EtlScheduledRunClaimOutcome.Claimed>(await _store.TryClaimScheduledRunAsync(runId, "scheduler-1", DateTimeOffset.UtcNow, CancellationToken.None)).Claim.ExtractionClaimId;
+        await SeedWatermarkAsync("clients", CursorJson(CursorX), 1, EtlDomainFingerprint.Compute(SourceNamespace, "clients", DefinitionJson("clients"), "incremental"));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients", queryMode: "incremental"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 3), ClaimOf(runId), CancellationToken.None));
+
+        var due = Assert.Single(await _store.GetDueBatchUploadsAsync(10, DateTimeOffset.UtcNow, CancellationToken.None));
+
+        Assert.Equal(SourceNamespace, due.SourceNamespace);
+        Assert.Equal("gen-7", due.SourceGeneration);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("a b")]
+    [InlineData("x\r\ny")]
+    [InlineData("поколение")]
+    public async Task E3_an_invalid_generation_token_is_refused_at_run_creation(string token)
+    {
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => _store.EnsureScheduledEtlRunAsync(
+            new EtlScheduledRunRequest("nightly", "incremental", [MakeEntities()[0]], 7, token), DateTimeOffset.UtcNow, CancellationToken.None));
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => _store.EnsureScheduledEtlRunAsync(
+            new EtlScheduledRunRequest("nightly", "incremental", [MakeEntities()[0]], 7, new string('g', 129)), DateTimeOffset.UtcNow, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("shape1-v2")]
+    [InlineData("shape2-legacy")]
+    [InlineData("shape-null")]
+    [InlineData("v2-mode")]
+    [InlineData("v2-environment")]
+    [InlineData("v2-scope")]
+    [InlineData("v2-extra")]
+    [InlineData("v2-no-identity")]
+    public async Task E3_a_stored_body_that_does_not_match_its_shape_is_seal_violated_on_reclaim(string tamper)
+    {
+        var runId = await NewRunAsync("clients");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 2);
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+        var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+        Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(await _store.MarkRunCompletionRetryAsync(runId, first.Claim.ClaimId, "timeout", DateTimeOffset.UtcNow.AddMinutes(-1), 8, CancellationToken.None));
+        var body = first.Claim.CompletePayloadJson;
+        var legacy = $"{{\"runId\":\"{runId:D}\",\"status\":\"succeeded\",\"rowsRead\":2,\"batchesCreated\":1,\"batchesAcknowledged\":1,\"completedAtUtc\":\"2026-09-28T00:00:00+00:00\"}}";
+        var (payload, shape) = tamper switch
+        {
+            "shape1-v2" => (body, "1"),
+            "shape2-legacy" => (legacy, "2"),
+            "shape-null" => (body, "NULL"),
+            "v2-mode" => (body.Replace("\"mode\":\"bootstrap_full\"", "\"mode\":\"entity_reload\"", StringComparison.Ordinal), "2"),
+            "v2-environment" => (body.Replace("\"environment\":\"test\"", "\"environment\":\"production\"", StringComparison.Ordinal), "2"),
+            "v2-scope" => (body.Replace("\"readScope\":\"full\"", "\"readScope\":\"delta\"", StringComparison.Ordinal), "2"),
+            "v2-extra" => (body.Replace("{\"runId\"", "{\"extra\":1,\"runId\"", StringComparison.Ordinal), "2"),
+            _ => (RemoveProperty(body, "sourceIdentity"), "2"),
+        };
+        await ExecuteSqlAsync($"UPDATE etl_runs SET complete_payload_json=$p, complete_payload_shape={shape} WHERE run_id=$run;", ("$p", payload), ("$run", runId.ToString("D")));
+
+        var outcome = await _store.TryClaimRunCompletionAsync(runId, "owner-2", DateTimeOffset.UtcNow, 8, CancellationToken.None);
+
+        Assert.Equal("SEAL_VIOLATED", Assert.IsType<EtlRunClaimOutcome.Blocked>(outcome).Code);
+    }
+
+    [Fact]
+    public async Task E3_a_pre_013_legacy_body_replays_byte_for_byte()
+    {
+        var runId = await NewRunAsync("clients");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 2);
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+        var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+        Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(await _store.MarkRunCompletionRetryAsync(runId, first.Claim.ClaimId, "timeout", DateTimeOffset.UtcNow.AddMinutes(-1), 8, CancellationToken.None));
+        // Evidence stored by a pre-013 agent: the six-property body, shape 1 (migration backfill).
+        var legacy = $"{{\"runId\":\"{runId:D}\",\"status\":\"succeeded\",\"rowsRead\":2,\"batchesCreated\":1,\"batchesAcknowledged\":1,\"completedAtUtc\":\"2026-09-20T00:00:00+00:00\"}}";
+        await ExecuteSqlAsync("UPDATE etl_runs SET complete_payload_json=$p, complete_payload_shape=1 WHERE run_id=$run;", ("$p", legacy), ("$run", runId.ToString("D")));
+
+        var reclaim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-2", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+
+        Assert.Equal(legacy, reclaim.Claim.CompletePayloadJson);
+    }
+
+    private static string RemoveProperty(string json, string name)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();
+        node.Remove(name);
+        return node.ToJsonString();
+    }
 
     private static string Now() => DateTimeOffset.UtcNow.ToString("O");
     private static string CursorJson(EtlCursor cursor) => JsonSerializer.Serialize(cursor, JsonOptions);

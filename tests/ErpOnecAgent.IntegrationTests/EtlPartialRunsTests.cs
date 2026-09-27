@@ -41,7 +41,7 @@ public sealed class EtlPartialRunsTests : IAsyncLifetime
 {
     private const string QueryMode = "bootstrap_full";
     private const string IncrementalMode = "incremental";
-    private const string StoreSourceNamespace = "partial-runs-source";
+    private const string StoreSourceNamespace = "1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:test";
     private const long PlentyOfDisk = 100L * 1024 * 1024 * 1024;
     private static readonly TimeSpan BoundedWait = TimeSpan.FromSeconds(15);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);

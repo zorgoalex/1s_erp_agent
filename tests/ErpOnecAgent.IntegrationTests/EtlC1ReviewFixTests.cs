@@ -35,7 +35,7 @@ public sealed class EtlC1ReviewFixTests : IAsyncLifetime
 {
     private const string QueryMode = "bootstrap_full";
     private const string ODataEndpoint = "http://onec.test/odata";
-    private const string SourceNamespace = "c1-review-source";
+    private const string SourceNamespace = "1c-identity:v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:test";
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan GateTimeout = TimeSpan.FromSeconds(15);
 

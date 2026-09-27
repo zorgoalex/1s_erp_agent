@@ -149,7 +149,9 @@ public sealed class CommandExecutionWorker(
     // start_full_sync selects every enabled entity.
     private async Task<bool> AcceptEtlJobAsync(CommandEnvelope command, string claimOwner, string mode, string[] requested, CancellationToken cancellationToken)
     {
-        var enabled = configuration.Entities.Where(static entity => entity.Enabled).ToArray();
+        // E3: version, entities and generation token come from ONE snapshot.
+        var snapshot = configuration.Snapshot;
+        var enabled = snapshot.Entities.Where(static entity => entity.Enabled).ToArray();
         EtlEntityDefinition[] selected;
         if (requested.Length == 0) selected = enabled;
         else
@@ -168,7 +170,7 @@ public sealed class CommandExecutionWorker(
             return true;
         }
 
-        var outcome = await store.AcceptEtlJobAndCompleteCommandAsync(command.CommandId, claimOwner, new EtlJobAcceptanceRequest(mode, selected, configuration.Version), cancellationToken).ConfigureAwait(false);
+        var outcome = await store.AcceptEtlJobAndCompleteCommandAsync(command.CommandId, claimOwner, new EtlJobAcceptanceRequest(mode, selected, snapshot.Version, snapshot.SourceGeneration), cancellationToken).ConfigureAwait(false);
         switch (outcome)
         {
             case EtlJobAcceptanceOutcome.Applied applied:

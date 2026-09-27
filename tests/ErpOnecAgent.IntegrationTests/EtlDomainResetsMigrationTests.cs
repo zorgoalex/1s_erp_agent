@@ -29,8 +29,8 @@ public sealed class EtlDomainResetsMigrationTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _migrationSql = new string[11];
-        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql", "011_watermark_domain_resets.sql"];
+        _migrationSql = new string[13];
+        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql", "011_watermark_domain_resets.sql", "012_etl_partial_runs.sql", "013_etl_source_labels.sql"];
         for (var index = 0; index < names.Length; index++)
         {
             _migrationSql[index] = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Migrations", names[index]));
@@ -82,8 +82,8 @@ public sealed class EtlDomainResetsMigrationTests : IAsyncLifetime
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(12, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(13, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(13, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         // Every pre-existing row in every table survives byte-identical — the scheduled
         // runs with their keys and frozen identity, the resolved/unresolved terminal
         // runs, the live 'admitted' attempt row, retained + released ownership, the
@@ -116,14 +116,16 @@ public sealed class EtlDomainResetsMigrationTests : IAsyncLifetime
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM watermarks WHERE domain_fingerprint IS NULL"));
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM watermarks WHERE generation > 1000"));
 
-        // Checksums 1-11 recorded canonically — independent of the checkout's line endings.
-        for (var version = 1; version <= 11; version++)
+        // Checksums 1-13 recorded canonically — independent of the checkout's line endings.
+        for (var version = 1; version <= 13; version++)
         {
             var expected = PublishedChecksum(_migrationSql[version - 1]);
             Assert.Equal(expected, await ChecksumForVersionAsync(version));
         }
         Assert.Equal("010_etl_run_resolutions.sql", await NameForVersionAsync(10));
         Assert.Equal("011_watermark_domain_resets.sql", await NameForVersionAsync(11));
+        Assert.Equal("012_etl_partial_runs.sql", await NameForVersionAsync(12));
+        Assert.Equal("013_etl_source_labels.sql", await NameForVersionAsync(13));
     }
 
     [Fact]
@@ -141,7 +143,7 @@ public sealed class EtlDomainResetsMigrationTests : IAsyncLifetime
         Assert.Equal(watermarksAfterFirst, await SnapshotRowsAsync("SELECT * FROM watermarks ORDER BY entity_name;"));
         Assert.Equal(resetsAfterFirst, await SnapshotRowsAsync("SELECT * FROM watermark_domain_resets ORDER BY reset_id;"));
         Assert.Equal(ledgerAfterFirst, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
-        Assert.Equal(12, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(13, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     [Fact]

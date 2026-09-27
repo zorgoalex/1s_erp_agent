@@ -11,7 +11,8 @@ public sealed record DynamicConfigurationSnapshot(
     IReadOnlyList<string> CommandTypes,
     IReadOnlyList<EtlEntityDefinition> Entities,
     int IntervalMinutes,
-    AgentMode Mode);
+    AgentMode Mode,
+    string? SourceGeneration = null);
 
 public sealed class DynamicConfigurationState
 {
@@ -21,6 +22,7 @@ public sealed class DynamicConfigurationState
     private IReadOnlyList<EtlEntityDefinition> _entities;
     private int _intervalMinutes;
     private AgentMode _mode = AgentMode.Normal;
+    private string? _sourceGeneration;
 
     public DynamicConfigurationState(IOptions<CommandOptions> commands, IOptions<EtlOptions> etl)
     {
@@ -35,7 +37,7 @@ public sealed class DynamicConfigurationState
         {
             lock (_gate)
             {
-                return new(_version, _commandTypes, _entities, _intervalMinutes, _mode);
+                return new(_version, _commandTypes, _entities, _intervalMinutes, _mode, _sourceGeneration);
             }
         }
     }
@@ -45,6 +47,7 @@ public sealed class DynamicConfigurationState
     public IReadOnlyList<EtlEntityDefinition> Entities => Snapshot.Entities;
     public int IntervalMinutes => Snapshot.IntervalMinutes;
     public AgentMode Mode => Snapshot.Mode;
+    public string? SourceGeneration => Snapshot.SourceGeneration;
 
     public DynamicConfigurationSnapshot Prepare(long version, RemoteAgentConfiguration configuration)
     {
@@ -56,6 +59,8 @@ public sealed class DynamicConfigurationState
         if (configuration is null) throw new InvalidDataException("Remote configuration is null.");
         if (configuration.CommandTypes is null || configuration.EtlEntities is null) throw new InvalidDataException("Remote configuration lists cannot be null.");
         if (configuration.EtlIntervalMinutes <= 0) throw new InvalidDataException("Remote ETL interval must be positive.");
+        if (configuration.SourceGeneration is not null && !ErpOnecAgent.Application.Etl.SourceGenerationToken.IsValid(configuration.SourceGeneration))
+            throw new InvalidDataException("Remote sourceGeneration must be 1..128 printable ASCII characters without spaces.");
         if (configuration.CommandTypes.Any(string.IsNullOrWhiteSpace) || configuration.CommandTypes.Distinct(StringComparer.Ordinal).Count() != configuration.CommandTypes.Count) throw new InvalidDataException("Remote command type allowlist is invalid.");
         if (configuration.EtlEntities.Any(static value => value is null)) throw new InvalidDataException("Remote ETL entities cannot contain null.");
         if (configuration.EtlEntities.Select(static value => value.EntityCode).Distinct(StringComparer.Ordinal).Count() != configuration.EtlEntities.Count) throw new InvalidDataException("Remote ETL entity codes must be unique.");
@@ -74,7 +79,8 @@ public sealed class DynamicConfigurationState
             Freeze(configuration.CommandTypes),
             FreezeEntities(configuration.EtlEntities),
             configuration.EtlIntervalMinutes,
-            AgentRuntimeState.ParseRemoteMode(configuration.Mode));
+            AgentRuntimeState.ParseRemoteMode(configuration.Mode),
+            configuration.SourceGeneration);
     }
 
     public void Publish(DynamicConfigurationSnapshot snapshot, AgentRuntimeState runtime)
@@ -91,6 +97,7 @@ public sealed class DynamicConfigurationState
             _entities = snapshot.Entities;
             _intervalMinutes = snapshot.IntervalMinutes;
             _mode = snapshot.Mode;
+            _sourceGeneration = snapshot.SourceGeneration;
             runtime.SetRemoteMode(snapshot.Mode);
         }
     }

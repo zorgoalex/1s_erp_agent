@@ -62,6 +62,29 @@ public sealed record OnecSourceBinding(Guid DatabaseId, Guid ExportEpoch, string
     /// <summary>The stable non-secret ETL source namespace: <c>1c-identity:v1:{databaseId}:{exportEpoch}:{environment}</c>.</summary>
     public string SourceNamespace => $"{NamespacePrefix}{DatabaseId:D}:{ExportEpoch:D}:{Environment}";
 
+    /// <summary>E3: the identity parts as sent to ERP (session/start, heartbeat).</summary>
+    public ErpOnecAgent.Contracts.Erp.SourceIdentity ToContract() => new(DatabaseId.ToString("D"), ExportEpoch.ToString("D"), Environment);
+
+    /// <summary>
+    /// E3: strict parse of a stored namespace back into its parts. Accepts exactly the form
+    /// <see cref="SourceNamespace"/> produces (lower-case D-format non-empty UUIDs, environment
+    /// test|production); anything else is null.
+    /// </summary>
+    public static ErpOnecAgent.Contracts.Erp.SourceIdentity? ParseNamespace(string? value)
+    {
+        if (value is null || !value.StartsWith(NamespacePrefix, StringComparison.Ordinal)) return null;
+        var parts = value[NamespacePrefix.Length..].Split(':');
+        if (parts.Length != 3
+            || !Guid.TryParseExact(parts[0], "D", out var databaseId) || databaseId == Guid.Empty
+            || !Guid.TryParseExact(parts[1], "D", out var exportEpoch) || exportEpoch == Guid.Empty
+            || parts[2] is not ("test" or "production"))
+            return null;
+        var canonical = $"{NamespacePrefix}{databaseId:D}:{exportEpoch:D}:{parts[2]}";
+        return string.Equals(canonical, value, StringComparison.Ordinal)
+            ? new(databaseId.ToString("D"), exportEpoch.ToString("D"), parts[2])
+            : null;
+    }
+
     /// <summary>Parses configured options; returns null with a reason when the binding is absent or invalid.</summary>
     public static OnecSourceBinding? TryCreate(OnecSourceBindingOptions? options, out string reason)
     {
@@ -78,6 +101,19 @@ public sealed record OnecSourceBinding(Guid DatabaseId, Guid ExportEpoch, string
         reason = string.Empty;
         return new OnecSourceBinding(databaseId, exportEpoch, options.Environment, endpoint);
     }
+}
+
+/// <summary>
+/// E3: the opaque ERP <c>configuration.sourceGeneration</c> token. The agent never compares
+/// tokens; it freezes the one active at run creation and sends it verbatim as a header, so it
+/// must be 1..128 printable ASCII characters without spaces (no CR/LF injection).
+/// </summary>
+public static class SourceGenerationToken
+{
+    public const int MaxLength = 128;
+
+    public static bool IsValid(string? token) =>
+        token is { Length: > 0 and <= MaxLength } && token.All(static c => c is >= '!' and <= '~');
 }
 
 /// <summary>Normalization of an OData service root for binding comparison.</summary>

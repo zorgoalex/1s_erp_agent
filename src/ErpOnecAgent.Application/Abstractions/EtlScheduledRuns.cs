@@ -18,7 +18,8 @@ public sealed record EtlScheduledRunRequest(
     string ScheduleKey,
     string Mode,
     IReadOnlyList<EtlEntityDefinition> Entities,
-    long ConfigurationVersion);
+    long ConfigurationVersion,
+    string? SourceGeneration = null);
 
 /// <summary>
 /// Typed outcome of <c>EnsureScheduledEtlRunAsync</c>. <c>Created</c> inserted one

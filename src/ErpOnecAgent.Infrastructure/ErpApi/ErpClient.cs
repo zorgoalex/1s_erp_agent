@@ -59,8 +59,12 @@ public sealed class ErpClient : IErpClient
     public async Task<BatchAcknowledgement> UploadBatchAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken) =>
         (await UploadBatchWithEvidenceAsync(batch, content, cancellationToken).ConfigureAwait(false)).Ack;
 
-    public async Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken)
+    public Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken) =>
+        UploadBatchWithEvidenceAsync(batch, new EtlBatchSourceLabels(null, null), content, cancellationToken);
+
+    public async Task<BatchUploadResponse> UploadBatchWithEvidenceAsync(EtlBatch batch, EtlBatchSourceLabels labels, Stream content, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(labels);
         using var request = CreateRequest(HttpMethod.Post, "etl/batches");
         request.Headers.TryAddWithoutValidation("Idempotency-Key", batch.BatchId.ToString("D"));
         request.Headers.TryAddWithoutValidation("X-Content-SHA256", batch.Sha256);
@@ -69,6 +73,10 @@ public sealed class ErpClient : IErpClient
         request.Headers.TryAddWithoutValidation("X-Entity", batch.EntityName);
         request.Headers.TryAddWithoutValidation("X-Schema-Version", batch.SchemaVersion.ToString(System.Globalization.CultureInfo.InvariantCulture));
         request.Headers.TryAddWithoutValidation("X-Row-Count", batch.RowCount.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        // E3: labels are validated where they are stored (canonical namespace, printable-ASCII
+        // token), so they are header-safe; runs created before a label existed send none.
+        if (labels.SourceNamespace is not null) request.Headers.TryAddWithoutValidation("X-Source-Namespace", labels.SourceNamespace);
+        if (labels.SourceGeneration is not null) request.Headers.TryAddWithoutValidation("X-Source-Generation", labels.SourceGeneration);
         request.Content = new StreamContent(content);
         request.Content.Headers.ContentType = new("application/x-ndjson");
         request.Content.Headers.ContentEncoding.Add("gzip");

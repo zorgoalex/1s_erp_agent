@@ -103,7 +103,7 @@ public sealed class EtlUploadWorker(
         BatchAcknowledgementResult result;
         try
         {
-            var response = await erp.UploadBatchWithEvidenceAsync(batch, content, cancellationToken).ConfigureAwait(false);
+            var response = await erp.UploadBatchWithEvidenceAsync(batch, new EtlBatchSourceLabels(due.SourceNamespace, due.SourceGeneration), content, cancellationToken).ConfigureAwait(false);
             result = new BatchAcknowledgementResult(response, null, null);
         }
         catch (Exception ex)

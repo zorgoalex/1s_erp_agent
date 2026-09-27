@@ -20,7 +20,8 @@ public sealed class HeartbeatWorker(
     IOptions<StorageOptions> storageOptions,
     ILogger<HeartbeatWorker> logger,
     DynamicConfigurationState? configuration = null,
-    IOptions<EtlOptions>? etlOptions = null) : BackgroundService
+    IOptions<EtlOptions>? etlOptions = null,
+    IOptions<OnecOptions>? onecOptions = null) : BackgroundService
 {
     private static readonly TimeSpan HealthSummaryInterval = TimeSpan.FromMinutes(15);
     private int? _lastCertificateWarning;
@@ -69,7 +70,8 @@ public sealed class HeartbeatWorker(
                     new(queues.CommandsPending, queues.ResultsPending, queues.EtlBatchesPending, queues.DeadLetters),
                     new(state.LastEtlSuccessAtUtc, state.CurrentEtlRunId),
                     new(metrics.DiskFreeBytes, metrics.WorkingSetBytes, metrics.CpuPercent, metrics.SqliteSizeBytes, metrics.SpoolSizeBytes),
-                    new(certificateExpiry));
+                    new(certificateExpiry),
+                    ErpSessionManager.BoundSourceIdentity(onecOptions));
                 await erp.SendHeartbeatAsync(request, stoppingToken).ConfigureAwait(false);
                 state.LastErpSuccessAtUtc = DateTimeOffset.UtcNow;
             }

@@ -9,7 +9,8 @@ namespace ErpOnecAgent.Application.Abstractions;
 /// non-empty set of effective <see cref="EtlEntityDefinition"/>s serialized verbatim into the job,
 /// and <see cref="ConfigurationVersion"/> is the configuration version they were resolved against.
 /// </summary>
-public sealed record EtlJobAcceptanceRequest(string Mode, IReadOnlyList<EtlEntityDefinition> Entities, long ConfigurationVersion);
+/// <param name="SourceGeneration">E3: the ERP source generation token active at run creation (null when the configuration has none); frozen on the run.</param>
+public sealed record EtlJobAcceptanceRequest(string Mode, IReadOnlyList<EtlEntityDefinition> Entities, long ConfigurationVersion, string? SourceGeneration = null);
 
 /// <summary>Stable identity of one accepted durable ETL job: the job/run pair fixed at acceptance and the exact stored acceptance result.</summary>
 public sealed record EtlAcceptedJob(Guid JobId, Guid RunId, string Mode, string AcceptanceResultJson);

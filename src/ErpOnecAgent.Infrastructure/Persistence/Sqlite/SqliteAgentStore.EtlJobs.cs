@@ -74,10 +74,10 @@ public sealed partial class SqliteAgentStore
         }
 
         await ExecuteAsync(connection, transaction, """
-            INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,started_at_utc,configuration_version,created_at_utc,updated_at_utc,row_version)
-            VALUES($run,$mode,$entities,'pending',NULL,$configVersion,$now,$now,1);
+            INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,started_at_utc,configuration_version,created_at_utc,updated_at_utc,row_version,source_generation)
+            VALUES($run,$mode,$entities,'pending',NULL,$configVersion,$now,$now,1,$generation);
             """, cancellationToken,
-            ("$run", runId.ToString("D")), ("$mode", request.Mode), ("$entities", entityCodesJson), ("$configVersion", request.ConfigurationVersion), ("$now", now)).ConfigureAwait(false);
+            ("$run", runId.ToString("D")), ("$mode", request.Mode), ("$entities", entityCodesJson), ("$configVersion", request.ConfigurationVersion), ("$now", now), ("$generation", request.SourceGeneration)).ConfigureAwait(false);
 
         await ExecuteAsync(connection, transaction, """
             INSERT INTO etl_jobs(job_id,command_id,run_id,mode,entities_json,configuration_version,status,command_payload_hash,acceptance_result_json,created_at_utc,updated_at_utc,row_version)
@@ -230,6 +230,8 @@ public sealed partial class SqliteAgentStore
             throw new ArgumentException("Resolved entity codes must be unique.", nameof(request));
         if (request.ConfigurationVersion < 0)
             throw new ArgumentOutOfRangeException(nameof(request), "Configuration version cannot be negative.");
+        if (request.SourceGeneration is not null && !ErpOnecAgent.Application.Etl.SourceGenerationToken.IsValid(request.SourceGeneration))
+            throw new ArgumentException("The source generation token is invalid.", nameof(request));
         foreach (var entity in request.Entities)
         {
             if (!IsValidResolvedEntityDefinition(entity))

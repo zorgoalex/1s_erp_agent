@@ -46,11 +46,11 @@ public sealed partial class SqliteAgentStore
 
             var runId = Guid.NewGuid();
             await ExecuteAsync(connection, transaction, """
-                INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,started_at_utc,configuration_version,created_at_utc,updated_at_utc,row_version,schedule_key,resolved_entities_json)
-                VALUES($run,$mode,$codes,'pending',NULL,$config,$now,$now,1,$key,$resolved);
+                INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,started_at_utc,configuration_version,created_at_utc,updated_at_utc,row_version,schedule_key,resolved_entities_json,source_generation)
+                VALUES($run,$mode,$codes,'pending',NULL,$config,$now,$now,1,$key,$resolved,$generation);
                 """, cancellationToken,
                 ("$run", runId.ToString("D")), ("$mode", request.Mode), ("$codes", codesJson), ("$config", request.ConfigurationVersion),
-                ("$now", now), ("$key", request.ScheduleKey), ("$resolved", resolvedJson)).ConfigureAwait(false);
+                ("$now", now), ("$key", request.ScheduleKey), ("$resolved", resolvedJson), ("$generation", request.SourceGeneration)).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return new EtlScheduledRunEnsureOutcome.Created(runId);
         }
@@ -211,6 +211,8 @@ public sealed partial class SqliteAgentStore
             throw new ArgumentException("Resolved entity definitions cannot contain null.", nameof(request));
         if (request.Entities.Select(static entity => entity.EntityCode).Distinct(StringComparer.Ordinal).Count() != request.Entities.Count)
             throw new ArgumentException("Resolved entity codes must be unique.", nameof(request));
+        if (request.SourceGeneration is not null && !ErpOnecAgent.Application.Etl.SourceGenerationToken.IsValid(request.SourceGeneration))
+            throw new ArgumentException("The source generation token is invalid.", nameof(request));
         if (request.ConfigurationVersion < 0)
             throw new ArgumentOutOfRangeException(nameof(request), "Configuration version cannot be negative.");
         foreach (var entity in request.Entities)

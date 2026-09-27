@@ -29,7 +29,9 @@ public sealed record EtlDueBatchUpload(
     string FilePath,
     int RowCount,
     string Sha256,
-    int PriorAttempts);
+    int PriorAttempts,
+    string? SourceNamespace = null,
+    string? SourceGeneration = null);
 
 /// <summary>
 /// One won send claim. <see cref="AttemptId"/> is the fresh GUID minted inside the

@@ -116,12 +116,14 @@ public sealed class EtlExtractionWorker(
     private async Task EnsureScheduledRunAsync(CancellationToken cancellationToken)
     {
         if (DateTimeOffset.UtcNow < _nextScheduleTick) return;
-        _nextScheduleTick = DateTimeOffset.UtcNow.AddMinutes(configuration.IntervalMinutes);
+        // E3: version, entities and generation token come from ONE snapshot.
+        var snapshot = configuration.Snapshot;
+        _nextScheduleTick = DateTimeOffset.UtcNow.AddMinutes(snapshot.IntervalMinutes);
         // D1 policy: an incremental read never establishes a domain, so the scheduled manifest
         // contains only entities whose baseline exists. An entity without one would make the
         // whole run BaselineRequired; it is reported instead until an explicit
         // start_full_sync/reload_entity establishes it.
-        var candidates = configuration.Entities.Where(static entity => entity.Enabled && entity.RunsOnSchedule()).ToArray();
+        var candidates = snapshot.Entities.Where(static entity => entity.Enabled && entity.RunsOnSchedule()).ToArray();
         var entities = new List<EtlEntityDefinition>();
         foreach (var entity in candidates)
         {
@@ -129,7 +131,7 @@ public sealed class EtlExtractionWorker(
             else logger.LogWarning("ETL_BASELINE_REQUIRED Entity={Entity} — excluded from the schedule until a start_full_sync or reload_entity baseline completes", entity.EntityCode);
         }
         if (entities.Count == 0) return;
-        var outcome = await store.EnsureScheduledEtlRunAsync(new EtlScheduledRunRequest(ScheduleKey, "incremental", entities, configuration.Version), DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+        var outcome = await store.EnsureScheduledEtlRunAsync(new EtlScheduledRunRequest(ScheduleKey, "incremental", entities, snapshot.Version, snapshot.SourceGeneration), DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
         if (outcome is EtlScheduledRunEnsureOutcome.ActiveExisting existing && existing.Status is "failed" or "blocked")
             logger.LogWarning("ETL_SCHEDULE_HELD_BY_UNRESOLVED_RUN RunId={RunId} Status={Status} — manual resolution required", existing.RunId, existing.Status);
     }

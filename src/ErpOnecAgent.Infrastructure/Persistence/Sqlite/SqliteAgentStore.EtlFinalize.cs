@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ErpOnecAgent.Application.Abstractions;
+using ErpOnecAgent.Application.Etl;
 using ErpOnecAgent.Domain.Common;
 using ErpOnecAgent.Domain.Etl;
 using Microsoft.Data.Sqlite;
@@ -24,6 +25,10 @@ public sealed partial class SqliteAgentStore
         // caller blocks the run; nothing is captured against an unidentifiable domain.
         if (string.IsNullOrWhiteSpace(request.SourceNamespace))
             return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.SourceNamespaceMissing);
+        // E3: the namespace is recorded on the run and sent to ERP, so only the canonical
+        // binding form is accepted.
+        if (OnecSourceBinding.ParseNamespace(request.SourceNamespace) is null)
+            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.SourceNamespaceInvalid);
 
         var fingerprint = EtlDomainFingerprint.Compute(request.SourceNamespace, request.EntityName, request.EntityDefinitionJson, request.QueryMode);
 
@@ -204,6 +209,35 @@ public sealed partial class SqliteAgentStore
         // Partial runs: the refusal is recorded as a FAILED entity row with a failure code,
         // so the run can skip this entity and still seal the others.
         var baselineRequired = !basePresent && request.QueryMode == "incremental";
+
+        // E3: the run's source namespace is the one its FIRST entity was fingerprinted under
+        // (failed first rows included — they used it too). Every later entity must match it.
+        // A run that began reading before 013 (legacy) has no recoverable namespace and keeps
+        // its pre-E3 behaviour: nothing is recorded or compared.
+        await ExecuteAsync(connection, transaction, """
+            UPDATE etl_runs SET source_namespace=$ns
+            WHERE run_id=$run AND source_namespace IS NULL AND legacy_source_identity IS NULL
+              AND NOT EXISTS (SELECT 1 FROM etl_run_entities WHERE run_id=$run);
+            """, cancellationToken, ("$ns", request.SourceNamespace), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+        string? runNamespace = null;
+        var legacyIdentity = false;
+        await using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = "SELECT source_namespace, legacy_source_identity FROM etl_runs WHERE run_id=$run;";
+            Add(read, "$run", runId.ToString("D"));
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                runNamespace = NullableString(reader, 0);
+                legacyIdentity = !reader.IsDBNull(1);
+            }
+        }
+        if (!legacyIdentity && !string.Equals(runNamespace, request.SourceNamespace, StringComparison.Ordinal))
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlEntityBeginOutcome.Rejected(EtlEntityBeginRejection.SourceNamespaceMismatch);
+        }
 
         var proceeded = !baselineRequired && domainStatus is "absent" or "same";
         var failureCode = baselineRequired ? "BASELINE_REQUIRED" : domainStatus == "changed" ? "DOMAIN_CHANGED" : domainStatus == "unknown" ? "DOMAIN_UNKNOWN" : null;
@@ -417,6 +451,12 @@ public sealed partial class SqliteAgentStore
             await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             return new EtlRunSealOutcome.Rejected(EtlRunSealRejection.EntitySetMismatch);
         }
+        // E3: every Begin of a post-013 run records the namespace; its absence is corruption.
+        if (!run!.LegacySourceIdentity && run.SourceNamespace is null)
+        {
+            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlRunSealOutcome.Rejected(EtlRunSealRejection.SourceNamespaceMissing);
+        }
 
         var batchAggregates = await ReadBatchAggregatesAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
         var expectedTotal = 0;
@@ -618,40 +658,19 @@ public sealed partial class SqliteAgentStore
         }
 
         var payloadEntities = await ReadEntityRowsAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
-        var payloadFailed = payloadEntities.Count(IsSkippedFailure);
-        // Partial runs: a run with a skipped entity reports every entity and its outcome, so
-        // ERP knows which entities' staged rows must not be made final. Built once and stored.
-        var payload = payloadFailed == 0
-            ? JsonSerializer.Serialize(new
-            {
-                runId,
-                status = "succeeded",
-                rowsRead = run.RowsRead,
-                batchesCreated = run.BatchesCreated,
-                batchesAcknowledged = run.BatchesAcknowledged,
-                completedAtUtc = DateTimeOffset.UtcNow
-            }, JsonOptions)
-            : JsonSerializer.Serialize(new
-            {
-                runId,
-                status = "partial_success",
-                rowsRead = run.RowsRead,
-                batchesCreated = run.BatchesCreated,
-                batchesAcknowledged = run.BatchesAcknowledged,
-                completedAtUtc = DateTimeOffset.UtcNow,
-                entitiesFailed = payloadFailed,
-                entities = payloadEntities.OrderBy(static entity => entity.EntityName, StringComparer.Ordinal).Select(static entity => new
-                {
-                    entity = entity.EntityName,
-                    status = IsSkippedFailure(entity) ? "failed" : "done",
-                    rowsRead = entity.RowsRead,
-                    batchesCreated = entity.BatchesCreated,
-                    errorCode = entity.FailureCode,
-                    errorMessage = entity.FailureMessage
-                }).ToArray()
-            }, JsonOptions);
+        // E3: every body built from now on is v2 (shape 2) — mode, source labels and every
+        // entity with its outcome and readScope. Bodies stored before 013 stay shape 1 and are
+        // replayed byte for byte. Built once and stored.
+        var payload = BuildCompletePayloadV2(runId, run, payloadEntities, DateTimeOffset.UtcNow);
+        if (payload is null)
+        {
+            const string message = "A frozen entity definition or the run's source labels could not be read while building the completion body; the run is preserved for manual resolution.";
+            await CommitBlockedRunAsync(connection, transaction, runId, "SEAL_VIOLATED", message, now, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            return new EtlRunClaimOutcome.Blocked("SEAL_VIOLATED", message);
+        }
         await ExecuteAsync(connection, transaction,
-            "UPDATE etl_runs SET complete_payload_json=$payload WHERE run_id=$run;",
+            "UPDATE etl_runs SET complete_payload_json=$payload, complete_payload_shape=2 WHERE run_id=$run;",
             cancellationToken, ("$payload", payload), ("$run", runId.ToString("D"))).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new EtlRunClaimOutcome.Claimed(new EtlRunCompletionClaim(runId, claimId, ownerId, payload, (int)run.CompletionAttemptCount));
@@ -947,7 +966,12 @@ public sealed partial class SqliteAgentStore
         long BatchesCreated,
         long BatchesAcknowledged,
         long CompletionAttemptCount,
-        long SealedFailedEntityCount = 0);
+        long SealedFailedEntityCount = 0,
+        string Mode = "",
+        string? SourceNamespace = null,
+        string? SourceGeneration = null,
+        bool LegacySourceIdentity = false,
+        long? CompletePayloadShape = null);
 
     private sealed record EntityRow(
         string EntityName,
@@ -963,7 +987,8 @@ public sealed partial class SqliteAgentStore
         string? ExpectedBaseDomainFingerprint,
         string DomainStatus,
         string? FailureCode = null,
-        string? FailureMessage = null);
+        string? FailureMessage = null,
+        string EntityDefinitionJson = "");
 
     private sealed record BatchAggregate(long Count, long RowSum);
 
@@ -971,11 +996,12 @@ public sealed partial class SqliteAgentStore
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT status,requested_entities_json,sealed_at_utc,sealed_entity_count,sealed_expected_batch_count,complete_payload_json,rows_read,batches_created,batches_acknowledged,completion_attempt_count,COALESCE(sealed_failed_entity_count,0) FROM etl_runs WHERE run_id=$run;";
+        command.CommandText = "SELECT status,requested_entities_json,sealed_at_utc,sealed_entity_count,sealed_expected_batch_count,complete_payload_json,rows_read,batches_created,batches_acknowledged,completion_attempt_count,COALESCE(sealed_failed_entity_count,0),mode,source_namespace,source_generation,legacy_source_identity,complete_payload_shape FROM etl_runs WHERE run_id=$run;";
         Add(command, "$run", runId.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
-            ? new RunRow(reader.GetString(0), NullableString(reader, 1), NullableString(reader, 2), NullableLong(reader, 3), NullableLong(reader, 4), NullableString(reader, 5), reader.GetInt64(6), reader.GetInt64(7), reader.GetInt64(8), reader.GetInt64(9), reader.GetInt64(10))
+            ? new RunRow(reader.GetString(0), NullableString(reader, 1), NullableString(reader, 2), NullableLong(reader, 3), NullableLong(reader, 4), NullableString(reader, 5), reader.GetInt64(6), reader.GetInt64(7), reader.GetInt64(8), reader.GetInt64(9), reader.GetInt64(10),
+                reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13), !reader.IsDBNull(14), NullableLong(reader, 15))
             : null;
     }
 
@@ -984,12 +1010,12 @@ public sealed partial class SqliteAgentStore
         var entities = new List<EntityRow>();
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT entity_name,status,domain_fingerprint,final_watermark_json,expected_batch_count,rows_read,batches_created,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,failure_code,failure_message FROM etl_run_entities WHERE run_id=$run;";
+        command.CommandText = "SELECT entity_name,status,domain_fingerprint,final_watermark_json,expected_batch_count,rows_read,batches_created,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,failure_code,failure_message,entity_definition_json FROM etl_run_entities WHERE run_id=$run;";
         Add(command, "$run", runId.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            entities.Add(new EntityRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), NullableLong(reader, 8), NullableString(reader, 9), NullableString(reader, 10), reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13)));
+            entities.Add(new EntityRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), NullableLong(reader, 8), NullableString(reader, 9), NullableString(reader, 10), reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13), reader.GetString(14)));
         }
         return entities;
     }
@@ -1341,7 +1367,16 @@ public sealed partial class SqliteAgentStore
     private static readonly string[] PartialEntityProperties =
         ["entity", "status", "rowsRead", "batchesCreated", "errorCode", "errorMessage"];
 
-    private static bool IsValidCompletePayload(string payloadJson, Guid runId, RunRow run, List<EntityRow> entities)
+    private static bool IsValidCompletePayload(string payloadJson, Guid runId, RunRow run, List<EntityRow> entities) =>
+        run.CompletePayloadShape switch
+        {
+            1 => IsValidShape1Payload(payloadJson, runId, run, entities),
+            2 => IsValidShape2Payload(payloadJson, runId, run, entities),
+            _ => false
+        };
+
+    // Shape 1: bodies stored before 013 (legacy six-property / partial eight-property).
+    private static bool IsValidShape1Payload(string payloadJson, Guid runId, RunRow run, List<EntityRow> entities)
     {
         try
         {
@@ -1373,6 +1408,151 @@ public sealed partial class SqliteAgentStore
         {
             return false;
         }
+    }
+
+    // ---------- E3: completion body shape 2 (always v2) ----------
+
+    private sealed record CompletePayloadV2(
+        Guid RunId,
+        string Status,
+        string Mode,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] ErpOnecAgent.Contracts.Erp.SourceIdentity? SourceIdentity,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? SourceGeneration,
+        long RowsRead,
+        long BatchesCreated,
+        long BatchesAcknowledged,
+        DateTimeOffset CompletedAtUtc,
+        long EntitiesFailed,
+        IReadOnlyList<CompletePayloadEntity> Entities);
+
+    private sealed record CompletePayloadEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage);
+
+    private static readonly string[] V2BaseProperties =
+        ["runId", "status", "mode", "rowsRead", "batchesCreated", "batchesAcknowledged", "completedAtUtc", "entitiesFailed", "entities"];
+
+    private static readonly string[] V2EntityProperties =
+        ["entity", "status", "readScope", "rowsRead", "batchesCreated", "errorCode", "errorMessage"];
+
+    private static readonly string[] SourceIdentityProperties = ["databaseId", "exportEpoch", "environment"];
+
+    /// <summary>
+    /// readScope (agreed with ERP, variant (b)): "full" when the entity was read without a date
+    /// filter — every entity of a full mode, and an incremental entity without updatedAtField;
+    /// "delta" otherwise. It describes the query, not verified completeness. Null when the frozen
+    /// definition cannot be read (corrupt evidence).
+    /// </summary>
+    private static string? ReadScope(string mode, EntityRow entity)
+    {
+        EtlEntityDefinition? definition;
+        try
+        {
+            definition = JsonSerializer.Deserialize<EtlEntityDefinition>(entity.EntityDefinitionJson, JsonOptions);
+        }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException)
+        {
+            return null;
+        }
+        if (definition is null || !string.Equals(definition.EntityCode, entity.EntityName, StringComparison.Ordinal)) return null;
+        return mode != "incremental" || definition.UpdatedAtField is null ? "full" : "delta";
+    }
+
+    /// <summary>The run's recorded source identity (null for a legacy run without one); false when the stored labels are unusable.</summary>
+    private static bool TryReadRunIdentity(RunRow run, out ErpOnecAgent.Contracts.Erp.SourceIdentity? identity)
+    {
+        identity = null;
+        if (run.SourceGeneration is not null && !SourceGenerationToken.IsValid(run.SourceGeneration)) return false;
+        if (run.SourceNamespace is null) return run.LegacySourceIdentity;
+        identity = OnecSourceBinding.ParseNamespace(run.SourceNamespace);
+        return identity is not null;
+    }
+
+    private static string? BuildCompletePayloadV2(Guid runId, RunRow run, List<EntityRow> entities, DateTimeOffset completedAtUtc)
+    {
+        if (!IsSupportedExtractionMode(run.Mode) || !TryReadRunIdentity(run, out var identity)) return null;
+        var items = new List<CompletePayloadEntity>(entities.Count);
+        foreach (var entity in entities.OrderBy(static entity => entity.EntityName, StringComparer.Ordinal))
+        {
+            if (ReadScope(run.Mode, entity) is not { } scope) return null;
+            items.Add(new(entity.EntityName, IsSkippedFailure(entity) ? "failed" : "done", scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage));
+        }
+        var failed = entities.Count(IsSkippedFailure);
+        return JsonSerializer.Serialize(new CompletePayloadV2(
+            runId, failed == 0 ? "succeeded" : "partial_success", run.Mode, identity, run.SourceGeneration,
+            run.RowsRead, run.BatchesCreated, run.BatchesAcknowledged, completedAtUtc, failed, items), JsonOptions);
+    }
+
+    // Shape 2: every value is recomputed from durable rows; the property set is exact.
+    private static bool IsValidShape2Payload(string payloadJson, Guid runId, RunRow run, List<EntityRow> entities)
+    {
+        try
+        {
+            if (!IsSupportedExtractionMode(run.Mode) || !TryReadRunIdentity(run, out var identity)) return false;
+            using var document = JsonDocument.Parse(payloadJson);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+            JsonAmbiguityGuard.EnsureUnambiguous(root);
+            var expectedNames = new HashSet<string>(V2BaseProperties, StringComparer.Ordinal);
+            if (identity is not null) expectedNames.Add("sourceIdentity");
+            if (run.SourceGeneration is not null) expectedNames.Add("sourceGeneration");
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in root.EnumerateObject()) names.Add(property.Name);
+            if (!names.SetEquals(expectedNames)) return false;
+
+            var failed = entities.Count(IsSkippedFailure);
+            if (identity is not null && !IdentityMatches(root.GetProperty("sourceIdentity"), identity)) return false;
+            if (run.SourceGeneration is not null && !StringEquals(root.GetProperty("sourceGeneration"), run.SourceGeneration)) return false;
+            return root.GetProperty("runId").ValueKind == JsonValueKind.String
+                && Guid.TryParse(root.GetProperty("runId").GetString(), out var payloadRunId)
+                && payloadRunId == runId
+                && StringEquals(root.GetProperty("status"), failed == 0 ? "succeeded" : "partial_success")
+                && StringEquals(root.GetProperty("mode"), run.Mode)
+                && TryReadInt64(root.GetProperty("rowsRead"), out var rowsRead) && rowsRead == run.RowsRead
+                && TryReadInt64(root.GetProperty("batchesCreated"), out var created) && created == run.BatchesCreated
+                && TryReadInt64(root.GetProperty("batchesAcknowledged"), out var acknowledged) && acknowledged == run.BatchesAcknowledged
+                && root.GetProperty("completedAtUtc").ValueKind == JsonValueKind.String
+                && root.GetProperty("completedAtUtc").TryGetDateTimeOffset(out _)
+                && TryReadInt64(root.GetProperty("entitiesFailed"), out var declaredFailed) && declaredFailed == failed
+                && V2EntitiesMatch(root.GetProperty("entities"), run.Mode, entities);
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidDataException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IdentityMatches(JsonElement element, ErpOnecAgent.Contracts.Erp.SourceIdentity identity)
+    {
+        if (element.ValueKind != JsonValueKind.Object) return false;
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in element.EnumerateObject()) names.Add(property.Name);
+        return names.SetEquals(SourceIdentityProperties)
+            && StringEquals(element.GetProperty("databaseId"), identity.DatabaseId)
+            && StringEquals(element.GetProperty("exportEpoch"), identity.ExportEpoch)
+            && StringEquals(element.GetProperty("environment"), identity.Environment);
+    }
+
+    private static bool V2EntitiesMatch(JsonElement list, string mode, List<EntityRow> entities)
+    {
+        if (list.ValueKind != JsonValueKind.Array || list.GetArrayLength() != entities.Count) return false;
+        var ordered = entities.OrderBy(static entity => entity.EntityName, StringComparer.Ordinal).ToArray();
+        var index = 0;
+        foreach (var item in list.EnumerateArray())
+        {
+            var expected = ordered[index++];
+            if (item.ValueKind != JsonValueKind.Object || ReadScope(mode, expected) is not { } scope) return false;
+            var itemNames = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var property in item.EnumerateObject()) itemNames.Add(property.Name);
+            if (!itemNames.SetEquals(V2EntityProperties)) return false;
+            if (!StringEquals(item.GetProperty("entity"), expected.EntityName)
+                || !StringEquals(item.GetProperty("status"), IsSkippedFailure(expected) ? "failed" : "done")
+                || !StringEquals(item.GetProperty("readScope"), scope)
+                || !TryReadInt64(item.GetProperty("rowsRead"), out var rows) || rows != expected.RowsRead
+                || !TryReadInt64(item.GetProperty("batchesCreated"), out var batches) || batches != expected.BatchesCreated
+                || !StringEquals(item.GetProperty("errorCode"), expected.FailureCode)
+                || !StringEquals(item.GetProperty("errorMessage"), expected.FailureMessage))
+                return false;
+        }
+        return true;
     }
 
     private static bool PartialEntitiesMatch(JsonElement root, List<EntityRow> entities, int failed)

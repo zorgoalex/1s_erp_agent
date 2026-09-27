@@ -8,7 +8,11 @@ public sealed record SessionStartRequest(
     string AgentVersion,
     int LocalSchemaVersion,
     IReadOnlyList<string> Capabilities,
-    DateTimeOffset SystemTimeUtc);
+    DateTimeOffset SystemTimeUtc,
+    SourceIdentity? SourceIdentity = null);
+
+/// <summary>E3: identity of the bound 1C source; null when no valid binding is configured.</summary>
+public sealed record SourceIdentity(string DatabaseId, string ExportEpoch, string Environment);
 
 public sealed record SessionStartResponse(
     Guid SessionId,
@@ -34,7 +38,8 @@ public sealed record HeartbeatRequest(
     QueueHeartbeat Queues,
     EtlHeartbeat Etl,
     MachineHeartbeat Machine,
-    CertificateHeartbeat Certificate);
+    CertificateHeartbeat Certificate,
+    SourceIdentity? SourceIdentity = null);
 
 public sealed record OnecHeartbeat(bool ODataAvailable, bool CommandApiAvailable, DateTimeOffset? LastSuccessAtUtc, string? LastError);
 public sealed record QueueHeartbeat(long CommandsPending, long ResultsPending, long EtlBatchesPending, long DeadLetters);

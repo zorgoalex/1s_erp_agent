@@ -6,11 +6,15 @@ using Microsoft.Extensions.Options;
 
 namespace ErpOnecAgent.Service.Runtime;
 
-public sealed class ErpSessionManager(IErpClient erp, IOptions<AgentOptions> agentOptions, AgentRuntimeState state, ILogger<ErpSessionManager>? logger = null) : IDisposable
+public sealed class ErpSessionManager(IErpClient erp, IOptions<AgentOptions> agentOptions, AgentRuntimeState state, ILogger<ErpSessionManager>? logger = null, IOptions<OnecOptions>? onecOptions = null) : IDisposable
 {
-    private static readonly string[] Capabilities = ["commands.long-poll.v1", "commands.result.v1", "etl.ndjson-gzip.v1", "onec.odata.v1"];
+    private static readonly string[] Capabilities = ["commands.long-poll.v1", "commands.result.v1", "etl.ndjson-gzip.v1", "onec.odata.v1", "etl.source-labels.v1"];
     private readonly SemaphoreSlim _lock = new(1, 1);
     private Guid? _sessionId;
+
+    /// <summary>E3: the configured source identity for ERP; null when no valid binding is configured.</summary>
+    internal static SourceIdentity? BoundSourceIdentity(IOptions<OnecOptions>? onecOptions) =>
+        ErpOnecAgent.Application.Etl.OnecSourceBinding.TryCreate(onecOptions?.Value.SourceBinding, out _)?.ToContract();
 
     public async Task<Guid> GetSessionAsync(CancellationToken cancellationToken)
     {
@@ -22,7 +26,7 @@ public sealed class ErpSessionManager(IErpClient erp, IOptions<AgentOptions> age
             var options = agentOptions.Value;
             var sentAt = DateTimeOffset.UtcNow;
             var roundTrip = System.Diagnostics.Stopwatch.StartNew();
-            var response = await erp.StartSessionAsync(new(options.AgentId, options.SiteId, ThisAssembly.Version, SqliteMigrator.CurrentSchemaVersion, Capabilities, sentAt), cancellationToken).ConfigureAwait(false);
+            var response = await erp.StartSessionAsync(new(options.AgentId, options.SiteId, ThisAssembly.Version, SqliteMigrator.CurrentSchemaVersion, Capabilities, sentAt, BoundSourceIdentity(onecOptions)), cancellationToken).ConfigureAwait(false);
             roundTrip.Stop();
             // A07b B6: an explicit version rejection (accepted:false or a parsed minimum above the
             // running binary) latches CompatibilityRejected in the runtime state; the throw keeps

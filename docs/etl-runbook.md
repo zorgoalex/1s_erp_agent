@@ -38,6 +38,8 @@
 | `SPOOL_FILE_MISSING` | Файл зарегистрированного, но ещё не отправленного пакета пропал из spool |
 | `BATCH_REGISTRATION_REFUSED` / `ENTITY_COMPLETION_REFUSED` / `SEAL_REFUSED` | Store отказал в шаге извлечения, например потерян claim. Причина в `finalize_conflict_message` |
 | `BEGIN_BASELINE_REQUIRED` | Для incremental нет baseline (например, ручной job без предварительного `start_full_sync`) |
+| `BEGIN_SOURCE_NAMESPACE_MISMATCH` | Сущности одного run прочитаны под разными пространствами имён источника: между сущностями сменилась привязка `OneC:SourceBinding`. Проверить привязку и запустить новый run |
+| `BEGIN_SOURCE_NAMESPACE_INVALID` | Пространство имён источника не в каноническом виде `1c-identity:v1:{databaseId}:{exportEpoch}:{test\|production}`. Проверить `OneC:SourceBinding` |
 | `LEGACY_UNRESOLVED` | Run создан старым конвейером до переключения |
 | `BATCH_PAYLOAD_INVALID` | ERP принял пакет, но не смог разобрать его строки, и отказал в `complete` (422). Повторов нет |
 | `SOURCE_IDENTITY_MISMATCH` | ERP не принимает данные этой базы 1С (409): подключена другая база или сменилась эпоха. Нужно проверить привязку |

@@ -69,7 +69,9 @@ public sealed partial class SqliteAgentStore
         // the claim transaction re-verifies together with the full ownership set.
         command.CommandText = $"""
             SELECT b.batch_id, b.run_id, b.entity_name, b.schema_version, b.file_path, b.row_count, b.sha256,
-                   (SELECT COUNT(*) FROM etl_batch_send_attempts a0 WHERE a0.batch_id=b.batch_id)
+                   (SELECT COUNT(*) FROM etl_batch_send_attempts a0 WHERE a0.batch_id=b.batch_id),
+                   (SELECT rl.source_namespace FROM etl_runs rl WHERE rl.run_id=b.run_id),
+                   (SELECT rl.source_generation FROM etl_runs rl WHERE rl.run_id=b.run_id)
             FROM etl_batches b
             WHERE (b.status='ready'
                    OR (b.status='retry_waiting' AND (b.next_attempt_at_utc IS NULL OR b.next_attempt_at_utc <= $now)))
@@ -88,7 +90,10 @@ public sealed partial class SqliteAgentStore
             batches.Add(new EtlDueBatchUpload(
                 Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), reader.GetString(2),
                 reader.GetInt32(3), reader.GetString(4), reader.GetInt32(5), reader.GetString(6),
-                (int)reader.GetInt64(7)));
+                (int)reader.GetInt64(7),
+                // E3: the run's labels; both are immutable (migration 013 trigger), and the
+                // namespace is recorded at Begin, before any batch of the run exists.
+                NullableString(reader, 8), NullableString(reader, 9)));
         }
         return batches;
     }
