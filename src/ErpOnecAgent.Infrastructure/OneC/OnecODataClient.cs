@@ -31,13 +31,43 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
     [GeneratedRegex("^[\\p{L}\\p{N}_.$-]+$", RegexOptions.CultureInvariant)]
     private static partial Regex IdentifierPattern();
 
-    public async IAsyncEnumerable<JsonElement> ReadEntityAsync(EtlEntityDefinition entity, EtlCursor? committedCursor, EtlCursor upperBound, bool full, [EnumeratorCancellation] CancellationToken cancellationToken)
+    public IAsyncEnumerable<JsonElement> ReadEntityAsync(EtlEntityDefinition entity, EtlCursor? committedCursor, EtlCursor upperBound, bool full, CancellationToken cancellationToken)
     {
         Validate(entity);
+        return ReadPagesAsync(entity, skip => BuildInitialUri(entity, committedCursor, upperBound, full, skip), cancellationToken);
+    }
+
+    /// <summary>V1: every key of the entity set, unfiltered, ordered by key; only the key fields are selected.</summary>
+    public IAsyncEnumerable<JsonElement> ReadKeysAsync(EtlEntityDefinition entity, CancellationToken cancellationToken)
+    {
+        Validate(entity);
+        return ReadPagesAsync(entity, skip => BuildKeysUri(entity, skip), cancellationToken);
+    }
+
+    /// <summary>V1: <c>{set}/$count</c> of the whole entity set (no filter).</summary>
+    public async Task<long> CountAsync(EtlEntityDefinition entity, CancellationToken cancellationToken)
+    {
+        Validate(entity);
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (httpClient.Timeout != Timeout.InfiniteTimeSpan) attempt.CancelAfter(httpClient.Timeout);
+        using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(entity.ODataPath + "/$count", UriKind.Relative));
+        request.Headers.TryAddWithoutValidation("Accept", "text/plain, application/json");
+        request.Headers.TryAddWithoutValidation("OData-Version", entity.ODataVersion.ToString(CultureInfo.InvariantCulture));
+        await authentication.ApplyAsync(request, attempt.Token).ConfigureAwait(false);
+        using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attempt.Token).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        var text = (await response.Content.ReadAsStringAsync(attempt.Token).ConfigureAwait(false)).Trim().TrimStart('\uFEFF');
+        if (text.Length is 0 or > 20 || !long.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out var count))
+            throw new InvalidDataException($"OData $count of '{entity.EntityCode}' is not a non-negative integer.");
+        return count;
+    }
+
+    private async IAsyncEnumerable<JsonElement> ReadPagesAsync(EtlEntityDefinition entity, Func<int, Uri> build, [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         var skip = 0;
         var continuationMode = false;
         var visitedContinuations = new HashSet<string>(StringComparer.Ordinal);
-        Uri? next = BuildInitialUri(entity, committedCursor, upperBound, full, skip);
+        Uri? next = build(skip);
         visitedContinuations.Add(Absolute(next).AbsoluteUri);
         while (next is not null)
         {
@@ -67,7 +97,7 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
             if (values.GetArrayLength() >= entity.PageSize)
             {
                 skip += values.GetArrayLength();
-                next = BuildInitialUri(entity, committedCursor, upperBound, full, skip);
+                next = build(skip);
             }
             else
             {
@@ -140,6 +170,19 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (HttpRequestException) { return false; }
+    }
+
+    private static Uri BuildKeysUri(EtlEntityDefinition entity, int skip)
+    {
+        var keyFields = entity.EffectiveKeyFields();
+        var query = new List<string>
+        {
+            "$select=" + Uri.EscapeDataString(string.Join(',', keyFields.Order(StringComparer.Ordinal))),
+            "$top=" + entity.PageSize.ToString(CultureInfo.InvariantCulture),
+            "$skip=" + skip.ToString(CultureInfo.InvariantCulture),
+            "$orderby=" + Uri.EscapeDataString(string.Join(',', keyFields))
+        };
+        return new Uri(entity.ODataPath + "?" + string.Join('&', query), UriKind.Relative);
     }
 
     private static Uri BuildInitialUri(EtlEntityDefinition entity, EtlCursor? committed, EtlCursor upperBound, bool full, int skip)

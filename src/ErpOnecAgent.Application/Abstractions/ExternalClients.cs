@@ -66,6 +66,14 @@ public interface IOnecCommandClient
 public interface IOnecODataClient
 {
     IAsyncEnumerable<JsonElement> ReadEntityAsync(EtlEntityDefinition entity, EtlCursor? committedCursor, EtlCursor upperBound, bool full, CancellationToken cancellationToken);
+
+    /// <summary>V1: every key of the entity set, unfiltered (a second, key-only pass).</summary>
+    IAsyncEnumerable<JsonElement> ReadKeysAsync(EtlEntityDefinition entity, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("This OData client cannot read keys.");
+
+    /// <summary>V1: the size of the whole entity set (<c>$count</c>).</summary>
+    Task<long> CountAsync(EtlEntityDefinition entity, CancellationToken cancellationToken) =>
+        throw new NotSupportedException("This OData client cannot count.");
     Task<bool> CheckAsync(CancellationToken cancellationToken);
 }
 

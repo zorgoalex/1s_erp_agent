@@ -323,8 +323,9 @@ public sealed partial class SqliteAgentStore
     }
 
     /// <inheritdoc cref="IAgentStore.CompleteEtlEntityExtractionAsync"/>
-    public async Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken)
+    public async Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken, EtlReadCompleteness? completeness = null)
     {
+        if (completeness is not null && !completeness.IsValid) throw new ArgumentException("The read completeness verdict is invalid.", nameof(completeness));
         if (extractionClaimId == Guid.Empty) throw new ArgumentException("An extraction claim identity is required.", nameof(extractionClaimId));
         if (string.IsNullOrWhiteSpace(entityName)) throw new ArgumentException("Entity name is required.", nameof(entityName));
         if (!IsValidCursorJson(finalWatermarkJson, requireMeaningfulComponent: true))
@@ -337,13 +338,15 @@ public sealed partial class SqliteAgentStore
         var claimText = extractionClaimId.ToString("D");
 
         var guarded = await ExecuteAsync(connection, transaction, $"""
-            UPDATE etl_run_entities SET status='done', final_watermark_json=$final, expected_batch_count=$expected, updated_at_utc=$now, row_version=row_version+1
+            UPDATE etl_run_entities SET status='done', final_watermark_json=$final, expected_batch_count=$expected,
+                read_completeness=$completeness, read_completeness_reason=$completenessReason, updated_at_utc=$now, row_version=row_version+1
             WHERE run_id=$run AND entity_name=$entity AND status='extracting' AND batches_created=$expected
               AND EXISTS (SELECT 1 FROM etl_runs r WHERE r.run_id=$run AND r.status='running' AND r.sealed_at_utc IS NULL
                           AND r.extraction_claim_id=$claim AND {RunOwnershipSetPredicate}
                           AND {EntityOwnershipPredicate});
             """, cancellationToken,
             ("$final", finalWatermarkJson), ("$expected", expectedBatchCount), ("$now", now),
+            ("$completeness", completeness?.Status), ("$completenessReason", completeness?.Reason),
             ("$run", runId.ToString("D")), ("$entity", entityName), ("$claim", claimText)).ConfigureAwait(false);
         if (guarded == 0)
         {
@@ -988,7 +991,9 @@ public sealed partial class SqliteAgentStore
         string DomainStatus,
         string? FailureCode = null,
         string? FailureMessage = null,
-        string EntityDefinitionJson = "");
+        string EntityDefinitionJson = "",
+        string? ReadCompleteness = null,
+        string? ReadCompletenessReason = null);
 
     private sealed record BatchAggregate(long Count, long RowSum);
 
@@ -1010,12 +1015,12 @@ public sealed partial class SqliteAgentStore
         var entities = new List<EntityRow>();
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT entity_name,status,domain_fingerprint,final_watermark_json,expected_batch_count,rows_read,batches_created,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,failure_code,failure_message,entity_definition_json FROM etl_run_entities WHERE run_id=$run;";
+        command.CommandText = "SELECT entity_name,status,domain_fingerprint,final_watermark_json,expected_batch_count,rows_read,batches_created,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,failure_code,failure_message,entity_definition_json,read_completeness,read_completeness_reason FROM etl_run_entities WHERE run_id=$run;";
         Add(command, "$run", runId.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            entities.Add(new EntityRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), NullableLong(reader, 8), NullableString(reader, 9), NullableString(reader, 10), reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13), reader.GetString(14)));
+            entities.Add(new EntityRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), NullableLong(reader, 8), NullableString(reader, 9), NullableString(reader, 10), reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13), reader.GetString(14), NullableString(reader, 15), NullableString(reader, 16)));
         }
         return entities;
     }
@@ -1423,9 +1428,12 @@ public sealed partial class SqliteAgentStore
         long BatchesAcknowledged,
         DateTimeOffset CompletedAtUtc,
         long EntitiesFailed,
-        IReadOnlyList<CompletePayloadEntity> Entities);
+        IReadOnlyList<object> Entities);
 
     private sealed record CompletePayloadEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage);
+
+    // V1: an entity whose full read was checked (014+) also carries the verdict.
+    private sealed record CompletePayloadCheckedEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage, string Completeness, string? CompletenessReason);
 
     private static readonly string[] V2BaseProperties =
         ["runId", "status", "mode", "rowsRead", "batchesCreated", "batchesAcknowledged", "completedAtUtc", "entitiesFailed", "entities"];
@@ -1469,11 +1477,14 @@ public sealed partial class SqliteAgentStore
     private static string? BuildCompletePayloadV2(Guid runId, RunRow run, List<EntityRow> entities, DateTimeOffset completedAtUtc)
     {
         if (!IsSupportedExtractionMode(run.Mode) || !TryReadRunIdentity(run, out var identity)) return null;
-        var items = new List<CompletePayloadEntity>(entities.Count);
+        var items = new List<object>(entities.Count);
         foreach (var entity in entities.OrderBy(static entity => entity.EntityName, StringComparer.Ordinal))
         {
             if (ReadScope(run.Mode, entity) is not { } scope) return null;
-            items.Add(new(entity.EntityName, IsSkippedFailure(entity) ? "failed" : "done", scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage));
+            var status = IsSkippedFailure(entity) ? "failed" : "done";
+            items.Add(entity.ReadCompleteness is { } completeness
+                ? new CompletePayloadCheckedEntity(entity.EntityName, status, scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage, completeness, entity.ReadCompletenessReason)
+                : new CompletePayloadEntity(entity.EntityName, status, scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage));
         }
         var failed = entities.Count(IsSkippedFailure);
         return JsonSerializer.Serialize(new CompletePayloadV2(
@@ -1542,7 +1553,13 @@ public sealed partial class SqliteAgentStore
             if (item.ValueKind != JsonValueKind.Object || ReadScope(mode, expected) is not { } scope) return false;
             var itemNames = new HashSet<string>(StringComparer.Ordinal);
             foreach (var property in item.EnumerateObject()) itemNames.Add(property.Name);
-            if (!itemNames.SetEquals(V2EntityProperties)) return false;
+            var expectedNames = new HashSet<string>(V2EntityProperties, StringComparer.Ordinal);
+            if (expected.ReadCompleteness is not null) { expectedNames.Add("completeness"); expectedNames.Add("completenessReason"); }
+            if (!itemNames.SetEquals(expectedNames)) return false;
+            if (expected.ReadCompleteness is not null
+                && (!StringEquals(item.GetProperty("completeness"), expected.ReadCompleteness)
+                    || !StringEquals(item.GetProperty("completenessReason"), expected.ReadCompletenessReason)))
+                return false;
             if (!StringEquals(item.GetProperty("entity"), expected.EntityName)
                 || !StringEquals(item.GetProperty("status"), IsSkippedFailure(expected) ? "failed" : "done")
                 || !StringEquals(item.GetProperty("readScope"), scope)

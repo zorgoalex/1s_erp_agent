@@ -31,8 +31,8 @@ public sealed class EtlRunResolutionsMigrationTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _migrationSql = new string[13];
-        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql", "011_watermark_domain_resets.sql", "012_etl_partial_runs.sql", "013_etl_source_labels.sql"];
+        _migrationSql = new string[14];
+        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql", "011_watermark_domain_resets.sql", "012_etl_partial_runs.sql", "013_etl_source_labels.sql", "014_etl_read_completeness.sql"];
         for (var index = 0; index < names.Length; index++)
         {
             _migrationSql[index] = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Migrations", names[index]));
@@ -83,8 +83,8 @@ public sealed class EtlRunResolutionsMigrationTests : IAsyncLifetime
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(13, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(13, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(14, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(14, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         // Every pre-existing row in every table survives byte-identical — the scheduled
         // runs with their keys and frozen identity, the unresolved failed/blocked runs,
         // the live 'admitted' attempt row, retained + released ownership, bindings.
@@ -115,8 +115,8 @@ public sealed class EtlRunResolutionsMigrationTests : IAsyncLifetime
         Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE status IN ('failed','blocked') AND resolved_at_utc IS NOT NULL"));
         Assert.Equal(4, await CountAsync("SELECT COUNT(*) FROM etl_runs WHERE status IN ('failed','blocked')"));
 
-        // Checksums 1-13 recorded canonically — independent of the checkout's line endings.
-        for (var version = 1; version <= 13; version++)
+        // Checksums 1-14 recorded canonically — independent of the checkout's line endings.
+        for (var version = 1; version <= 14; version++)
         {
             var expected = PublishedChecksum(_migrationSql[version - 1]);
             Assert.Equal(expected, await ChecksumForVersionAsync(version));
@@ -126,6 +126,7 @@ public sealed class EtlRunResolutionsMigrationTests : IAsyncLifetime
         Assert.Equal("011_watermark_domain_resets.sql", await NameForVersionAsync(11));
         Assert.Equal("012_etl_partial_runs.sql", await NameForVersionAsync(12));
         Assert.Equal("013_etl_source_labels.sql", await NameForVersionAsync(13));
+        Assert.Equal("014_etl_read_completeness.sql", await NameForVersionAsync(14));
     }
 
     [Fact]
@@ -141,7 +142,7 @@ public sealed class EtlRunResolutionsMigrationTests : IAsyncLifetime
         Assert.Equal(runsAfterFirst, await SnapshotRowsAsync("SELECT * FROM etl_runs ORDER BY run_id;"));
         Assert.Equal(resolutionsAfterFirst, await SnapshotRowsAsync("SELECT * FROM etl_run_resolutions ORDER BY run_id;"));
         Assert.Equal(ledgerAfterFirst, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
-        Assert.Equal(13, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(14, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     [Fact]

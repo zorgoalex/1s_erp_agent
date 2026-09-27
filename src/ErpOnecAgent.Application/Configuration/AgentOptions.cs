@@ -124,6 +124,12 @@ public sealed class EtlOptions
     /// <summary>A10c: first retry delay; doubles per attempt.</summary>
     public int ODataRetryBaseDelayMilliseconds { get; init; } = 1000;
     public IReadOnlyList<EtlEntityDefinition> Entities { get; init; } = [];
+    /// <summary>
+    /// V1: verify every full read (readScope "full") with $count before and after and an
+    /// independent key-only pass; the verdict goes into complete as completeness. A failed or
+    /// impossible check never fails the entity — it only marks it unverified.
+    /// </summary>
+    public bool VerifyFullReads { get; init; } = true;
 }
 
 public sealed class StorageOptions

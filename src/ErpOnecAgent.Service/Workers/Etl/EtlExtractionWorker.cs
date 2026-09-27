@@ -248,6 +248,15 @@ public sealed class EtlExtractionWorker(
         var from = committed;
         EtlCursor? last = null;
         var batches = 0;
+        // V1: a full read (readScope "full") is verified with $count before/after and an
+        // independent key-only pass. The check never fails the entity; it only yields a verdict.
+        var fullScope = mode is not "incremental" || entity.UpdatedAtField is null;
+        var verify = fullScope && options.VerifyFullReads;
+        long? countBefore = null;
+        string? verifyFailure = null;
+        if (verify) (countBefore, verifyFailure) = await TryCountAsync(entity, cancellationToken).ConfigureAwait(false);
+        var digest = verify ? new EtlKeySetDigest() : null;
+
         // Source phase: a failure while reading this entity from 1C or building its cursor
         // skips the entity. Everything else (spool, disk, store) stays run-level.
         await using var source = odata.ReadEntityAsync(entity, committed, upper, full, cancellationToken).GetAsyncEnumerator(cancellationToken);
@@ -271,6 +280,11 @@ public sealed class EtlExtractionWorker(
             {
                 return await FailEntityAsync(runId, claimId, entity.EntityCode, "ODATA_CURSOR", ex).ConfigureAwait(false);
             }
+            if (digest is not null && verifyFailure is null)
+            {
+                try { digest.Add(row, entity); }
+                catch (InvalidDataException) { verifyFailure = "KEY_MISSING"; }
+            }
             rows.Add(row); approximateBytes += row.GetRawText().Length + 128;
             if (approximateBytes >= options.TargetBatchUncompressedBytes)
             {
@@ -286,7 +300,10 @@ public sealed class EtlExtractionWorker(
             batches++;
         }
         var final = last ?? upper;
-        var completed = await store.CompleteEtlEntityExtractionAsync(runId, claimId, entity.EntityCode, JsonSerializer.Serialize(final, JsonOptions), batches, cancellationToken).ConfigureAwait(false);
+        EtlReadCompleteness? completeness = null;
+        if (verify) completeness = await VerifyFullReadAsync(runId, entity, countBefore, digest!, verifyFailure, cancellationToken).ConfigureAwait(false);
+        else if (fullScope) completeness = EtlReadCompleteness.NotChecked;
+        var completed = await store.CompleteEtlEntityExtractionAsync(runId, claimId, entity.EntityCode, JsonSerializer.Serialize(final, JsonOptions), batches, cancellationToken, completeness).ConfigureAwait(false);
         if (completed is not EtlEntityCompletionOutcome.Completed)
         {
             // A refusal leaves the run without a way forward; it is blocked (fenced by the
@@ -295,6 +312,46 @@ public sealed class EtlExtractionWorker(
             return EntityResult.Stop;
         }
         return EntityResult.Done;
+    }
+
+    private async Task<(long? Count, string? Failure)> TryCountAsync(EtlEntityDefinition entity, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return (await odata.CountAsync(entity, cancellationToken).ConfigureAwait(false), null);
+        }
+        catch (NotSupportedException) { return (null, "COUNT_UNSUPPORTED"); }
+        catch (Exception ex) when (SourceFailureCode(ex, cancellationToken) is not null) { return (null, "COUNT_FAILED"); }
+    }
+
+    // V1: verified = $count before == $count after == rows of the data pass == rows of an
+    // unfiltered key-only pass, and both passes saw the same key multiset. A row changed after
+    // the snapshot bound is missing from the data pass, so such a read is honestly unverified.
+    private async Task<EtlReadCompleteness> VerifyFullReadAsync(Guid runId, EtlEntityDefinition entity, long? countBefore, EtlKeySetDigest dataPass, string? failure, CancellationToken cancellationToken)
+    {
+        var verdict = await DecideAsync().ConfigureAwait(false);
+        logger.LogInformation("ETL_ENTITY_COMPLETENESS RunId={RunId} Entity={Entity} Status={Status} Reason={Reason} Rows={Rows} CountBefore={CountBefore}",
+            runId, entity.EntityCode, verdict.Status, verdict.Reason, dataPass.Count, countBefore);
+        return verdict;
+
+        async Task<EtlReadCompleteness> DecideAsync()
+        {
+            if (failure is not null) return EtlReadCompleteness.Unverified(failure);
+            var keyPass = new EtlKeySetDigest();
+            try
+            {
+                await foreach (var row in odata.ReadKeysAsync(entity, cancellationToken).ConfigureAwait(false)) keyPass.Add(row, entity);
+            }
+            catch (NotSupportedException) { return EtlReadCompleteness.Unverified("KEY_PASS_UNSUPPORTED"); }
+            catch (Exception ex) when (SourceFailureCode(ex, cancellationToken) is not null) { return EtlReadCompleteness.Unverified("KEY_PASS_FAILED"); }
+            var (countAfter, countFailure) = await TryCountAsync(entity, cancellationToken).ConfigureAwait(false);
+            if (countFailure is not null) return EtlReadCompleteness.Unverified(countFailure);
+            if (countBefore != countAfter) return EtlReadCompleteness.Unverified("COUNT_CHANGED");
+            if (dataPass.Count != countBefore) return EtlReadCompleteness.Unverified("ROWS_NOT_EQUAL_COUNT");
+            if (keyPass.Count != countBefore) return EtlReadCompleteness.Unverified("KEY_PASS_COUNT_MISMATCH");
+            if (!string.Equals(keyPass.Value, dataPass.Value, StringComparison.Ordinal)) return EtlReadCompleteness.Unverified("KEY_SET_MISMATCH");
+            return EtlReadCompleteness.Verified;
+        }
     }
 
     // Partial runs: the failure code of an exception raised while reading an entity from

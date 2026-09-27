@@ -261,7 +261,7 @@ public interface IAgentStore
     /// batch count, which must equal the durable per-entity batch counter. Entity
     /// metadata and counts freeze after this.
     /// </summary>
-    Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken);
+    Task<EtlEntityCompletionOutcome> CompleteEtlEntityExtractionAsync(Guid runId, Guid extractionClaimId, string entityName, string finalWatermarkJson, int expectedBatchCount, CancellationToken cancellationToken, EtlReadCompleteness? completeness = null);
 
     /// <summary>
     /// Partial runs: marks an 'extracting' entity of the claimed, unsealed run as failed at the

@@ -662,6 +662,78 @@ public sealed class EtlPipelineC1Tests : IAsyncLifetime
             type == typeof(ILegacyEtlStore) || type.Name is "EtlTrigger" or "OnecEtlWorker" or "EtlBatchUploadWorker";
     }
 
+    // ---------- V1: verified completeness of full reads ----------
+
+    [Theory]
+    [InlineData("verified", null)]
+    [InlineData("count-changed", "COUNT_CHANGED")]
+    [InlineData("key-set", "KEY_SET_MISMATCH")]
+    [InlineData("rows-vs-count", "ROWS_NOT_EQUAL_COUNT")]
+    [InlineData("unsupported", "COUNT_UNSUPPORTED")]
+    public async Task V1_a_full_read_is_verified_only_when_counts_and_both_key_passes_agree(string scenario, string? reason)
+    {
+        var h = NewHarness(["clients"]);
+        h.OData.Rows["clients"] = [ClientRow("A1", "2026-09-19T09:50:00Z"), ClientRow("A2", "2026-09-19T09:55:00Z"), ClientRow("A3", "2026-09-19T09:59:00Z")];
+        switch (scenario)
+        {
+            case "verified": h.OData.Counts = new([3]); break;
+            case "count-changed": h.OData.Counts = new([3, 4]); break;
+            case "key-set":
+                h.OData.Counts = new([3]);
+                h.OData.KeyRows["clients"] = [ClientRow("A1", "x"), ClientRow("A2", "x"), ClientRow("A4", "x")];
+                break;
+            case "rows-vs-count":
+                // A row changed after the snapshot bound: in the unfiltered key pass, not in the data pass.
+                h.OData.Counts = new([4]);
+                h.OData.KeyRows["clients"] = [ClientRow("A1", "x"), ClientRow("A2", "x"), ClientRow("A3", "x"), ClientRow("A9", "x")];
+                break;
+        }
+
+        var runId = await ExtractBaselineAsync(h, "clients");
+        Assert.Equal(1, await RunUploadPassAsync(h));
+        Assert.Equal(1, await RunCompletionPassAsync(h));
+
+        var expected = reason is null ? "verified" : "unverified";
+        Assert.Equal("succeeded", await RunStatusAsync(runId));
+        Assert.Equal(expected, await ScalarStringAsync($"SELECT read_completeness FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'"));
+        Assert.Equal(reason, await ScalarStringAsync($"SELECT read_completeness_reason FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'"));
+        using var body = JsonDocument.Parse(Assert.Single(h.Erp.Completions).Payload);
+        var item = Assert.Single(body.RootElement.GetProperty("entities").EnumerateArray());
+        Assert.Equal("done", item.GetProperty("status").GetString());
+        Assert.Equal("full", item.GetProperty("readScope").GetString());
+        Assert.Equal(expected, item.GetProperty("completeness").GetString());
+        if (reason is null) Assert.Equal(JsonValueKind.Null, item.GetProperty("completenessReason").ValueKind);
+        else Assert.Equal(reason, item.GetProperty("completenessReason").GetString());
+        Assert.Equal(scenario == "unsupported" ? 0 : 1, h.OData.KeyPasses);
+    }
+
+    [Fact]
+    public async Task V1_switched_off_verification_reports_not_checked_and_makes_no_extra_reads()
+    {
+        var h = NewHarness(["clients"], verifyFullReads: false);
+        h.OData.Rows["clients"] = [ClientRow("A1", "2026-09-19T09:50:00Z")];
+        h.OData.Counts = new([1]);
+
+        var runId = await ExtractBaselineAsync(h, "clients");
+        Assert.Equal(1, await RunUploadPassAsync(h));
+        Assert.Equal(1, await RunCompletionPassAsync(h));
+
+        Assert.Equal("not_checked", await ScalarStringAsync($"SELECT read_completeness FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'"));
+        Assert.Equal("VERIFICATION_DISABLED", await ScalarStringAsync($"SELECT read_completeness_reason FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'"));
+        Assert.Equal(0, h.OData.KeyPasses);
+    }
+
+    [Fact]
+    public async Task V1_an_empty_entity_set_is_verified()
+    {
+        var h = NewHarness(["clients"]);
+        h.OData.Counts = new([0]);
+
+        var runId = await ExtractBaselineAsync(h, "clients");
+
+        Assert.Equal("verified", await ScalarStringAsync($"SELECT read_completeness FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'"));
+    }
+
     // ---------- scenario helpers ----------
 
     /// <summary>Drives a stored command through the worker's real claim+route path.</summary>
@@ -748,7 +820,8 @@ public sealed class EtlPipelineC1Tests : IAsyncLifetime
         Func<Guid, Guid, IEnumerable<OnecIdentityFetchResult>>? identityScript = null,
         IEnumerable<long>? diskScript = null,
         int maxBatchUploadAttempts = 5,
-        int maxRunCompletionAttempts = 20)
+        int maxRunCompletionAttempts = 20,
+        bool verifyFullReads = true)
     {
         var databaseId = Guid.NewGuid();
         var exportEpoch = Guid.NewGuid();
@@ -774,6 +847,7 @@ public sealed class EtlPipelineC1Tests : IAsyncLifetime
             MaxBatchUploadAttempts = maxBatchUploadAttempts,
             MaxRunCompletionAttempts = maxRunCompletionAttempts,
             TargetBatchUncompressedBytes = 1024 * 1024,
+            VerifyFullReads = verifyFullReads,
             Entities = entities.Select(code => Catalog().Single(e => e.EntityCode == code)).ToArray()
         };
         var storage = new StorageOptions
@@ -985,6 +1059,27 @@ public sealed class EtlPipelineC1Tests : IAsyncLifetime
         }
 
         public Task<bool> CheckAsync(CancellationToken cancellationToken) => Task.FromResult(true);
+
+        // V1: null = not supported (the interface default). Counts are dequeued per call; the
+        // last value repeats. Keys default to the data rows.
+        public Queue<long>? Counts { get; set; }
+        public Dictionary<string, List<JsonElement>> KeyRows { get; } = new(StringComparer.Ordinal);
+        public int KeyPasses { get; private set; }
+
+        public Task<long> CountAsync(EtlEntityDefinition entity, CancellationToken cancellationToken)
+        {
+            if (Counts is null) throw new NotSupportedException();
+            lock (_gate) return Task.FromResult(Counts.Count > 1 ? Counts.Dequeue() : Counts.Peek());
+        }
+
+        public async IAsyncEnumerable<JsonElement> ReadKeysAsync(EtlEntityDefinition entity, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            if (Counts is null) throw new NotSupportedException();
+            KeyPasses++;
+            await Task.Yield();
+            var rows = KeyRows.TryGetValue(entity.EntityCode, out var keys) ? keys : Rows.GetValueOrDefault(entity.EntityCode) ?? [];
+            foreach (var row in rows) yield return row;
+        }
     }
 
     private sealed class FakeErp : IErpClient

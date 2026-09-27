@@ -1816,6 +1816,33 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         Assert.Equal(legacy, reclaim.Claim.CompletePayloadJson);
     }
 
+    [Theory]
+    [InlineData("\"completeness\":\"verified\"", "\"completeness\":\"unverified\"")]
+    [InlineData("\"completenessReason\":null", "\"completenessReason\":\"X\"")]
+    [InlineData(",\"completeness\":\"verified\",\"completenessReason\":null", "")]
+    public async Task V1_the_stored_verdict_is_part_of_the_sealed_body(string original, string tampered)
+    {
+        var runId = await NewRunAsync("clients");
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(MakeBatch(runId, "clients", 2), ClaimOf(runId), CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() => _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 1, CancellationToken.None, new EtlReadCompleteness("verified", "X")));
+        Assert.IsType<EtlEntityCompletionOutcome.Completed>(await _store.CompleteEtlEntityExtractionAsync(runId, ClaimOf(runId), "clients", CursorJson(FinalClients), 1, CancellationToken.None, EtlReadCompleteness.Verified));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+        var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+        Assert.Contains(original, first.Claim.CompletePayloadJson, StringComparison.Ordinal);
+        Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(await _store.MarkRunCompletionRetryAsync(runId, first.Claim.ClaimId, "timeout", DateTimeOffset.UtcNow.AddMinutes(-1), 8, CancellationToken.None));
+        // An honest reclaim replays the same bytes.
+        var reclaim = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-2", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+        Assert.Equal(first.Claim.CompletePayloadJson, reclaim.Claim.CompletePayloadJson);
+        Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(await _store.MarkRunCompletionRetryAsync(runId, reclaim.Claim.ClaimId, "timeout", DateTimeOffset.UtcNow.AddMinutes(-1), 8, CancellationToken.None));
+        await ExecuteSqlAsync("UPDATE etl_runs SET complete_payload_json=$p WHERE run_id=$run;", ("$p", first.Claim.CompletePayloadJson.Replace(original, tampered, StringComparison.Ordinal)), ("$run", runId.ToString("D")));
+
+        var outcome = await _store.TryClaimRunCompletionAsync(runId, "owner-3", DateTimeOffset.UtcNow, 8, CancellationToken.None);
+
+        Assert.Equal("SEAL_VIOLATED", Assert.IsType<EtlRunClaimOutcome.Blocked>(outcome).Code);
+    }
+
     private static string RemoveProperty(string json, string name)
     {
         var node = System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();

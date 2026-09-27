@@ -75,6 +75,25 @@ public sealed record EtlEntityExtractionBase(
     string DomainFingerprint,
     string DomainStatus);
 
+/// <summary>
+/// V1: the agent's verdict on a full read, stored with the entity's completion and reported in
+/// complete (<c>completeness</c>, <c>completenessReason</c>). Status: verified | unverified | not_checked.
+/// </summary>
+public sealed record EtlReadCompleteness(string Status, string? Reason)
+{
+    public static EtlReadCompleteness Verified { get; } = new("verified", null);
+    public static EtlReadCompleteness Unverified(string reason) => new("unverified", reason);
+    public static EtlReadCompleteness NotChecked { get; } = new("not_checked", "VERIFICATION_DISABLED");
+
+    public bool IsValid =>
+        Status switch
+        {
+            "verified" => Reason is null,
+            "unverified" or "not_checked" => Reason is { Length: > 0 and <= 64 } && Reason.All(static c => c is (>= 'A' and <= 'Z') or (>= '0' and <= '9') or '_'),
+            _ => false
+        };
+}
+
 public enum EtlEntityBeginRejection
 {
     /// <summary>The run is missing, not running, already sealed, or the entity already has a row.</summary>

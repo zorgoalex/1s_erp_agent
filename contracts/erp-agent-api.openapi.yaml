@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ERP 1C Agent API
-  version: 1.1.0
+  version: 1.2.0
   description: >-
     Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
     1.1.0 (2026-09-28) reflects the decisions agreed over agent-bridge (to-erp/0001-0009,
@@ -330,6 +330,7 @@ components:
       type: object
       additionalProperties: false
       required: [entity, status, readScope, rowsRead, batchesCreated, errorCode, errorMessage]
+      description: completeness and completenessReason appear together or not at all.
       properties:
         entity: { type: string }
         status: { type: string, enum: [done, failed] }
@@ -344,6 +345,20 @@ components:
         batchesCreated: { type: integer, format: int64 }
         errorCode: { type: [string, 'null'], description: 'e.g. ODATA_HTTP_500, ODATA_TIMEOUT, BASELINE_REQUIRED, DOMAIN_CHANGED' }
         errorMessage: { type: [string, 'null'] }
+        completeness:
+          type: string
+          enum: [verified, unverified, not_checked]
+          description: >-
+            V1 (agent schema v14+). Present only for readScope=full entities that were checked.
+            verified — $count before = $count after = rows of the data pass = rows of an
+            independent unfiltered key-only pass, and both passes saw the same key set. Absence
+            of this property, or any value other than verified, is NOT evidence of completeness.
+        completenessReason:
+          type: [string, 'null']
+          description: >-
+            Null for verified; otherwise COUNT_UNSUPPORTED, COUNT_FAILED, KEY_MISSING,
+            KEY_PASS_UNSUPPORTED, KEY_PASS_FAILED, COUNT_CHANGED, ROWS_NOT_EQUAL_COUNT,
+            KEY_PASS_COUNT_MISMATCH, KEY_SET_MISMATCH, VERIFICATION_DISABLED.
     RunCompletionPartialV1:
       type: object
       additionalProperties: false
