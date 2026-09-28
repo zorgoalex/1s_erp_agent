@@ -235,12 +235,22 @@ public sealed class ErpClient : IErpClient
                 if (reader.TokenType == JsonTokenType.EndObject) return null;
                 if (reader.TokenType != JsonTokenType.PropertyName) return null;
                 var isCode = reader.ValueTextEquals("code"u8);
+                var isError = reader.ValueTextEquals("error"u8);
                 if (!reader.Read()) return null;
-                if (isCode)
+                if (isCode) return WellFormedCode(ref reader);
+                // ERP's envelope {"error":{"code":…}} (agent-bridge to-onec/0025): one level only.
+                if (isError && reader.TokenType == JsonTokenType.StartObject)
                 {
-                    if (reader.TokenType != JsonTokenType.String) return null;
-                    var code = reader.GetString();
-                    return code is { Length: >= 1 and <= 64 } && code.All(static c => c is >= 'A' and <= 'Z' or >= '0' and <= '9' or '_') ? code : null;
+                    while (reader.Read())
+                    {
+                        if (reader.TokenType == JsonTokenType.EndObject) break;
+                        if (reader.TokenType != JsonTokenType.PropertyName) return null;
+                        var isInnerCode = reader.ValueTextEquals("code"u8);
+                        if (!reader.Read()) return null;
+                        if (isInnerCode) return WellFormedCode(ref reader);
+                        if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray && !reader.TrySkip()) return null;
+                    }
+                    continue;
                 }
                 if (reader.TokenType is JsonTokenType.StartObject or JsonTokenType.StartArray && !reader.TrySkip()) return null;
             }
@@ -250,6 +260,13 @@ public sealed class ErpClient : IErpClient
         {
             return null;
         }
+    }
+
+    private static string? WellFormedCode(ref Utf8JsonReader reader)
+    {
+        if (reader.TokenType != JsonTokenType.String) return null;
+        var code = reader.GetString();
+        return code is { Length: >= 1 and <= 64 } && code.All(static c => c is >= 'A' and <= 'Z' or >= '0' and <= '9' or '_') ? code : null;
     }
 }
 

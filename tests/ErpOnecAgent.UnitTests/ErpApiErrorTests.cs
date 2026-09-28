@@ -61,6 +61,11 @@ public sealed class ErpApiErrorTests
     [InlineData("{\"details\":{\"code\":\"NESTED\"},\"code\":\"TOP_LEVEL\"}", "TOP_LEVEL")]
     [InlineData("{\"list\":[1,2,{\"code\":\"X\"}],\"code\":\"AFTER_ARRAY\"}", "AFTER_ARRAY")]
     [InlineData("{\"message\":\"no code here\"}", null)]
+    [InlineData("{\"error\":{\"code\":\"BATCH_NOT_STORED_RETRYABLE\",\"message\":\"m\",\"requestId\":\"req_1\"}}", "BATCH_NOT_STORED_RETRYABLE")]
+    [InlineData("{\"error\":{\"message\":\"m\",\"details\":{\"code\":\"DEEP\"},\"code\":\"RESULT_CONFLICT\"}}", "RESULT_CONFLICT")]
+    [InlineData("{\"error\":{\"message\":\"no code\"},\"code\":\"TOP_AFTER\"}", "TOP_AFTER")]
+    [InlineData("{\"error\":{\"code\":\"lower\"}}", null)]
+    [InlineData("{\"data\":{\"error\":{\"code\":\"TOO_DEEP\"}}}", null)]
     public void The_code_is_the_first_top_level_string_property(string json, string? expected) =>
         Assert.Equal(expected, ErpClient.ExtractCode(System.Text.Encoding.UTF8.GetBytes(json), isFinalBlock: true));
 
