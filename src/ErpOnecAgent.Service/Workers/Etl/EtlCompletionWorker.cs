@@ -101,8 +101,12 @@ public sealed class EtlCompletionWorker(
         return handled;
     }
 
+    // The completion body is immutable (H1): an ERP refusal of it — any 409 or 422 carrying an ERP
+    // code (BATCH_PAYLOAD_INVALID, SOURCE_IDENTITY_MISMATCH, RUN_GENERATION_CLOSED, RUN_CLOSED,
+    // RUN_BATCHES_MISMATCH, RUN_ENTITIES_MISMATCH, RUN_COMPLETION_CONFLICT, …; to-onec/0026) —
+    // can never succeed on a resend, so the run is blocked at once. A 409/422 without an ERP code
+    // (e.g. from a proxy) and 503 RUN_NOT_READY / RUN_MODE_PENDING stay retryable.
     internal static bool IsPermanentCompletionRefusal(ErpApiException ex) =>
-        ex.Is(System.Net.HttpStatusCode.UnprocessableEntity, ErpApiException.BatchPayloadInvalid)
-        || ex.Is(System.Net.HttpStatusCode.Conflict, ErpApiException.SourceIdentityMismatch)
-        || ex.Is(System.Net.HttpStatusCode.Conflict, ErpApiException.RunGenerationClosed);
+        ex.ApiErrorCode is not null
+        && ex.StatusCode is System.Net.HttpStatusCode.Conflict or System.Net.HttpStatusCode.UnprocessableEntity;
 }

@@ -118,11 +118,17 @@ public sealed class ErpErrorCodeStoreTests : IAsyncLifetime
     [InlineData(422, "BATCH_PAYLOAD_INVALID", true)]
     [InlineData(409, "SOURCE_IDENTITY_MISMATCH", true)]
     [InlineData(409, "RUN_GENERATION_CLOSED", true)]
-    [InlineData(409, "BATCH_PAYLOAD_INVALID", false)]
+    [InlineData(409, "BATCH_PAYLOAD_INVALID", true)]
+    [InlineData(409, "RUN_ENTITIES_MISMATCH", true)]
+    [InlineData(409, "RUN_COMPLETION_CONFLICT", true)]
+    [InlineData(409, "RUN_CLOSED", true)]
     [InlineData(422, null, false)]
+    [InlineData(409, null, false)]
+    [InlineData(503, "RUN_NOT_READY", false)]
+    [InlineData(503, "RUN_MODE_PENDING", false)]
     [InlineData(503, "BATCH_NOT_STORED_RETRYABLE", false)]
     [InlineData(500, null, false)]
-    public void Only_the_agreed_permanent_refusals_stop_completion_retries(int status, string? code, bool permanent) =>
+    public void Every_coded_409_or_422_on_completion_stops_retries(int status, string? code, bool permanent) =>
         Assert.Equal(permanent, EtlCompletionWorker.IsPermanentCompletionRefusal(new ErpApiException((HttpStatusCode)status, code, null)));
 
     private async Task<Guid> InsertPendingResultAsync()
