@@ -50,3 +50,23 @@ gives no command and holds the lease for 3 s.
 Tests 4 and 5 guard against regressions.
 
 L1 tests still pass.
+
+## Stage redelivery test switch
+
+For the redelivery test with ERP (`r1`, agreed in `to-erp/0044` and `to-onec/0045`) the agent
+has a switch: `Commands:TestHoldProbeResultSeconds` (default 0, off).
+
+- **What it does:** the first delivery of every `integration_probe` result is postponed by
+  this many seconds. The postponement is recorded durably as a result retry
+  (`TEST_RESULT_HOLD`), so it happens once.
+- **Why:** ERP's 60 s lease expires and ERP leases the same command again before the result
+  arrives. The agent sees a duplicate and does not execute the command again. The stored
+  result is sent after the hold.
+- **Where it applies:** only against a test source binding
+  (`OneC:SourceBinding:Environment = test`). Elsewhere it is ignored with
+  `TEST_RESULT_HOLD_IGNORED`. The value is capped at 600 s.
+- **Logs:** `TEST_RESULT_HOLD_ENABLED` at start and `COMMAND_RESULT_HELD_FOR_TEST` per held
+  result.
+
+Tests: the switch is honoured only for `test` and is capped. A held probe result is delivered
+exactly once, after the hold, while other results are not held.

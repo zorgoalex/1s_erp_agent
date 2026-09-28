@@ -177,6 +177,60 @@ public sealed class L2CommandCapacityTests : IAsyncLifetime
         Assert.Equal(1, await _store.CountReadyUnclaimedCommandsAsync(DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, CancellationToken.None));
     }
 
+    // ---- stage redelivery test switch (to-erp/0044, to-onec/0045) ----
+
+    [Theory]
+    [InlineData(0, "test", null)]
+    [InlineData(90, "test", 90)]
+    [InlineData(90, "production", null)]
+    [InlineData(90, "", null)]
+    [InlineData(5000, "test", 600)]
+    public void The_probe_result_hold_is_honoured_only_against_a_test_binding_and_is_capped(int seconds, string environment, int? expected)
+    {
+        var hold = ResultDeliveryWorker.ProbeHold(new CommandOptions { TestHoldProbeResultSeconds = seconds },
+            new OnecOptions { SourceBinding = new OnecSourceBindingOptions { Environment = environment } });
+
+        Assert.Equal(expected, hold is { } value ? (int)value.TotalSeconds : null);
+    }
+
+    [Fact]
+    public async Task A_held_probe_result_is_delivered_once_after_the_hold_and_other_results_are_not_held()
+    {
+        var signals = new CommandWorkSignals();
+        var state = ReadyState();
+        var erp = new GatingErp([]);
+        var probe = MakeEnvelope(type: "integration_probe");
+        var other = MakeEnvelope();
+        var probeDone = erp.ExpectResult(probe.CommandId);
+        var otherDone = erp.ExpectResult(other.CommandId);
+        using var execution = CreateExecutionWorker(state, signals, capacity: 2);
+        using var delivery = new ResultDeliveryWorker(_store, erp, state, NullLogger<ResultDeliveryWorker>.Instance, signals,
+            Options.Create(new CommandOptions { TestHoldProbeResultSeconds = 2 }),
+            Options.Create(new OnecOptions { SourceBinding = new OnecSourceBindingOptions { Environment = "test" } }));
+        await _store.StoreCommandAsync(probe, DateTimeOffset.UtcNow, CancellationToken.None);
+        await _store.StoreCommandAsync(other, DateTimeOffset.UtcNow, CancellationToken.None);
+        var watch = Stopwatch.StartNew();
+
+        await execution.StartAsync(CancellationToken.None);
+        await delivery.StartAsync(CancellationToken.None);
+        try
+        {
+            await otherDone.WaitAsync(BoundedWait);
+            Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1.5), $"Unheld result after {watch.Elapsed.TotalMilliseconds} ms");
+            Assert.False(probeDone.IsCompleted, "The probe result was not held.");
+            await probeDone.WaitAsync(BoundedWait);
+            Assert.True(watch.Elapsed >= TimeSpan.FromSeconds(2), $"Held result after {watch.Elapsed.TotalMilliseconds} ms");
+            await Task.Delay(1000);
+        }
+        finally
+        {
+            await StopAsync(delivery);
+            await StopAsync(execution);
+        }
+
+        Assert.Equal(1, erp.ResultCount(probe.CommandId));
+    }
+
     // ---- helpers ----
 
     private static AgentRuntimeState ReadyState()
@@ -216,11 +270,11 @@ public sealed class L2CommandCapacityTests : IAsyncLifetime
             signals);
     }
 
-    private static CommandEnvelope MakeEnvelope(DateTimeOffset? notBefore = null)
+    private static CommandEnvelope MakeEnvelope(DateTimeOffset? notBefore = null, string type = "synthetic")
     {
         using var document = JsonDocument.Parse("{\"amount\":10}");
         var payload = document.RootElement.Clone();
-        return new(Guid.NewGuid(), "synthetic", 1, 100, null, null, DateTimeOffset.UtcNow, notBefore, null, null, PayloadHasher.Compute(payload), payload);
+        return new(Guid.NewGuid(), type, 1, 100, null, null, DateTimeOffset.UtcNow, notBefore, null, null, PayloadHasher.Compute(payload), payload);
     }
 
     private static IOptions<AgentOptions> AgentOptions() => Options.Create(new AgentOptions
@@ -280,10 +334,15 @@ public sealed class L2CommandCapacityTests : IAsyncLifetime
 
         public Task AcknowledgeReceivedAsync(Guid commandId, CommandReceivedRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
 
+        private readonly Dictionary<Guid, int> _results = [];
+
+        public int ResultCount(Guid commandId) { lock (_gate) return _results.GetValueOrDefault(commandId); }
+
         public Task AcknowledgeResultAsync(Guid commandId, string resultJson, CancellationToken cancellationToken)
         {
             lock (_gate)
             {
+                _results[commandId] = _results.GetValueOrDefault(commandId) + 1;
                 if (_expected.Remove(commandId, out var completion)) completion.TrySetResult();
             }
             return Task.CompletedTask;

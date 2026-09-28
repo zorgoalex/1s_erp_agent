@@ -1,14 +1,37 @@
 using ErpOnecAgent.Application.Abstractions;
 using ErpOnecAgent.Application.Commands;
+using ErpOnecAgent.Application.Configuration;
 using ErpOnecAgent.Service.Runtime;
+using Microsoft.Extensions.Options;
 
 namespace ErpOnecAgent.Service.Workers;
 
-public sealed class ResultDeliveryWorker(IAgentStore store, IErpClient erp, AgentRuntimeState state, ILogger<ResultDeliveryWorker> logger, CommandWorkSignals? signals = null) : BackgroundService
+public sealed class ResultDeliveryWorker(IAgentStore store, IErpClient erp, AgentRuntimeState state, ILogger<ResultDeliveryWorker> logger, CommandWorkSignals? signals = null,
+    IOptions<CommandOptions>? commandOptions = null, IOptions<OnecOptions>? onecOptions = null) : BackgroundService
 {
     // Fallback re-check: retry times and rows written without a signal.
     private static readonly TimeSpan IdleRecheck = TimeSpan.FromMilliseconds(500);
     private readonly CommandWorkSignals _signals = signals ?? new CommandWorkSignals();
+    private readonly TimeSpan? _probeHold = ProbeHold(commandOptions?.Value, onecOptions?.Value);
+
+    internal const string ProbeCommandType = "integration_probe";
+    internal const int MaxProbeHoldSeconds = 600;
+
+    // The stage-only redelivery test switch: honoured only against a test source binding.
+    internal static TimeSpan? ProbeHold(CommandOptions? commands, OnecOptions? onec) =>
+        commands?.TestHoldProbeResultSeconds is > 0 and var seconds
+        && string.Equals(onec?.SourceBinding?.Environment, "test", StringComparison.Ordinal)
+            ? TimeSpan.FromSeconds(Math.Min(seconds, MaxProbeHoldSeconds))
+            : null;
+
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (commandOptions?.Value.TestHoldProbeResultSeconds > 0 && _probeHold is null)
+            logger.LogError("TEST_RESULT_HOLD_IGNORED — Commands:TestHoldProbeResultSeconds is set but the source binding is not 'test'; results are delivered normally");
+        else if (_probeHold is { } hold)
+            logger.LogWarning("TEST_RESULT_HOLD_ENABLED Seconds={Seconds} — the first delivery of every {CommandType} result is postponed (stage redelivery test)", hold.TotalSeconds, ProbeCommandType);
+        return base.StartAsync(cancellationToken);
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -23,6 +46,13 @@ public sealed class ResultDeliveryWorker(IAgentStore store, IErpClient erp, Agen
             if (results.Count == 0) { await _signals.Results.WaitAsync(IdleRecheck, stoppingToken).ConfigureAwait(false); continue; }
             foreach (var result in results)
             {
+                if (_probeHold is { } hold && result.AttemptCount == 0 && string.Equals(result.CommandType, ProbeCommandType, StringComparison.Ordinal))
+                {
+                    // Durable, once: the retry schedule carries the hold and counts as the first attempt.
+                    if (await RecordAsync(() => store.MarkResultRetryAsync(result.CommandId, "TEST_RESULT_HOLD", DateTimeOffset.UtcNow + hold, stoppingToken), result.CommandId).ConfigureAwait(false))
+                        logger.LogWarning("COMMAND_RESULT_HELD_FOR_TEST CommandId={CommandId} Seconds={Seconds}", result.CommandId, hold.TotalSeconds);
+                    continue;
+                }
                 try
                 {
                     await erp.AcknowledgeResultAsync(result.CommandId, result.PayloadJson, stoppingToken).ConfigureAwait(false);

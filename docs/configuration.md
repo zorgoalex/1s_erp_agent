@@ -61,6 +61,8 @@ Bootstrap-настройки находятся в `appsettings.json`. Секр�
 | `OneC:CredentialSecretName` (по умолчанию `onec-main`) | OData, `health`, `identity` | только чтение: `ERPIntegration_ODataRead` |
 | `OneC:CommandCredentialSecretName` (например, `onec-command`) | `commands/execute` и `commands/{id}` | `ERPIntegration_CommandWrite` + `БазовыеПраваБСП` |
 
+`Commands:TestHoldProbeResultSeconds` (по умолчанию 0) — только для проверки повторной доставки на stage: откладывает первую доставку результата `integration_probe` на N секунд (не больше 600). Действует только при `OneC:SourceBinding:Environment = test`. После проверки верните 0.
+
 Если `CommandCredentialSecretName` не задан, команды идут под учётной записью OData, как до E5. При запуске служба тогда пишет предупреждение `ONEC_SINGLE_CREDENTIAL`. Эта учётная запись должна иметь право записи, поэтому для рабочей установки задайте отдельную.
 
 Перед запуском:

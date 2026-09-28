@@ -593,10 +593,10 @@ public sealed partial class SqliteAgentStore
         var results = new List<PendingResult>();
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT command_id,payload_json,attempt_count FROM results_outbox WHERE status IN ('pending','retry_waiting') AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= $now) ORDER BY created_at_utc LIMIT $limit;";
+        command.CommandText = "SELECT r.command_id,r.payload_json,r.attempt_count,(SELECT i.command_type FROM commands_inbox i WHERE i.command_id=r.command_id) FROM results_outbox r WHERE r.status IN ('pending','retry_waiting') AND (r.next_attempt_at_utc IS NULL OR r.next_attempt_at_utc <= $now) ORDER BY r.created_at_utc LIMIT $limit;";
         Add(command, "$now", nowUtc.ToUniversalTime().ToString("O")); Add(command, "$limit", limit);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) results.Add(new PendingResult(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetInt32(2)));
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) results.Add(new PendingResult(Guid.Parse(reader.GetString(0)), reader.GetString(1), reader.GetInt32(2), NullableString(reader, 3)));
         return results;
     }
 

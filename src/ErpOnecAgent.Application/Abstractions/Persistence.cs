@@ -5,7 +5,7 @@ using ErpOnecAgent.Domain.Etl;
 
 namespace ErpOnecAgent.Application.Abstractions;
 
-public sealed record PendingResult(Guid CommandId, string PayloadJson, int AttemptCount);
+public sealed record PendingResult(Guid CommandId, string PayloadJson, int AttemptCount, string? CommandType = null);
 
 /// <summary>
 /// Identity of one durable command attempt (one row in <c>command_attempts</c>).
