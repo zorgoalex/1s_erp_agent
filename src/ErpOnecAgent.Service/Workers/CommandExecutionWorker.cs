@@ -85,21 +85,30 @@ public sealed class CommandExecutionWorker(
 
     private async Task ProcessAsync(StoredCommand stored, CancellationToken cancellationToken)
     {
-        using var executing = state.BeginCommandExecution();
         try
         {
-            await execution.ProcessAsync(stored, TryExecuteAdministrativeAsync, cancellationToken, () => state.Snapshot.CanExecuteCommands).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "COMMAND_TECHNICAL_FAILED CommandId={CommandId}", stored.Envelope.CommandId);
-            await store.MarkUnknownResultAsync(stored.Envelope.CommandId, "UNHANDLED_EXECUTION_ERROR", ex.Message, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None).ConfigureAwait(false);
+            using var executing = state.BeginCommandExecution();
+            try
+            {
+                await execution.ProcessAsync(stored, TryExecuteAdministrativeAsync, cancellationToken, () => state.Snapshot.CanExecuteCommands).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "COMMAND_TECHNICAL_FAILED CommandId={CommandId}", stored.Envelope.CommandId);
+                await store.MarkUnknownResultAsync(stored.Envelope.CommandId, "UNHANDLED_EXECUTION_ERROR", ex.Message, DateTimeOffset.UtcNow.AddSeconds(2), CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                // A pass may have committed a result to the outbox: wake delivery now.
+                _signals.Results.Pulse();
+            }
         }
         finally
         {
-            // A pass may have committed a result to the outbox: wake delivery now.
-            _signals.Results.Pulse();
+            // L2: the slot is free only once the execution scope above is disposed; the lease
+            // worker waiting at full capacity asks for the next command now.
+            _signals.Capacity.Pulse();
         }
     }
 

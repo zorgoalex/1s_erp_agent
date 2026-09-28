@@ -25,7 +25,11 @@ public sealed class CommandLeaseWorker(
     internal static readonly TimeSpan EmptyLeaseMinimumCycle = TimeSpan.FromMilliseconds(250);
     private readonly CommandWorkSignals _signals = signals ?? new CommandWorkSignals();
     internal static TimeSpan IdleRecheck { get; set; } = TimeSpan.FromSeconds(15);
+    // L2: fallback re-check while at full capacity (a released slot normally wakes the worker via
+    // CommandWorkSignals.Capacity; this covers rows that become due or a missed pulse).
+    internal static TimeSpan CapacityRecheck { get; set; } = TimeSpan.FromSeconds(1);
     private bool _idleWithoutCommandTypes;
+    private bool _atCapacity;
 
     private readonly CommandIntakeService intake = new(erp, store);
 
@@ -51,11 +55,26 @@ public sealed class CommandLeaseWorker(
             _idleWithoutCommandTypes = false;
             try
             {
-                var sessionId = await sessions.GetSessionAsync(stoppingToken).ConfigureAwait(false);
                 var options = commandOptions.Value;
+                // L2 (agreed with ERP, to-onec/0045): ERP hands out no command while
+                // executing >= capacity and holds such a lease for the whole long poll, so leasing
+                // at full capacity cost a long poll per command of a queued batch. The load counts
+                // commands being executed plus accepted-but-not-started ones; at capacity no lease
+                // goes out until a slot is released.
+                var now = DateTimeOffset.UtcNow;
+                var occupied = state.ExecutingCommands + await store.CountReadyUnclaimedCommandsAsync(now, state.NotBeforeNow(now), stoppingToken).ConfigureAwait(false);
+                if (occupied >= options.MaxConcurrency)
+                {
+                    if (!_atCapacity) logger.LogDebug("COMMAND_LEASE_AT_CAPACITY Occupied={Occupied} Capacity={Capacity}", occupied, options.MaxConcurrency);
+                    _atCapacity = true;
+                    await _signals.Capacity.WaitAsync(CapacityRecheck, stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
+                _atCapacity = false;
+                var sessionId = await sessions.GetSessionAsync(stoppingToken).ConfigureAwait(false);
                 var supportedTypes = dynamicConfiguration.Snapshot.CommandTypes;
                 var leaseStarted = System.Diagnostics.Stopwatch.GetTimestamp();
-                var lease = await erp.LeaseCommandAsync(new LeaseRequest(sessionId, supportedTypes, erpOptions.Value.LongPollSeconds, new LeaseLoad(state.ExecutingCommands, options.MaxConcurrency)), stoppingToken).ConfigureAwait(false);
+                var lease = await erp.LeaseCommandAsync(new LeaseRequest(sessionId, supportedTypes, erpOptions.Value.LongPollSeconds, new LeaseLoad(occupied, options.MaxConcurrency)), stoppingToken).ConfigureAwait(false);
                 state.LastErpSuccessAtUtc = DateTimeOffset.UtcNow; failureCount = 0;
                 if (!lease.HasCommand)
                 {

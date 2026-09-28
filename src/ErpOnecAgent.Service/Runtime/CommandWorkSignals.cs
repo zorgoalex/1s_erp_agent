@@ -12,6 +12,9 @@ public sealed class CommandWorkSignals
 
     /// <summary>A result may be ready to send (execution/intake → delivery).</summary>
     public WorkSignal Results { get; } = new();
+
+    /// <summary>L2: an execution slot was released (execution → lease).</summary>
+    public WorkSignal Capacity { get; } = new();
 }
 
 /// <summary>

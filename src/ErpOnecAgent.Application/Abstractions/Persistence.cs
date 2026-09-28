@@ -58,6 +58,13 @@ public interface IAgentStore
     Task<IReadOnlyList<StoredCommand>> GetDueSentCommandsAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
     /// <summary>A07 time: sent-only variant with the ERP-defined not-before judged at <paramref name="notBeforeNowUtc"/>.</summary>
     Task<IReadOnlyList<StoredCommand>> GetDueSentCommandsAsync(int limit, DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, CancellationToken cancellationToken);
+    /// <summary>
+    /// L2: stored commands an execution pass would select right now (same predicate as
+    /// <see cref="GetReadyCommandsAsync(int, DateTimeOffset, DateTimeOffset, CancellationToken)"/>)
+    /// that no executor has claimed yet — accepted but not started. Rows waiting for their
+    /// not-before or retry time are not counted, so they can never hold leasing back.
+    /// </summary>
+    Task<int> CountReadyUnclaimedCommandsAsync(DateTimeOffset nowUtc, DateTimeOffset notBeforeNowUtc, CancellationToken cancellationToken);
     Task<int> MarkExecutingAsync(Guid commandId, CancellationToken cancellationToken);
     Task<CommandAttemptId?> ClaimPostAttemptAsync(Guid commandId, CancellationToken cancellationToken);
     Task<CommandAttemptId?> ClaimPostAttemptAsync(Guid commandId, string claimOwner, CancellationToken cancellationToken);
