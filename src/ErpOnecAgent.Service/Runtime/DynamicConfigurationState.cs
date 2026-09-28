@@ -23,6 +23,10 @@ public sealed class DynamicConfigurationState
     private ConfigurationRejection? _rejection;
     private long _version;
     private IReadOnlyList<string> _commandTypes;
+    // Administrative (agent-executed) types are allowed by the LOCAL allowlist only
+    // (Commands:SupportedTypes), independent of ERP; ERP's configuration decides business types.
+    // User decision 2026-09-28, agreed with ERP (agent-bridge to-onec/0018, variant 1).
+    private readonly string[] _localAdministrativeTypes;
     private IReadOnlyList<EtlEntityDefinition> _entities;
     private int _intervalMinutes;
     private AgentMode _mode = AgentMode.Normal;
@@ -31,6 +35,9 @@ public sealed class DynamicConfigurationState
     public DynamicConfigurationState(IOptions<CommandOptions> commands, IOptions<EtlOptions> etl)
     {
         _commandTypes = Freeze(commands.Value.SupportedTypes);
+        _localAdministrativeTypes = commands.Value.SupportedTypes
+            .Where(ErpOnecAgent.Application.Commands.AdministrativeCommandRouting.IsAdministrativeCommandType)
+            .Distinct(StringComparer.Ordinal).ToArray();
         _entities = FreezeEntities(etl.Value.Entities);
         _intervalMinutes = etl.Value.IntervalMinutes;
     }
@@ -95,7 +102,7 @@ public sealed class DynamicConfigurationState
 
         return new(
             version,
-            Freeze(configuration.CommandTypes),
+            Freeze(EffectiveCommandTypes(configuration.CommandTypes)),
             FreezeEntities(configuration.EtlEntities),
             configuration.EtlIntervalMinutes,
             AgentRuntimeState.ParseRemoteMode(configuration.Mode),
@@ -128,6 +135,12 @@ public sealed class DynamicConfigurationState
     }
 
     private static ReadOnlyCollection<string> Freeze(IEnumerable<string> values) => Array.AsReadOnly(values.ToArray());
+
+    /// <summary>ERP's business types plus the locally allowed administrative types; an administrative type listed by ERP but not allowed locally stays refused.</summary>
+    internal IEnumerable<string> EffectiveCommandTypes(IEnumerable<string> remoteTypes) =>
+        remoteTypes.Where(static type => !ErpOnecAgent.Application.Commands.AdministrativeCommandRouting.IsAdministrativeCommandType(type))
+            .Concat(_localAdministrativeTypes)
+            .Distinct(StringComparer.Ordinal);
 
     private static ReadOnlyCollection<EtlEntityDefinition> FreezeEntities(IEnumerable<EtlEntityDefinition> entities) =>
         Array.AsReadOnly(entities.Select(CloneEntity).ToArray());
