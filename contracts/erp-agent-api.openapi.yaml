@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ERP 1C Agent API
-  version: 1.3.0
+  version: 1.4.0
   description: >-
     Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
     1.1.0 (2026-09-28) reflects the decisions agreed over agent-bridge (to-erp/0001-0009,
@@ -438,6 +438,14 @@ components:
         schemaVersion: { type: integer }
         odataVersion: { type: integer, enum: [3, 4] }
         enabled: { type: boolean }
+        filter:
+          type: [string, 'null']
+          maxLength: 512
+          description: >-
+            Static OData $filter expression over the entity set, e.g. "Тип eq 'Телефон'" for
+            counterparty_phones. Applied to the data read (parenthesised, ANDed with date bounds),
+            to $count and to the V1 key pass. Part of the definition, hence of the domain
+            fingerprint; omit it (or null) for the whole set.
     ApiError:
       type: object
       required: [code, message, retryable]

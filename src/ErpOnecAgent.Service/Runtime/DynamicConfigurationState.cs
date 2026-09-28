@@ -96,7 +96,8 @@ public sealed class DynamicConfigurationState
             if (string.IsNullOrWhiteSpace(entity.EntityCode) || string.IsNullOrWhiteSpace(entity.ODataPath) || string.IsNullOrWhiteSpace(entity.KeyField)
                 || entity.Select is null || keys.Any(string.IsNullOrWhiteSpace) || keys.Distinct(StringComparer.Ordinal).Count() != keys.Count || !keys.Contains(entity.KeyField, StringComparer.Ordinal)
                 || entity.PageSize is < 1 or > 10_000 || entity.Select.Count == 0 || entity.ODataVersion is < 3 or > 4
-                || (entity.UpdatedAtField is not null && entity.UpdatedAtEdmType is not ("Edm.DateTime" or "Edm.DateTimeOffset")))
+                || (entity.UpdatedAtField is not null && entity.UpdatedAtEdmType is not ("Edm.DateTime" or "Edm.DateTimeOffset"))
+                || !EtlEntityFilterPolicy.IsAcceptable(entity.Filter))
                 throw new InvalidDataException($"Remote ETL entity '{entity.EntityCode}' is invalid.");
         }
 
@@ -150,4 +151,17 @@ public sealed class DynamicConfigurationState
         Select = entity.Select is null ? null! : Array.AsReadOnly(entity.Select.ToArray()),
         KeyFields = entity.KeyFields is null ? null : Array.AsReadOnly(entity.KeyFields.ToArray())
     };
+}
+
+/// <summary>
+/// A static entity filter is an OData $filter expression from ERP's configuration. It is sent
+/// URL-escaped, so it cannot add query options; the bounds keep it a plain expression.
+/// </summary>
+public static class EtlEntityFilterPolicy
+{
+    public const int MaxLength = 512;
+
+    public static bool IsAcceptable(string? filter) =>
+        filter is null
+        || (filter.Length is > 0 and <= MaxLength && !string.IsNullOrWhiteSpace(filter) && filter.All(static c => !char.IsControl(c)));
 }

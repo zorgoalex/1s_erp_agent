@@ -21,7 +21,12 @@ public sealed record EtlEntityDefinition(
     int ODataVersion = 3,
     bool Enabled = true,
     IReadOnlyList<string>? KeyFields = null,
-    string UpdatedAtEdmType = "Edm.DateTimeOffset");
+    string UpdatedAtEdmType = "Edm.DateTimeOffset",
+    // A static OData $filter expression over the entity set (e.g. "Тип eq 'Телефон'"): applied
+    // to the data read, $count and the V1 key pass alike. Part of the definition, so part of the
+    // domain fingerprint. Null: the whole set — and then NOT serialized, so every existing
+    // definition JSON (and its fingerprint) stays byte-identical.
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Filter = null);
 
 public static class EtlEntityDefinitionExtensions
 {

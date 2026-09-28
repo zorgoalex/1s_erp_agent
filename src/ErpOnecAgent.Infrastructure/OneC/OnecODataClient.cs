@@ -50,7 +50,8 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
         Validate(entity);
         using var attempt = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         if (httpClient.Timeout != Timeout.InfiniteTimeSpan) attempt.CancelAfter(httpClient.Timeout);
-        using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(entity.ODataPath + "/$count", UriKind.Relative));
+        var countPath = entity.ODataPath + "/$count" + (entity.Filter is { } filter ? "?$filter=" + Uri.EscapeDataString(filter) : string.Empty);
+        using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(countPath, UriKind.Relative));
         // 1C answers $count as text/plain but REFUSES Accept: text/plain with 406 (found by E2E);
         // application/json is accepted and still yields the plain number.
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
@@ -184,6 +185,7 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
             "$skip=" + skip.ToString(CultureInfo.InvariantCulture),
             "$orderby=" + Uri.EscapeDataString(string.Join(',', keyFields))
         };
+        if (entity.Filter is { } filter) query.Add("$filter=" + Uri.EscapeDataString(filter));
         return new Uri(entity.ODataPath + "?" + string.Join('&', query), UriKind.Relative);
     }
 
@@ -205,16 +207,18 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
             : [entity.UpdatedAtField, .. keyFields.Where(key => !string.Equals(key, entity.UpdatedAtField, StringComparison.Ordinal))];
         var order = string.Join(',', orderFields);
         query.Add("$orderby=" + Uri.EscapeDataString(order));
+        var filters = new List<string>();
+        // The static filter is parenthesised so an "or" inside it cannot escape the date bounds.
+        if (entity.Filter is { } staticFilter) filters.Add("(" + staticFilter + ")");
         if (entity.UpdatedAtField is not null)
         {
-            var filters = new List<string>();
             if (!full && EtlCursorPolicy.QueryFrom(committed, entity.OverlapMinutes).UpdatedAtUtc is { } updated)
             {
                 filters.Add($"{entity.UpdatedAtField} ge {FormatDate(entity.ODataVersion, entity.UpdatedAtEdmType, updated)}");
             }
             if (upperBound.UpdatedAtUtc is { } upper) filters.Add($"{entity.UpdatedAtField} le {FormatDate(entity.ODataVersion, entity.UpdatedAtEdmType, upper)}");
-            if (filters.Count > 0) query.Add("$filter=" + Uri.EscapeDataString(string.Join(" and ", filters)));
         }
+        if (filters.Count > 0) query.Add("$filter=" + Uri.EscapeDataString(string.Join(" and ", filters)));
         return new Uri(entity.ODataPath + "?" + string.Join('&', query), UriKind.Relative);
     }
 

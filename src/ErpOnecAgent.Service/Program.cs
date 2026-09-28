@@ -132,7 +132,8 @@ static void ConfigureOptions(IServiceCollection services, IConfiguration configu
             return !string.IsNullOrWhiteSpace(entity.EntityCode) && !string.IsNullOrWhiteSpace(entity.ODataPath) && !string.IsNullOrWhiteSpace(entity.KeyField)
                 && keys.All(static key => !string.IsNullOrWhiteSpace(key)) && keys.Distinct(StringComparer.Ordinal).Count() == keys.Count && keys.Contains(entity.KeyField, StringComparer.Ordinal)
                 && entity.Select.Count > 0 && entity.PageSize is >= 1 and <= 10_000 && entity.ODataVersion is >= 3 and <= 4
-                && (entity.UpdatedAtField is null || entity.UpdatedAtEdmType is "Edm.DateTime" or "Edm.DateTimeOffset");
+                && (entity.UpdatedAtField is null || entity.UpdatedAtEdmType is "Edm.DateTime" or "Edm.DateTimeOffset")
+                && EtlEntityFilterPolicy.IsAcceptable(entity.Filter);
         }), "One or more ETL entities are invalid.").ValidateOnStart();
     services.AddOptions<StorageOptions>().Bind(configuration.GetSection(StorageOptions.SectionName))
         .Validate(static value => value.MaxSpoolBytes > value.MinimumReservedBytesForCommands && value.MaxSqliteBytes > 0 && value.MaxBatchCompressedBytes > 0 && value.MaxBatchCompressedBytes <= value.MaxSpoolBytes && value.BackupRetentionCount > 0 && value.MaintenanceIntervalHours > 0, "Storage limits are invalid.").ValidateOnStart();
