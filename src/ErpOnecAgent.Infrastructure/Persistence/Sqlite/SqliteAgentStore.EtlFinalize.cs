@@ -241,12 +241,32 @@ public sealed partial class SqliteAgentStore
 
         var proceeded = !baselineRequired && domainStatus is "absent" or "same";
         var failureCode = baselineRequired ? "BASELINE_REQUIRED" : domainStatus == "changed" ? "DOMAIN_CHANGED" : domainStatus == "unknown" ? "DOMAIN_UNKNOWN" : null;
+        // E3a: the snapshot time of an entity that is read — strictly greater than any earlier
+        // one issued for this entity, even if the host clock stepped back.
+        string? snapshotAt = null;
+        if (proceeded)
+        {
+            // Millisecond precision end to end: the wire value has milliseconds, so comparison
+            // and storage use them too (two reads in one millisecond still differ by 1 ms).
+            var utcNow = DateTimeOffset.UtcNow;
+            var issued = new DateTimeOffset(utcNow.Ticks - utcNow.Ticks % TimeSpan.TicksPerMillisecond, TimeSpan.Zero);
+            var last = await ScalarStringAsync(connection, transaction,
+                "SELECT last_snapshot_at_utc FROM etl_entity_snapshot_clock WHERE entity_name=$entity;",
+                cancellationToken, ("$entity", request.EntityName)).ConfigureAwait(false);
+            if (last is not null && DateTimeOffset.TryParse(last, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AdjustToUniversal, out var previous) && issued <= previous)
+                issued = previous.AddMilliseconds(1);
+            snapshotAt = SnapshotText(issued);
+            await ExecuteAsync(connection, transaction, """
+                INSERT INTO etl_entity_snapshot_clock(entity_name,last_snapshot_at_utc) VALUES($entity,$at)
+                ON CONFLICT(entity_name) DO UPDATE SET last_snapshot_at_utc=excluded.last_snapshot_at_utc;
+                """, cancellationToken, ("$entity", request.EntityName), ("$at", snapshotAt)).ConfigureAwait(false);
+        }
         await ExecuteAsync(connection, transaction, """
             INSERT INTO etl_run_entities(run_id,entity_name,entity_definition_json,domain_fingerprint,status,base_row_present,
                 expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,
                 watermark_from_json,snapshot_upper_bound_json,final_watermark_json,expected_batch_count,rows_read,batches_created,
-                last_error,failure_code,failure_message,failed_at_utc,created_at_utc,updated_at_utc,row_version)
-            VALUES($run,$entity,$definition,$fp,$status,$present,$gen,$base,$baseFp,$domain,$from,$upper,NULL,$expected,0,0,$error,$error,$failureMessage,$failedAt,$now,$now,1);
+                last_error,failure_code,failure_message,failed_at_utc,created_at_utc,updated_at_utc,row_version,snapshot_at_utc)
+            VALUES($run,$entity,$definition,$fp,$status,$present,$gen,$base,$baseFp,$domain,$from,$upper,NULL,$expected,0,0,$error,$error,$failureMessage,$failedAt,$now,$now,1,$snapshotAt);
             """, cancellationToken,
             ("$run", runId.ToString("D")), ("$entity", request.EntityName), ("$definition", request.EntityDefinitionJson),
             ("$fp", fingerprint), ("$status", proceeded ? "extracting" : "failed"), ("$present", basePresent ? 1 : 0),
@@ -261,7 +281,7 @@ public sealed partial class SqliteAgentStore
                 _ => null
             }),
             ("$failedAt", proceeded ? null : now),
-            ("$now", now)).ConfigureAwait(false);
+            ("$now", now), ("$snapshotAt", snapshotAt)).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         if (!proceeded)
@@ -993,7 +1013,8 @@ public sealed partial class SqliteAgentStore
         string? FailureMessage = null,
         string EntityDefinitionJson = "",
         string? ReadCompleteness = null,
-        string? ReadCompletenessReason = null);
+        string? ReadCompletenessReason = null,
+        string? SnapshotAtUtc = null);
 
     private sealed record BatchAggregate(long Count, long RowSum);
 
@@ -1015,12 +1036,12 @@ public sealed partial class SqliteAgentStore
         var entities = new List<EntityRow>();
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT entity_name,status,domain_fingerprint,final_watermark_json,expected_batch_count,rows_read,batches_created,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,failure_code,failure_message,entity_definition_json,read_completeness,read_completeness_reason FROM etl_run_entities WHERE run_id=$run;";
+        command.CommandText = "SELECT entity_name,status,domain_fingerprint,final_watermark_json,expected_batch_count,rows_read,batches_created,base_row_present,expected_base_generation,expected_base_cursor_json,expected_base_domain_fingerprint,domain_status,failure_code,failure_message,entity_definition_json,read_completeness,read_completeness_reason,snapshot_at_utc FROM etl_run_entities WHERE run_id=$run;";
         Add(command, "$run", runId.ToString("D"));
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
-            entities.Add(new EntityRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), NullableLong(reader, 8), NullableString(reader, 9), NullableString(reader, 10), reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13), reader.GetString(14), NullableString(reader, 15), NullableString(reader, 16)));
+            entities.Add(new EntityRow(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableLong(reader, 4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), NullableLong(reader, 8), NullableString(reader, 9), NullableString(reader, 10), reader.GetString(11), NullableString(reader, 12), NullableString(reader, 13), reader.GetString(14), NullableString(reader, 15), NullableString(reader, 16), NullableString(reader, 17)));
         }
         return entities;
     }
@@ -1415,6 +1436,10 @@ public sealed partial class SqliteAgentStore
         }
     }
 
+    // E3a snapshotAtUtc wire form: UTC, millisecond precision, Z suffix.
+    internal static string SnapshotText(DateTimeOffset value) =>
+        value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", System.Globalization.CultureInfo.InvariantCulture);
+
     // ---------- E3: completion body shape 2 (always v2) ----------
 
     private sealed record CompletePayloadV2(
@@ -1430,10 +1455,12 @@ public sealed partial class SqliteAgentStore
         long EntitiesFailed,
         IReadOnlyList<object> Entities);
 
-    private sealed record CompletePayloadEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage);
+    private sealed record CompletePayloadEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? SnapshotAtUtc = null);
 
     // V1: an entity whose full read was checked (014+) also carries the verdict.
-    private sealed record CompletePayloadCheckedEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage, string Completeness, string? CompletenessReason);
+    private sealed record CompletePayloadCheckedEntity(string Entity, string Status, string ReadScope, long RowsRead, long BatchesCreated, string? ErrorCode, string? ErrorMessage, string Completeness, string? CompletenessReason,
+        [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? SnapshotAtUtc = null);
 
     private static readonly string[] V2BaseProperties =
         ["runId", "status", "mode", "rowsRead", "batchesCreated", "batchesAcknowledged", "completedAtUtc", "entitiesFailed", "entities"];
@@ -1483,8 +1510,8 @@ public sealed partial class SqliteAgentStore
             if (ReadScope(run.Mode, entity) is not { } scope) return null;
             var status = IsSkippedFailure(entity) ? "failed" : "done";
             items.Add(entity.ReadCompleteness is { } completeness
-                ? new CompletePayloadCheckedEntity(entity.EntityName, status, scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage, completeness, entity.ReadCompletenessReason)
-                : new CompletePayloadEntity(entity.EntityName, status, scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage));
+                ? new CompletePayloadCheckedEntity(entity.EntityName, status, scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage, completeness, entity.ReadCompletenessReason, entity.SnapshotAtUtc)
+                : new CompletePayloadEntity(entity.EntityName, status, scope, entity.RowsRead, entity.BatchesCreated, entity.FailureCode, entity.FailureMessage, entity.SnapshotAtUtc));
         }
         var failed = entities.Count(IsSkippedFailure);
         return JsonSerializer.Serialize(new CompletePayloadV2(
@@ -1555,7 +1582,9 @@ public sealed partial class SqliteAgentStore
             foreach (var property in item.EnumerateObject()) itemNames.Add(property.Name);
             var expectedNames = new HashSet<string>(V2EntityProperties, StringComparer.Ordinal);
             if (expected.ReadCompleteness is not null) { expectedNames.Add("completeness"); expectedNames.Add("completenessReason"); }
+            if (expected.SnapshotAtUtc is not null) expectedNames.Add("snapshotAtUtc");
             if (!itemNames.SetEquals(expectedNames)) return false;
+            if (expected.SnapshotAtUtc is not null && !StringEquals(item.GetProperty("snapshotAtUtc"), expected.SnapshotAtUtc)) return false;
             if (expected.ReadCompleteness is not null
                 && (!StringEquals(item.GetProperty("completeness"), expected.ReadCompleteness)
                     || !StringEquals(item.GetProperty("completenessReason"), expected.ReadCompletenessReason)))

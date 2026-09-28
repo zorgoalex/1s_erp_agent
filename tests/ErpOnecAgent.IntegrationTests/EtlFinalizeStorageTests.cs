@@ -1689,7 +1689,7 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         Assert.Equal(["clients", "orders"], entities.Select(static e => e.GetProperty("entity").GetString()!).ToArray());
         Assert.All(entities, static e =>
         {
-            Assert.Equal(["entity", "status", "readScope", "rowsRead", "batchesCreated", "errorCode", "errorMessage"], e.EnumerateObject().Select(static p => p.Name).ToArray());
+            Assert.Equal(["entity", "status", "readScope", "rowsRead", "batchesCreated", "errorCode", "errorMessage", "snapshotAtUtc"], e.EnumerateObject().Select(static p => p.Name).ToArray());
             Assert.Equal("done", e.GetProperty("status").GetString());
             Assert.Equal("full", e.GetProperty("readScope").GetString());
             Assert.Equal(JsonValueKind.Null, e.GetProperty("errorCode").ValueKind);
@@ -1839,6 +1839,76 @@ public sealed class EtlFinalizeStorageTests : IAsyncLifetime
         await ExecuteSqlAsync("UPDATE etl_runs SET complete_payload_json=$p WHERE run_id=$run;", ("$p", first.Claim.CompletePayloadJson.Replace(original, tampered, StringComparison.Ordinal)), ("$run", runId.ToString("D")));
 
         var outcome = await _store.TryClaimRunCompletionAsync(runId, "owner-3", DateTimeOffset.UtcNow, 8, CancellationToken.None);
+
+        Assert.Equal("SEAL_VIOLATED", Assert.IsType<EtlRunClaimOutcome.Blocked>(outcome).Code);
+    }
+
+    // ---------- E3a: snapshotAtUtc ----------
+
+    [Fact]
+    public async Task E3a_a_read_entity_gets_a_millisecond_utc_snapshot_time_carried_into_complete()
+    {
+        var before = DateTimeOffset.UtcNow.AddSeconds(-1);
+        var runId = await NewRunAsync("clients");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 2);
+        var stored = await ScalarStringAsync($"SELECT snapshot_at_utc FROM etl_run_entities WHERE run_id='{runId:D}' AND entity_name='clients'");
+
+        Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$", stored);
+        Assert.InRange(DateTimeOffset.Parse(stored!, CultureInfo.InvariantCulture), before, DateTimeOffset.UtcNow.AddSeconds(1));
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+        var claimed = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+        using var payload = JsonDocument.Parse(claimed.Claim.CompletePayloadJson);
+        Assert.Equal(stored, payload.RootElement.GetProperty("entities")[0].GetProperty("snapshotAtUtc").GetString());
+    }
+
+    [Fact]
+    public async Task E3a_snapshot_times_of_one_entity_strictly_increase_even_if_the_clock_steps_back()
+    {
+        // The last issued time lies in the future (as after a backward clock step).
+        var future = DateTimeOffset.UtcNow.AddMinutes(10);
+        var futureText = future.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+        await ExecuteSqlAsync("INSERT INTO etl_entity_snapshot_clock(entity_name,last_snapshot_at_utc) VALUES('clients',$at);", ("$at", futureText));
+        var first = await NewRunAsync("clients");
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(first, ClaimOf(first), Request("clients"), CancellationToken.None));
+        var firstAt = await ScalarStringAsync($"SELECT snapshot_at_utc FROM etl_run_entities WHERE run_id='{first:D}'");
+
+        Assert.Equal(DateTimeOffset.Parse(futureText, CultureInfo.InvariantCulture).AddMilliseconds(1), DateTimeOffset.Parse(firstAt!, CultureInfo.InvariantCulture));
+        Assert.Equal(firstAt, await ScalarStringAsync("SELECT last_snapshot_at_utc FROM etl_entity_snapshot_clock WHERE entity_name='clients'"));
+    }
+
+    [Fact]
+    public async Task E3a_an_entity_refused_at_begin_gets_no_snapshot_time_and_no_wire_field()
+    {
+        var runId = await NewRunAsync("clients");
+        await SeedWatermarkAsync("clients", CursorJson(CursorX), generation: 3, fingerprint: "other-domain");
+
+        Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, ClaimOf(runId), Request("clients"), CancellationToken.None));
+
+        Assert.Null(await ScalarStringAsync($"SELECT snapshot_at_utc FROM etl_run_entities WHERE run_id='{runId:D}'"));
+        Assert.Null(await ScalarStringAsync("SELECT last_snapshot_at_utc FROM etl_entity_snapshot_clock WHERE entity_name='clients'"));
+    }
+
+    [Theory]
+    [InlineData("change")]
+    [InlineData("remove")]
+    public async Task E3a_a_tampered_snapshot_time_in_the_stored_body_is_seal_violated(string tamper)
+    {
+        var runId = await NewRunAsync("clients");
+        await BeginExtractCompleteAsync(runId, "clients", CursorJson(FinalClients), batchRows: 2);
+        var stored = (await ScalarStringAsync($"SELECT snapshot_at_utc FROM etl_run_entities WHERE run_id='{runId:D}'"))!;
+        Assert.IsType<EtlRunSealOutcome.Sealed>(await _store.SealEtlRunExtractionAsync(runId, ClaimOf(runId), CancellationToken.None));
+        await AcknowledgeAllBatchesAsync(runId);
+        var first = Assert.IsType<EtlRunClaimOutcome.Claimed>(await _store.TryClaimRunCompletionAsync(runId, "owner-1", DateTimeOffset.UtcNow, 8, CancellationToken.None));
+        Assert.IsType<EtlRunCompletionRetryOutcome.Scheduled>(await _store.MarkRunCompletionRetryAsync(runId, first.Claim.ClaimId, "timeout", DateTimeOffset.UtcNow.AddMinutes(-1), 8, CancellationToken.None));
+        var body = first.Claim.CompletePayloadJson;
+        var payload = tamper == "change"
+            ? body.Replace(stored, "2000-01-01T00:00:00.000Z", StringComparison.Ordinal)
+            : body.Replace($",\"snapshotAtUtc\":\"{stored}\"", string.Empty, StringComparison.Ordinal);
+        Assert.NotEqual(body, payload);
+        await ExecuteSqlAsync("UPDATE etl_runs SET complete_payload_json=$p WHERE run_id=$run;", ("$p", payload), ("$run", runId.ToString("D")));
+
+        var outcome = await _store.TryClaimRunCompletionAsync(runId, "owner-2", DateTimeOffset.UtcNow, 8, CancellationToken.None);
 
         Assert.Equal("SEAL_VIOLATED", Assert.IsType<EtlRunClaimOutcome.Blocked>(outcome).Code);
     }

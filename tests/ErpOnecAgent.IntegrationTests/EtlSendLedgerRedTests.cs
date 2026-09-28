@@ -43,8 +43,8 @@ public sealed class EtlSendLedgerRedTests : IAsyncLifetime
     [Fact]
     public async Task Migration_008_creates_the_send_attempt_ledger_and_batch_send_columns()
     {
-        Assert.Equal(14, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(14, await ScalarAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(15, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(15, await ScalarAsync("SELECT COUNT(*) FROM schema_migrations"));
         Assert.Equal("008_etl_send_attempts.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=8"));
         Assert.Equal("009_etl_scheduled_runs.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=9"));
         Assert.Equal("010_etl_run_resolutions.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=10"));
@@ -52,6 +52,7 @@ public sealed class EtlSendLedgerRedTests : IAsyncLifetime
         Assert.Equal("012_etl_partial_runs.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=12"));
         Assert.Equal("013_etl_source_labels.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=13"));
         Assert.Equal("014_etl_read_completeness.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=14"));
+        Assert.Equal("015_etl_snapshot_at.sql", await ScalarStringAsync("SELECT name FROM schema_migrations WHERE version=15"));
         Assert.Equal(1, await ScalarAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='etl_batch_send_attempts'"));
         // Full ledger shape per design §3.2, including the single-live-admission index.
         Assert.Equal(1, await ScalarAsync("SELECT COUNT(*) FROM pragma_table_info('etl_batch_send_attempts') WHERE name='attempt_id' AND pk=1"));

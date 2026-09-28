@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ERP 1C Agent API
-  version: 1.2.0
+  version: 1.3.0
   description: >-
     Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
     1.1.0 (2026-09-28) reflects the decisions agreed over agent-bridge (to-erp/0001-0009,
@@ -353,6 +353,14 @@ components:
             verified — $count before = $count after = rows of the data pass = rows of an
             independent unfiltered key-only pass, and both passes saw the same key set. Absence
             of this property, or any value other than verified, is NOT evidence of completeness.
+        snapshotAtUtc:
+          type: string
+          format: date-time
+          description: >-
+            E3a (schema v15+). When the agent started reading the entity from 1C; UTC, millisecond
+            precision, Z suffix. Strictly increasing per entity across runs (the agent stores the
+            last issued value and uses max(now, last + 1 ms)). Absent for entities refused at Begin
+            and in bodies built before v15.
         completenessReason:
           type: [string, 'null']
           description: >-
