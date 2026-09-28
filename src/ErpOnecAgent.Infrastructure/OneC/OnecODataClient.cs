@@ -31,6 +31,13 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
     [GeneratedRegex("^[\\p{L}\\p{N}_.$-]+$", RegexOptions.CultureInvariant)]
     private static partial Regex IdentifierPattern();
 
+    // stock_balances: the register balance virtual table with explicit dimensions — the only form
+    // the 1C reader role may read (agent-bridge to-onec/0021; ext to-svc/0020: plain Balance() is 401).
+    [GeneratedRegex("^[\\p{L}\\p{N}_]+/Balance\\(Dimensions='[\\p{L}\\p{N}_]+(,[\\p{L}\\p{N}_]+)*'\\)$", RegexOptions.CultureInvariant)]
+    private static partial Regex BalancePathPattern();
+
+    internal static bool IsSafeODataPath(string path) => IdentifierPattern().IsMatch(path) || BalancePathPattern().IsMatch(path);
+
     public IAsyncEnumerable<JsonElement> ReadEntityAsync(EtlEntityDefinition entity, EtlCursor? committedCursor, EtlCursor upperBound, bool full, CancellationToken cancellationToken)
     {
         Validate(entity);
@@ -273,7 +280,8 @@ public sealed partial class OnecODataClient(HttpClient httpClient, OnecAuthentic
     private static void Validate(EtlEntityDefinition entity)
     {
         var keyFields = entity.EffectiveKeyFields();
-        var identifiers = entity.Select.Append(entity.ODataPath).Concat(keyFields);
+        if (!IsSafeODataPath(entity.ODataPath)) throw new InvalidDataException($"Unsafe OData path in entity '{entity.EntityCode}'.");
+        var identifiers = entity.Select.Concat(keyFields);
         if (entity.UpdatedAtField is not null) identifiers = identifiers.Append(entity.UpdatedAtField);
         if (entity.DeletedField is not null) identifiers = identifiers.Append(entity.DeletedField);
         if (identifiers.Any(value => !IdentifierPattern().IsMatch(value))) throw new InvalidDataException($"Unsafe OData identifier in entity '{entity.EntityCode}'.");
