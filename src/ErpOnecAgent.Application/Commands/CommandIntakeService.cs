@@ -12,7 +12,12 @@ public sealed record CommandIntakeResult(
     bool Acknowledged,
     Exception? AckError);
 
-public sealed class CommandIntakeService(IErpClient erp, IAgentStore store)
+/// <param name="withholdReceived">
+/// Stage-only redelivery test hook: when it returns true for a freshly admitted command, the
+/// <c>received</c> acknowledgement is not sent (ERP then re-leases the command after its lease
+/// expires, and the duplicate intake acknowledges it). Null in normal operation.
+/// </param>
+public sealed class CommandIntakeService(IErpClient erp, IAgentStore store, Func<CommandEnvelope, StoreCommandOutcome, bool>? withholdReceived = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = true };
 
@@ -30,6 +35,8 @@ public sealed class CommandIntakeService(IErpClient erp, IAgentStore store)
         var outcome = await store.AdmitCommandAsync(command, receivedAtUtc, validation, cancellationToken).ConfigureAwait(false);
         Exception? ackError = null;
         var acknowledged = false;
+        if (withholdReceived?.Invoke(command, outcome) == true)
+            return new CommandIntakeResult(command.CommandId, outcome, validation, false, null);
         try
         {
             await erp.AcknowledgeReceivedAsync(command.CommandId, new CommandReceivedRequest(leaseId, receivedAtUtc, command.PayloadHash ?? string.Empty), cancellationToken).ConfigureAwait(false);

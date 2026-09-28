@@ -70,3 +70,10 @@ has a switch: `Commands:TestHoldProbeResultSeconds` (default 0, off).
 
 Tests: the switch is honoured only for `test` and is capped. A held probe result is delivered
 exactly once, after the hold, while other results are not held.
+
+**`r2` extension** (`to-onec/0047`). ERP re-leases a command only when its `received` has not arrived: after
+`received`, the command stays with the agent. So while the switch is on, the lease worker also withholds the
+**first** `received` of a freshly admitted `integration_probe` (`COMMAND_RECEIVED_WITHHELD_FOR_TEST`). The re-lease
+after the 60 s lease is a duplicate: it is acknowledged, and the command is not executed again in 1C. The held
+result follows. Tests: the probe's `received` is sent only once, by the re-lease; other commands are never
+withheld; without a test binding nothing is withheld.

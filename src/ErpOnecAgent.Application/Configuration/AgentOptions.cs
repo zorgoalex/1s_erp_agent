@@ -94,9 +94,10 @@ public sealed class CommandOptions
     public int RetryMaxDelaySeconds { get; init; } = 300;
     public IReadOnlyList<string> SupportedTypes { get; init; } = [];
     /// <summary>
-    /// Stage-only redelivery test (agent-bridge to-erp/0044, to-onec/0045): the first delivery of an
-    /// <c>integration_probe</c> result is postponed by this many seconds, so ERP's lease expires and
-    /// the same command is leased again before the result arrives. 0 (default) disables it; it is
+    /// Stage-only redelivery test (agent-bridge to-erp/0044, to-onec/0045, to-onec/0047): the first
+    /// <c>received</c> of a freshly leased <c>integration_probe</c> is withheld and the first delivery
+    /// of its result is postponed by this many seconds, so ERP's lease expires and the same command is
+    /// leased again (and acknowledged then) before the result arrives. 0 (default) disables it; it is
     /// honoured only when <c>OneC:SourceBinding:Environment</c> is <c>test</c>, and capped at 600.
     /// </summary>
     public int TestHoldProbeResultSeconds { get; init; }

@@ -17,7 +17,8 @@ public sealed class CommandLeaseWorker(
     IOptions<ErpOptions> erpOptions,
     IOptions<CommandOptions> commandOptions,
     ILogger<CommandLeaseWorker> logger,
-    CommandWorkSignals? signals = null) : BackgroundService
+    CommandWorkSignals? signals = null,
+    IOptions<OnecOptions>? onecOptions = null) : BackgroundService
 {
     // Minimum cycle for an EMPTY lease answer. A conforming ERP holds the request for
     // LongPollSeconds, so the next lease goes out at once; an endpoint that answers empty
@@ -31,7 +32,19 @@ public sealed class CommandLeaseWorker(
     private bool _idleWithoutCommandTypes;
     private bool _atCapacity;
 
-    private readonly CommandIntakeService intake = new(erp, store);
+    private readonly CommandIntakeService intake = new(erp, store, WithholdReceivedForTest(commandOptions.Value, onecOptions?.Value, logger));
+
+    // Stage-only redelivery test (to-onec/0047): with the probe result hold on, the FIRST received
+    // of an integration_probe is withheld too, so ERP re-leases the command after its lease expires.
+    private static Func<CommandEnvelope, StoreCommandOutcome, bool>? WithholdReceivedForTest(CommandOptions commands, OnecOptions? onec, ILogger logger) =>
+        ResultDeliveryWorker.ProbeHold(commands, onec) is null
+            ? null
+            : (command, outcome) =>
+            {
+                if (outcome != StoreCommandOutcome.Stored || !string.Equals(command.CommandType, ResultDeliveryWorker.ProbeCommandType, StringComparison.Ordinal)) return false;
+                logger.LogWarning("COMMAND_RECEIVED_WITHHELD_FOR_TEST CommandId={CommandId}", command.CommandId);
+                return true;
+            };
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

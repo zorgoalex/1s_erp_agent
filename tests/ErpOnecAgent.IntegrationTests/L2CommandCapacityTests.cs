@@ -231,6 +231,57 @@ public sealed class L2CommandCapacityTests : IAsyncLifetime
         Assert.Equal(1, erp.ResultCount(probe.CommandId));
     }
 
+    [Fact]
+    public async Task With_the_hold_on_the_first_received_of_a_probe_is_withheld_and_the_re_lease_acknowledges_it()
+    {
+        var signals = new CommandWorkSignals();
+        var state = ReadyState();
+        var probe = MakeEnvelope(type: "integration_probe");
+        var other = MakeEnvelope();
+        // ERP re-leases the probe after its lease expired (its received never arrived).
+        var erp = new GatingErp([probe, other, probe]);
+        using var sessions = new ErpSessionManager(erp, AgentOptions(), state);
+        using var lease = CreateLeaseWorker(erp, sessions, state, signals, capacity: 4, supportedTypes: ["synthetic", "integration_probe"],
+            hold: (2, "test"));
+
+        await lease.StartAsync(CancellationToken.None);
+        try
+        {
+            await erp.WaitForCallsAsync(4);
+        }
+        finally
+        {
+            await StopAsync(lease);
+        }
+
+        Assert.Equal(1, erp.ReceivedCount(probe.CommandId));   // only from the re-lease (duplicate)
+        Assert.Equal(1, erp.ReceivedCount(other.CommandId));   // never withheld
+    }
+
+    [Fact]
+    public async Task Without_a_test_binding_the_received_of_a_probe_is_never_withheld()
+    {
+        var signals = new CommandWorkSignals();
+        var state = ReadyState();
+        var probe = MakeEnvelope(type: "integration_probe");
+        var erp = new GatingErp([probe]);
+        using var sessions = new ErpSessionManager(erp, AgentOptions(), state);
+        using var lease = CreateLeaseWorker(erp, sessions, state, signals, capacity: 4, supportedTypes: ["integration_probe"],
+            hold: (90, "production"));
+
+        await lease.StartAsync(CancellationToken.None);
+        try
+        {
+            await erp.WaitForCallsAsync(2);
+        }
+        finally
+        {
+            await StopAsync(lease);
+        }
+
+        Assert.Equal(1, erp.ReceivedCount(probe.CommandId));
+    }
+
     // ---- helpers ----
 
     private static AgentRuntimeState ReadyState()
@@ -242,17 +293,19 @@ public sealed class L2CommandCapacityTests : IAsyncLifetime
         return state;
     }
 
-    private CommandLeaseWorker CreateLeaseWorker(GatingErp erp, ErpSessionManager sessions, AgentRuntimeState state, CommandWorkSignals signals, int capacity) =>
+    private CommandLeaseWorker CreateLeaseWorker(GatingErp erp, ErpSessionManager sessions, AgentRuntimeState state, CommandWorkSignals signals, int capacity,
+        string[]? supportedTypes = null, (int Seconds, string Environment)? hold = null) =>
         new(
             erp,
             _store,
             sessions,
             state,
-            new DynamicConfigurationState(Options.Create(new CommandOptions { SupportedTypes = ["synthetic"] }), Options.Create(new EtlOptions { Entities = [], IntervalMinutes = 60 })),
+            new DynamicConfigurationState(Options.Create(new CommandOptions { SupportedTypes = supportedTypes ?? ["synthetic"] }), Options.Create(new EtlOptions { Entities = [], IntervalMinutes = 60 })),
             Options.Create(new ErpOptions { RequireClientCertificate = false, LongPollSeconds = 1 }),
-            Options.Create(new CommandOptions { MaxConcurrency = capacity, SupportedTypes = ["synthetic"] }),
+            Options.Create(new CommandOptions { MaxConcurrency = capacity, SupportedTypes = supportedTypes ?? ["synthetic"], TestHoldProbeResultSeconds = hold?.Seconds ?? 0 }),
             NullLogger<CommandLeaseWorker>.Instance,
-            signals);
+            signals,
+            Options.Create(new OnecOptions { SourceBinding = new OnecSourceBindingOptions { Environment = hold?.Environment ?? "test" } }));
 
     private CommandExecutionWorker CreateExecutionWorker(AgentRuntimeState state, CommandWorkSignals signals, int capacity)
     {
@@ -332,7 +385,15 @@ public sealed class L2CommandCapacityTests : IAsyncLifetime
         public Task<SessionStartResponse> StartSessionAsync(SessionStartRequest request, CancellationToken cancellationToken) =>
             Task.FromResult(new SessionStartResponse(Guid.NewGuid(), DateTimeOffset.UtcNow, true, "1.0.0", 0, false));
 
-        public Task AcknowledgeReceivedAsync(Guid commandId, CommandReceivedRequest request, CancellationToken cancellationToken) => Task.CompletedTask;
+        private readonly Dictionary<Guid, int> _received = [];
+
+        public int ReceivedCount(Guid commandId) { lock (_gate) return _received.GetValueOrDefault(commandId); }
+
+        public Task AcknowledgeReceivedAsync(Guid commandId, CommandReceivedRequest request, CancellationToken cancellationToken)
+        {
+            lock (_gate) _received[commandId] = _received.GetValueOrDefault(commandId) + 1;
+            return Task.CompletedTask;
+        }
 
         private readonly Dictionary<Guid, int> _results = [];
 
