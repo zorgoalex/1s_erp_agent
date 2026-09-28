@@ -71,7 +71,8 @@ public sealed partial class SqliteAgentStore
             SELECT b.batch_id, b.run_id, b.entity_name, b.schema_version, b.file_path, b.row_count, b.sha256,
                    (SELECT COUNT(*) FROM etl_batch_send_attempts a0 WHERE a0.batch_id=b.batch_id),
                    (SELECT rl.source_namespace FROM etl_runs rl WHERE rl.run_id=b.run_id),
-                   (SELECT rl.source_generation FROM etl_runs rl WHERE rl.run_id=b.run_id)
+                   (SELECT rl.source_generation FROM etl_runs rl WHERE rl.run_id=b.run_id),
+                   (SELECT {DeleteBatchAfterAckFlag} FROM etl_run_entities re WHERE re.run_id=b.run_id AND re.entity_name=b.entity_name)
             FROM etl_batches b
             WHERE (b.status='ready'
                    OR (b.status='retry_waiting' AND (b.next_attempt_at_utc IS NULL OR b.next_attempt_at_utc <= $now)))
@@ -93,7 +94,9 @@ public sealed partial class SqliteAgentStore
                 (int)reader.GetInt64(7),
                 // E3: the run's labels; both are immutable (migration 013 trigger), and the
                 // namespace is recorded at Begin, before any batch of the run exists.
-                NullableString(reader, 8), NullableString(reader, 9)));
+                NullableString(reader, 8), NullableString(reader, 9),
+                // Retention: the run's frozen definition decides, never the live configuration.
+                !reader.IsDBNull(10) && reader.GetInt64(10) == 1));
         }
         return batches;
     }
@@ -339,9 +342,13 @@ public sealed partial class SqliteAgentStore
     }
 
     /// <inheritdoc cref="IAgentStore.FailClaimedBatchSendAsync"/>
-    public async Task<EtlBatchSendFailureOutcome> FailClaimedBatchSendAsync(Guid batchId, Guid attemptId, string errorMessage, int? httpStatus, CancellationToken cancellationToken)
+    public async Task<EtlBatchSendFailureOutcome> FailClaimedBatchSendAsync(Guid batchId, Guid attemptId, string errorMessage, int? httpStatus, CancellationToken cancellationToken, string? refusalCode = null)
     {
         var diagnostic = string.IsNullOrWhiteSpace(errorMessage) ? "uncertain send outcome" : errorMessage;
+        // A definitive ERP refusal (ENTITY_REVOKED) is not an uncertain outcome: the attempt is
+        // recorded rejected and the run is blocked with the refusal code - still never resent.
+        var runCode = refusalCode ?? QuarantineUploadOutcomeUnknown;
+        var attemptOutcome = refusalCode is null ? "unknown" : "rejected_ack";
 
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
@@ -376,14 +383,14 @@ public sealed partial class SqliteAgentStore
             // There is no resend: absence of a response is never proof of no remote
             // effect.
             var marked = await ExecuteAsync(connection, transaction,
-                "UPDATE etl_batch_send_attempts SET outcome='unknown', finished_at_utc=$now, http_status=$http, last_error=$error WHERE attempt_id=$attempt AND batch_id=$batch AND outcome='admitted';",
-                cancellationToken, ("$attempt", attemptText), ("$batch", batchText), ("$now", now), ("$http", httpStatus), ("$error", $"{QuarantineUploadOutcomeUnknown}: {diagnostic}")).ConfigureAwait(false);
+                "UPDATE etl_batch_send_attempts SET outcome=$outcome, finished_at_utc=$now, http_status=$http, last_error=$error WHERE attempt_id=$attempt AND batch_id=$batch AND outcome='admitted';",
+                cancellationToken, ("$outcome", attemptOutcome), ("$attempt", attemptText), ("$batch", batchText), ("$now", now), ("$http", httpStatus), ("$error", $"{runCode}: {diagnostic}")).ConfigureAwait(false);
             if (marked != 1) throw new InvalidOperationException($"ETL send attempt {attemptId:D} left 'admitted' mid-transaction.");
             var runId = await ReadBatchRunIdAsync(connection, transaction, batchId, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidOperationException($"ETL batch {batchId:D} vanished mid-transaction.");
-            await CommitUploadBlockAsync(connection, transaction, runId, batchId, QuarantineUploadOutcomeUnknown, QuarantineUploadOutcomeUnknown, diagnostic, now, cancellationToken).ConfigureAwait(false);
+            await CommitUploadBlockAsync(connection, transaction, runId, batchId, runCode, refusalCode is null ? QuarantineUploadOutcomeUnknown : QuarantineRunBlocked, diagnostic, now, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlBatchSendFailureOutcome.Blocked(QuarantineUploadOutcomeUnknown, diagnostic);
+            return new EtlBatchSendFailureOutcome.Blocked(runCode, diagnostic);
         }
 
         // Late outcome on a dead fence: the still-'admitted' attempt records 'unknown'
@@ -392,15 +399,15 @@ public sealed partial class SqliteAgentStore
         // uploading->ready, MarkBatchRetryAsync), the batch is quarantined and its run
         // blocked in the same commit — an uncertain send is never left re-sendable.
         var late = await ExecuteAsync(connection, transaction,
-            "UPDATE etl_batch_send_attempts SET outcome='unknown', finished_at_utc=$now, http_status=$http, last_error=$error WHERE attempt_id=$attempt AND batch_id=$batch AND outcome='admitted';",
-            cancellationToken, ("$attempt", attemptText), ("$batch", batchText), ("$now", now), ("$http", httpStatus), ("$error", $"{QuarantineUploadOutcomeUnknown}: {diagnostic}")).ConfigureAwait(false);
+            "UPDATE etl_batch_send_attempts SET outcome=$outcome, finished_at_utc=$now, http_status=$http, last_error=$error WHERE attempt_id=$attempt AND batch_id=$batch AND outcome='admitted';",
+            cancellationToken, ("$outcome", attemptOutcome), ("$attempt", attemptText), ("$batch", batchText), ("$now", now), ("$http", httpStatus), ("$error", $"{runCode}: {diagnostic}")).ConfigureAwait(false);
         if (late != 1) throw new InvalidOperationException($"ETL send attempt {attemptId:D} left 'admitted' mid-transaction.");
         var lateRunId = await ReadBatchRunIdAsync(connection, transaction, batchId, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException($"ETL batch {batchId:D} vanished mid-transaction.");
-        var quarantined = await QuarantineStrayBatchAsync(connection, transaction, lateRunId, batchId, QuarantineUploadOutcomeUnknown, diagnostic, now, cancellationToken).ConfigureAwait(false);
+        var quarantined = await QuarantineStrayBatchAsync(connection, transaction, lateRunId, batchId, runCode, diagnostic, now, cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return quarantined
-            ? new EtlBatchSendFailureOutcome.Blocked(QuarantineUploadOutcomeUnknown, diagnostic)
+            ? new EtlBatchSendFailureOutcome.Blocked(runCode, diagnostic)
             : new EtlBatchSendFailureOutcome.LateOutcomeRecorded();
     }
 

@@ -382,6 +382,21 @@ public interface IAgentStore
     /// </summary>
     Task<int> BlockRunsWithMissingSpoolFilesAsync(Func<string, bool> fileExists, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Retention of sensitive entities (frozen definition <c>deleteBatchAfterAck: true</c>): every
+    /// batch of such an entity that is not yet 'deleted', with its file path and status. The
+    /// caller deletes the files it is allowed to; the rows (metadata only) stay.
+    /// </summary>
+    Task<IReadOnlyList<EtlSensitiveBatchFile>> GetSensitiveBatchFilesAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Revocation: every unfinished run (pending/running/paused/uploading/completing) whose frozen
+    /// entities include a sensitive entity (<c>deleteBatchAfterAck: true</c>) that is no longer in
+    /// <paramref name="activeEntityCodes"/> is blocked ENTITY_REVOKED in one transaction — pending
+    /// batches fenced RUN_BLOCKED, job blocked, ownership retained for R1. Returns what was blocked.
+    /// </summary>
+    Task<IReadOnlyList<EtlRevokedRun>> BlockRunsWithRevokedEntitiesAsync(IReadOnlySet<string> activeEntityCodes, CancellationToken cancellationToken);
+
     // --- O2 dark storage APIs: the durable admitted-attempt send ledger with
     // owner-fenced claim/ACK/outcome and fail-closed unknown-outcome handling
     // (isolated new path; NOT wired into workers, recovery wiring, or the ERP
@@ -445,8 +460,11 @@ public interface IAgentStore
     /// A late report for a still-'admitted' attempt whose fence is already dead writes
     /// 'unknown' on the attempt only; a report for a terminal (e.g. already-acknowledged)
     /// attempt or a foreign attempt id is ClaimLost — zero writes.
+    /// With <paramref name="refusalCode"/> (a definitive ERP refusal such as ENTITY_REVOKED) the
+    /// attempt is recorded 'rejected_ack', the batch is quarantined RUN_BLOCKED and the run is
+    /// blocked with that code instead of UPLOAD_OUTCOME_UNKNOWN — equally never resent.
     /// </summary>
-    Task<EtlBatchSendFailureOutcome> FailClaimedBatchSendAsync(Guid batchId, Guid attemptId, string errorMessage, int? httpStatus, CancellationToken cancellationToken);
+    Task<EtlBatchSendFailureOutcome> FailClaimedBatchSendAsync(Guid batchId, Guid attemptId, string errorMessage, int? httpStatus, CancellationToken cancellationToken, string? refusalCode = null);
 
     /// <summary>
     /// Records the trusted precheck_failed attestation — the worker positively never

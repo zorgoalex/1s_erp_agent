@@ -134,6 +134,17 @@ public sealed class EtlUploadWorker(
             logger.LogWarning("ETL_BATCH_NOT_STORED_RETRY BatchId={BatchId} RetryIn={RetryIn} Outcome={Outcome}", due.BatchId, wait, retried);
             return true;
         }
+        if (result.Error is ErpApiException revoked && revoked.Is(System.Net.HttpStatusCode.Conflict, EntityRevoked))
+        {
+            // ERP refuses the entity outright (revoked while this batch was in flight): no resend,
+            // the run is blocked ENTITY_REVOKED (R1) and the file — sensitive data ERP will not
+            // hold — is deleted. Only the metadata stays.
+            var refused = await RecordOutcomeAsync(due.BatchId, () => store.FailClaimedBatchSendAsync(due.BatchId, claim.AttemptId,
+                $"ERP answered 409 {EntityRevoked} (requestId {revoked.RequestId})", result.HttpStatus, CancellationToken.None, EntityRevoked)).ConfigureAwait(false);
+            logger.LogWarning("ETL_BATCH_ENTITY_REVOKED BatchId={BatchId} Entity={Entity} Outcome={Outcome}", due.BatchId, due.EntityName, refused);
+            await DeleteBatchFileAsync(batch, "ETL_BATCH_FILE_DELETED_REVOKED").ConfigureAwait(false);
+            return true;
+        }
         if (result.Response is null)
         {
             var failed = await RecordOutcomeAsync(due.BatchId, () => store.FailClaimedBatchSendAsync(due.BatchId, claim.AttemptId, $"{result.Error!.GetType().Name}: {result.Error.Message}", result.HttpStatus, CancellationToken.None)).ConfigureAwait(false);
@@ -145,9 +156,31 @@ public sealed class EtlUploadWorker(
         var evidence = new EtlBatchAckEvidence(ack.Status, ack.BatchId, ack.RowsAccepted, ack.ChecksumValid, ack.AcknowledgedAtUtc);
         var acknowledged = await RecordOutcomeAsync(due.BatchId, () => store.AcknowledgeClaimedBatchAsync(due.BatchId, claim.AttemptId, evidence,
             Convert.ToHexString(SHA256.HashData(result.Response.Body)), result.Response.HttpStatus, CancellationToken.None)).ConfigureAwait(false);
-        if (acknowledged is EtlBatchAckOutcome.Acknowledged) logger.LogInformation("ETL_BATCH_ACKNOWLEDGED BatchId={BatchId}", due.BatchId);
+        if (acknowledged is EtlBatchAckOutcome.Acknowledged)
+        {
+            logger.LogInformation("ETL_BATCH_ACKNOWLEDGED BatchId={BatchId}", due.BatchId);
+            // Sensitive entity: ERP holds the data now, so the local copy goes at once instead of
+            // after the retention period. The batch stays 'acknowledged' (finalize and R1 read the
+            // row, never the file); a failed delete is retried by the retention sweep.
+            if (due.DeleteBatchAfterAck) await DeleteBatchFileAsync(batch, "ETL_BATCH_FILE_DELETED_AFTER_ACK").ConfigureAwait(false);
+        }
         else logger.LogWarning("ETL_BATCH_ACK_NOT_APPLIED BatchId={BatchId} Outcome={Outcome}", due.BatchId, acknowledged);
         return true;
+    }
+
+    internal const string EntityRevoked = "ENTITY_REVOKED";
+
+    private async Task DeleteBatchFileAsync(EtlBatch batch, string evidence)
+    {
+        try
+        {
+            await spool.DeleteAcknowledgedAsync(batch, CancellationToken.None).ConfigureAwait(false);
+            logger.LogInformation("{Evidence} BatchId={BatchId}", evidence, batch.BatchId);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "ETL_BATCH_FILE_DELETE_FAILED BatchId={BatchId} — the retention sweep retries", batch.BatchId);
+        }
     }
 
     // After the ERP call: if the outcome still cannot be recorded, the attempt stays admitted

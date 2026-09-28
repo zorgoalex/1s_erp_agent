@@ -10,6 +10,7 @@ Bootstrap-настройки находятся в `appsettings.json`. Секр�
 - `OneC.ODataBaseUrl`, `CommandApiBaseUrl` — локальные endpoints 1С.
 - `Commands.SupportedTypes` — allowlist; неизвестный тип fail-closed уходит в dead letter.
 - `Etl.Entities` — явные поля и стратегия каждой сущности; выгрузки `select *` нет.
+  - `DeleteBatchAfterAck` (по умолчанию `false`) — для чувствительных сущностей (телефоны контрагентов): файл пакета удаляется сразу после ACK ERP, остаются только метаданные. Если такая сущность пропадёт из конфигурации ERP (отзыв), незавершённые run с ней блокируются `ENTITY_REVOKED`, а все оставшиеся файлы сущности удаляются. Флаг не входит в fingerprint домена: его смена не требует новой базовой выгрузки. Подробности: `docs/remediation/revocation-retention-e3b.md`.
 - `Etl.SafetyLagSeconds` — отступ верхней границы окна от текущего времени; `RunOnStartup` управляет немедленным запуском после старта.
 - `Etl.MaxConcurrentBatchUploads` — независимый предел параллельной доставки batch.
 - `Storage.MaxSpoolBytes`, `MaxSqliteBytes`, `MaxBatchCompressedBytes` — backpressure и диагностические пределы локального хранения.

@@ -44,6 +44,20 @@ public sealed class EtlEntityFilterTests
     }
 
     [Fact]
+    public void The_retention_flag_is_serialized_only_when_set_and_never_changes_the_domain()
+    {
+        var sensitive = Phones with { DeleteBatchAfterAck = true };
+        var json = JsonSerializer.Serialize(sensitive, Web);
+        var plain = JsonSerializer.Serialize(Phones, Web);
+
+        Assert.DoesNotContain("deleteBatchAfterAck", plain, StringComparison.Ordinal);
+        Assert.True(JsonDocument.Parse(json).RootElement.GetProperty("deleteBatchAfterAck").GetBoolean());
+        Assert.True(JsonSerializer.Deserialize<EtlEntityDefinition>(json, Web)!.DeleteBatchAfterAck);
+        // Retention is local file handling, not the data read: toggling it keeps the watermark domain.
+        Assert.Equal(EtlDomainFingerprint.Compute("ns", Phones.EntityCode, plain, "bootstrap_full"), EtlDomainFingerprint.Compute("ns", Phones.EntityCode, json, "bootstrap_full"));
+    }
+
+    [Fact]
     public async Task The_filter_applies_to_the_data_read_the_count_and_the_key_pass()
     {
         var handler = new Handler();

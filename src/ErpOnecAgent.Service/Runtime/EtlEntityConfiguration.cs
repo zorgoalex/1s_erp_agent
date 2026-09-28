@@ -36,6 +36,7 @@ public static class EtlEntityConfiguration
         public List<string>? KeyFields { get; set; }
         public string? UpdatedAtEdmType { get; set; }
         public string? Filter { get; set; }
+        public bool? DeleteBatchAfterAck { get; set; }
 
         // Missing required values become empty ones, which the startup validation rejects.
         public EtlEntityDefinition ToDefinition() => new(
@@ -53,6 +54,7 @@ public static class EtlEntityConfiguration
             Enabled ?? true,
             KeyFields,
             UpdatedAtEdmType ?? "Edm.DateTimeOffset",
-            string.IsNullOrWhiteSpace(Filter) ? null : Filter);
+            string.IsNullOrWhiteSpace(Filter) ? null : Filter,
+            DeleteBatchAfterAck ?? false);
     }
 }

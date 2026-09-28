@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ErpOnecAgent.Application.Configuration;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace ErpOnecAgent.IntegrationTests;
@@ -32,6 +33,45 @@ public sealed class RemoteEntityNamingTests
         Assert.Equal(3, entity.ODataVersion);
         Assert.Null(entity.UpdatedAtField);
         Assert.Equal("0b9f3c2e-4f7a-4d33-9a58-0f6f2c1d9e10", configuration.SourceGeneration);
+    }
+
+    [Theory]
+    [InlineData(",\"deleteBatchAfterAck\":true", true)]
+    [InlineData(",\"deleteBatchAfterAck\":false", false)]
+    [InlineData("", false)]
+    public void The_remote_retention_flag_binds_and_defaults_to_keeping_files(string field, bool expected)
+    {
+        var json = $$"""
+            {"mode":"Normal","commandTypes":[],"etlIntervalMinutes":60,
+             "etlEntities":[{"entityCode":"counterparty_phones","oDataPath":"Catalog_X","keyField":"Ref_Key","updatedAtField":null,
+               "deletedField":null,"select":["Ref_Key"],"syncMode":"manual_only","pageSize":500,"overlapMinutes":0{{field}}}]}
+            """;
+
+        var configuration = JsonSerializer.Deserialize<RemoteAgentConfiguration>(json, RemoteOptions)!;
+
+        Assert.Equal(expected, Assert.Single(configuration.EtlEntities).DeleteBatchAfterAck);
+    }
+
+    [Fact]
+    public void The_appsettings_retention_flag_binds()
+    {
+        var settings = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Etl:Entities:0:EntityCode"] = "counterparty_phones",
+            ["Etl:Entities:0:ODataPath"] = "Catalog_X",
+            ["Etl:Entities:0:KeyField"] = "Ref_Key",
+            ["Etl:Entities:0:Select:0"] = "Ref_Key",
+            ["Etl:Entities:0:DeleteBatchAfterAck"] = "true",
+            ["Etl:Entities:1:EntityCode"] = "items",
+            ["Etl:Entities:1:ODataPath"] = "Catalog_Y",
+            ["Etl:Entities:1:KeyField"] = "Ref_Key",
+            ["Etl:Entities:1:Select:0"] = "Ref_Key",
+        }).Build();
+
+        var entities = ErpOnecAgent.Service.Runtime.EtlEntityConfiguration.Read(settings);
+
+        Assert.True(entities[0].DeleteBatchAfterAck);
+        Assert.False(entities[1].DeleteBatchAfterAck);
     }
 
     [Theory]

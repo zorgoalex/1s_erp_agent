@@ -26,7 +26,13 @@ public sealed record EtlEntityDefinition(
     // to the data read, $count and the V1 key pass alike. Part of the definition, so part of the
     // domain fingerprint. Null: the whole set — and then NOT serialized, so every existing
     // definition JSON (and its fingerprint) stays byte-identical.
-    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Filter = null);
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Filter = null,
+    // Retention for sensitive entities (counterparty phones): the spool file of a batch is
+    // deleted right after ERP's ACK instead of after AcknowledgedBatchRetentionDays; only the
+    // metadata stays. When such an entity is revoked (dropped from the configuration) every
+    // remaining file of it is deleted. Not part of the data domain (EtlDomainFingerprint drops
+    // it), and false is NOT serialized, so every existing definition JSON stays byte-identical.
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)] bool DeleteBatchAfterAck = false);
 
 public static class EtlEntityDefinitionExtensions
 {

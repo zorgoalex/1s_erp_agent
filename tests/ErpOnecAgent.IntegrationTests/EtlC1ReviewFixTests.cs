@@ -482,8 +482,10 @@ public sealed class EtlC1ReviewFixTests : IAsyncLifetime
         return (runId, batches);
     }
 
+    // "phones" is the sensitive entity of the retention tests (deleteBatchAfterAck).
     private static EtlEntityDefinition Entity(string code) =>
-        new(code, "Catalog_" + code, "Ref_Key", "UpdatedAt", "DeletionMark", ["Ref_Key", "UpdatedAt", "DeletionMark"], "incremental", 500, 10);
+        new(code, "Catalog_" + code, "Ref_Key", "UpdatedAt", "DeletionMark", ["Ref_Key", "UpdatedAt", "DeletionMark"], "incremental", 500, 10,
+            DeleteBatchAfterAck: code == "phones");
 
     private static EtlEntityExtractionRequest Request(string entity) =>
         new(entity, JsonSerializer.Serialize(Entity(entity), JsonOptions), SourceNamespace, QueryMode,
@@ -573,6 +575,8 @@ public sealed class EtlC1ReviewFixTests : IAsyncLifetime
     [InlineData(503, null)]
     [InlineData(503, "SOMETHING_ELSE")]
     [InlineData(500, "BATCH_NOT_STORED_RETRYABLE")]
+    [InlineData(409, "BATCH_CONFLICT")]
+    [InlineData(422, "ENTITY_REVOKED")]
     public async Task E2_any_other_failure_after_sending_still_quarantines_the_batch(int status, string? code)
     {
         var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
@@ -627,6 +631,146 @@ public sealed class EtlC1ReviewFixTests : IAsyncLifetime
 
         var next = DateTimeOffset.Parse((await ScalarStringAsync($"SELECT next_attempt_at_utc FROM etl_batches WHERE batch_id='{batchId:D}'"))!, System.Globalization.CultureInfo.InvariantCulture);
         Assert.True(next <= DateTimeOffset.UtcNow + TimeSpan.FromMinutes(16), $"next attempt {next:O}");
+    }
+
+    // ---------- Retention / revocation of sensitive entities (to-erp/0031, to-onec/0030) ----------
+
+    [Fact]
+    public async Task Retention_a_sensitive_batch_file_is_deleted_right_after_the_ack_and_its_row_stays()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (_, phones) = await SealedRunWithFileAsync(spool, "phones");
+        var (_, clients) = await SealedRunWithFileAsync(spool, "clients");
+
+        await UploadWorker(_store, spool, new FakeErpClient()).RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal("acknowledged", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{phones[0].BatchId:D}'"));
+        Assert.Equal(3, await ScalarAsync($"SELECT row_count FROM etl_batches WHERE batch_id='{phones[0].BatchId:D}'"));
+        Assert.False(File.Exists(phones[0].FilePath));
+        // An ordinary entity keeps its file until the retention period.
+        Assert.Equal("acknowledged", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{clients[0].BatchId:D}'"));
+        Assert.True(File.Exists(clients[0].FilePath));
+    }
+
+    [Fact]
+    public async Task Retention_entity_revoked_on_a_batch_blocks_the_run_deletes_the_file_and_never_resends()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (runId, batches) = await SealedRunWithFileAsync(spool, "phones", batchCount: 2);
+        var erp = new FakeErpClient
+        {
+            Handler = (_, _, _) => Task.FromException<BatchUploadResponse>(new ErpApiException(System.Net.HttpStatusCode.Conflict, "ENTITY_REVOKED", null, "req-1"))
+        };
+        var worker = UploadWorker(_store, spool, erp);
+
+        await worker.RunOnceAsync(CancellationToken.None);
+        var sentFirst = erp.UploadCalls;
+        await worker.RunOnceAsync(CancellationToken.None);
+
+        // Batches already in flight in the same pass may be refused too; nothing is ever resent.
+        Assert.Equal(sentFirst, erp.UploadCalls);
+        Assert.Equal(erp.UploadedBatchIds.Count, erp.UploadedBatchIds.Distinct().Count());
+        Assert.Equal("blocked", await ScalarStringAsync($"SELECT status FROM etl_runs WHERE run_id='{runId:D}'"));
+        Assert.Equal("ENTITY_REVOKED", await ScalarStringAsync($"SELECT finalize_conflict_code FROM etl_runs WHERE run_id='{runId:D}'"));
+        foreach (var sent in erp.UploadedBatchIds)
+        {
+            Assert.Equal("rejected_ack", await ScalarStringAsync($"SELECT outcome FROM etl_batch_send_attempts WHERE batch_id='{sent:D}'"));
+            Assert.StartsWith("ENTITY_REVOKED", await ScalarStringAsync($"SELECT last_error FROM etl_batch_send_attempts WHERE batch_id='{sent:D}'"));
+            Assert.False(File.Exists(batches.Single(b => b.BatchId == sent).FilePath));
+        }
+        Assert.Equal(2, await ScalarAsync($"SELECT COUNT(*) FROM etl_batches WHERE run_id='{runId:D}' AND status='dead_letter'"));
+        // Any unsent sibling is gone after the next retention sweep (the entity is sensitive).
+        await PublishRemoteConfigurationAsync("clients");
+        await RetentionWorker(spool).SweepAsync(CancellationToken.None);
+        Assert.All(batches, batch => Assert.False(File.Exists(batch.FilePath)));
+    }
+
+    [Fact]
+    public async Task Retention_revocation_blocks_unfinished_runs_of_the_entity_and_deletes_every_remaining_file()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (sealedRun, phoneBatches) = await SealedRunWithFileAsync(spool, "phones");
+        var (clientsRun, clientBatches) = await SealedRunWithFileAsync(spool, "clients");
+        var (pendingRun, _) = await NewPendingJobRunAsync(QueryMode, ["clients", "phones"]);
+        await PublishRemoteConfigurationAsync("clients");
+
+        var sweep = await RetentionWorker(spool).SweepAsync(CancellationToken.None);
+
+        Assert.Equal(2, sweep.BlockedRuns);
+        Assert.Equal(1, sweep.DeletedFiles);
+        foreach (var run in new[] { sealedRun, pendingRun })
+        {
+            Assert.Equal("blocked", await ScalarStringAsync($"SELECT status FROM etl_runs WHERE run_id='{run:D}'"));
+            Assert.Equal("ENTITY_REVOKED", await ScalarStringAsync($"SELECT finalize_conflict_code FROM etl_runs WHERE run_id='{run:D}'"));
+        }
+        Assert.Equal("blocked", await ScalarStringAsync($"SELECT status FROM etl_jobs WHERE run_id='{pendingRun:D}'"));
+        Assert.False(File.Exists(phoneBatches[0].FilePath));
+        Assert.Equal("dead_letter", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{phoneBatches[0].BatchId:D}'"));
+        // Runs without the revoked entity are untouched.
+        Assert.Equal("uploading", await ScalarStringAsync($"SELECT status FROM etl_runs WHERE run_id='{clientsRun:D}'"));
+        Assert.True(File.Exists(clientBatches[0].FilePath));
+
+        // Idempotent: a second sweep finds nothing more to do.
+        Assert.Equal(new EtlRetentionSweep(0, 0, 0), await RetentionWorker(spool).SweepAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Retention_the_local_configuration_never_revokes_and_a_live_sensitive_batch_keeps_its_file()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (runId, batches) = await SealedRunWithFileAsync(spool, "phones");
+
+        // Version 0: appsettings only (no ERP configuration yet) - never grounds for revocation.
+        var sweep = await RetentionWorker(spool).SweepAsync(CancellationToken.None);
+
+        Assert.Equal(new EtlRetentionSweep(0, 0, 0), sweep);
+        Assert.Equal("uploading", await ScalarStringAsync($"SELECT status FROM etl_runs WHERE run_id='{runId:D}'"));
+        Assert.True(File.Exists(batches[0].FilePath));
+
+        // Still configured by ERP: the ready batch has not reached ERP, so its file stays too.
+        await PublishRemoteConfigurationAsync("phones");
+        Assert.Equal(new EtlRetentionSweep(0, 0, 0), await RetentionWorker(spool).SweepAsync(CancellationToken.None));
+        Assert.True(File.Exists(batches[0].FilePath));
+    }
+
+    [Fact]
+    public async Task Retention_the_sweep_catches_up_an_acknowledged_sensitive_file_left_behind()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (_, batches) = await SealedRunWithFileAsync(spool, "phones");
+        // The file could not be deleted right after the ACK (e.g. a crash): simulate by a
+        // spool that refuses the first delete.
+        var refusing = new RefuseDeleteSpoolStore(spool);
+        await UploadWorker(_store, refusing, new FakeErpClient()).RunOnceAsync(CancellationToken.None);
+        Assert.Equal("acknowledged", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batches[0].BatchId:D}'"));
+        Assert.True(File.Exists(batches[0].FilePath));
+
+        var sweep = await RetentionWorker(spool).SweepAsync(CancellationToken.None);
+
+        Assert.Equal(1, sweep.DeletedFiles);
+        Assert.False(File.Exists(batches[0].FilePath));
+        Assert.Equal("acknowledged", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batches[0].BatchId:D}'"));
+    }
+
+    private EtlRetentionWorker RetentionWorker(ISpoolStore spool) =>
+        new(_store, spool, _configuration, _state, NullLogger<EtlRetentionWorker>.Instance);
+
+    private Task PublishRemoteConfigurationAsync(params string[] entities)
+    {
+        var remote = new RemoteAgentConfiguration { Mode = "Normal", CommandTypes = [], EtlEntities = entities.Select(Entity).ToList(), EtlIntervalMinutes = 60 };
+        _configuration.Publish(_configuration.Prepare(_configuration.Version + 1, remote), _state);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Spool whose deletes fail with a sharing violation (the file stays).</summary>
+    private sealed class RefuseDeleteSpoolStore(ISpoolStore inner) : ISpoolStore
+    {
+        public Task<Stream> OpenReadAsync(EtlBatch batch, CancellationToken cancellationToken) => inner.OpenReadAsync(batch, cancellationToken);
+        public Task<EtlBatch> WriteBatchAsync(Guid runId, EtlEntityDefinition entity, IReadOnlyList<JsonElement> rows, EtlCursor? watermarkFrom, EtlCursor? watermarkTo, CancellationToken cancellationToken) =>
+            inner.WriteBatchAsync(runId, entity, rows, watermarkFrom, watermarkTo, cancellationToken);
+        public Task<long> GetSizeAsync(CancellationToken cancellationToken) => inner.GetSizeAsync(cancellationToken);
+        public Task QuarantineTemporaryFilesAsync(CancellationToken cancellationToken) => inner.QuarantineTemporaryFilesAsync(cancellationToken);
+        public Task DeleteAcknowledgedAsync(EtlBatch batch, CancellationToken cancellationToken) => throw new IOException("sharing violation");
     }
 
     private sealed class FakeErpClient : IErpClient

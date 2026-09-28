@@ -36,8 +36,20 @@ public static class EtlDomainFingerprint
     {
         using var definition = JsonDocument.Parse(entityDefinitionJson);
         var tuple = JsonSerializer.SerializeToElement(
-            new { cursorClass = CursorClass(queryMode), definition = definition.RootElement, entity = entityName, source = sourceNamespace });
+            new { cursorClass = CursorClass(queryMode), definition = DomainPart(definition.RootElement), entity = entityName, source = sourceNamespace });
         return PayloadHasher.Compute(tuple);
+    }
+
+    /// <summary>Definition properties that govern local file retention, not the data read: toggling them never changes the domain.</summary>
+    public static readonly IReadOnlySet<string> RetentionProperties = new HashSet<string>(StringComparer.Ordinal) { "deleteBatchAfterAck" };
+
+    // A definition without a retention property is hashed as-is (existing fingerprints unchanged).
+    private static JsonElement DomainPart(JsonElement definition)
+    {
+        if (definition.ValueKind != JsonValueKind.Object || !definition.EnumerateObject().Any(static p => RetentionProperties.Contains(p.Name))) return definition;
+        var node = System.Text.Json.Nodes.JsonObject.Create(definition)!;
+        foreach (var name in RetentionProperties) node.Remove(name);
+        return JsonSerializer.SerializeToElement(node);
     }
 
     /// <summary>Supported modes share one cursor class; anything else stays distinct (and is rejected by Begin anyway).</summary>

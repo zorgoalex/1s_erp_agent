@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ERP 1C Agent API
-  version: 1.4.0
+  version: 1.5.0
   description: >-
     Outbound-only API consumed by ErpOnecAgent. Production transport requires mTLS.
     1.1.0 (2026-09-28) reflects the decisions agreed over agent-bridge (to-erp/0001-0009,
@@ -68,7 +68,9 @@ paths:
         Any non-2xx after the request was sent is an unknown outcome for the agent (the batch is
         quarantined and the run blocked; resolution via R1), EXCEPT 503 BATCH_NOT_STORED_RETRYABLE,
         which attests nothing was stored: the agent resends the same batch (same batchId and
-        Idempotency-Key) after max(Retry-After, backoff), capped at 15 min, within 5 attempts.
+        Idempotency-Key) after max(Retry-After, backoff), capped at 15 min, within 5 attempts,
+        and 409 ENTITY_REVOKED (1.5.0), a definitive refusal: the attempt is recorded rejected,
+        the batch file is deleted and the run is blocked ENTITY_REVOKED (R1) — never resent.
       parameters:
         - { name: Idempotency-Key, in: header, required: true, schema: { type: string, format: uuid } }
         - { name: X-Content-SHA256, in: header, required: true, schema: { type: string } }
@@ -446,6 +448,16 @@ components:
             counterparty_phones. Applied to the data read (parenthesised, ANDed with date bounds),
             to $count and to the V1 key pass. Part of the definition, hence of the domain
             fingerprint; omit it (or null) for the whole set.
+        deleteBatchAfterAck:
+          type: boolean
+          default: false
+          description: >-
+            1.5.0. Retention for sensitive entities (counterparty_phones): the agent deletes the
+            batch file right after the ACK instead of after the retention period; only metadata
+            (ids, row counts, hashes) stays. When a later configuration no longer lists such an
+            entity (revocation), the agent blocks every unfinished run that includes it with
+            ENTITY_REVOKED and deletes every remaining file of it. Not part of the domain
+            fingerprint: toggling it never forces a new baseline.
     ApiError:
       type: object
       required: [code, message, retryable]
@@ -456,7 +468,8 @@ components:
           description: >-
             The agent reads the first top-level code within the first 4 KiB of the body and acts on
             RESULT_CONFLICT (409), BATCH_PAYLOAD_INVALID (422), SOURCE_IDENTITY_MISMATCH (409),
-            RUN_GENERATION_CLOSED (409), BATCH_NOT_STORED_RETRYABLE (503). The message is never
+            RUN_GENERATION_CLOSED (409), BATCH_NOT_STORED_RETRYABLE (503), ENTITY_REVOKED (409 on a
+            batch). The message is never
             logged or stored by the agent.
         message: { type: string }
         retryable: { type: boolean }

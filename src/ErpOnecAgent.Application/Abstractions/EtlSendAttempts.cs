@@ -31,7 +31,8 @@ public sealed record EtlDueBatchUpload(
     string Sha256,
     int PriorAttempts,
     string? SourceNamespace = null,
-    string? SourceGeneration = null);
+    string? SourceGeneration = null,
+    bool DeleteBatchAfterAck = false);
 
 /// <summary>
 /// One won send claim. <see cref="AttemptId"/> is the fresh GUID minted inside the
@@ -145,3 +146,9 @@ public abstract record EtlBatchSendRetryOutcome
     public sealed record LateOutcomeRecorded : EtlBatchSendRetryOutcome;
     public sealed record ClaimLost : EtlBatchSendRetryOutcome;
 }
+
+/// <summary>A not-yet-deleted batch of a sensitive entity (frozen <c>deleteBatchAfterAck: true</c>).</summary>
+public sealed record EtlSensitiveBatchFile(Guid BatchId, Guid RunId, string EntityName, string FilePath, string Status);
+
+/// <summary>An unfinished run blocked ENTITY_REVOKED because its frozen entities include a revoked sensitive entity.</summary>
+public sealed record EtlRevokedRun(Guid RunId, string EntityName);
