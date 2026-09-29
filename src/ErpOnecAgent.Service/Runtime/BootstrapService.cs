@@ -69,7 +69,10 @@ public sealed class BootstrapService(
         // Without EtlOptions (in-process test hosts) nothing is auto-recovered, as before A04.
         if (etlOptions?.Value.MaxAutoRecoveries is > 0 and var maxRecoveries)
         {
-            foreach (var recovered in await store.AutoRecoverInterruptedRunsAsync(maxRecoveries, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false))
+            // A run interrupted before its first read has no recorded namespace; its closing complete
+            // then carries the current binding's identity.
+            var currentNamespace = ErpOnecAgent.Application.Etl.OnecSourceBinding.TryCreate(onecOptions.Value.SourceBinding, out _)?.SourceNamespace;
+            foreach (var recovered in await store.AutoRecoverInterruptedRunsAsync(maxRecoveries, DateTimeOffset.UtcNow, cancellationToken, currentNamespace).ConfigureAwait(false))
             {
                 switch (recovered.Result)
                 {

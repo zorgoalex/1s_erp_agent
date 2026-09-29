@@ -222,7 +222,7 @@ public interface IAgentStore
     /// whose recovery chain already reached <paramref name="maxChain"/> is left for a manual R1; a run
     /// R1 refuses (e.g. an admitted send attempt) is left untouched.
     /// </summary>
-    Task<IReadOnlyList<EtlAutoRecovery>> AutoRecoverInterruptedRunsAsync(int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+    Task<IReadOnlyList<EtlAutoRecovery>> AutoRecoverInterruptedRunsAsync(int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken, string? currentSourceNamespace = null);
 
     /// <summary>A04b: queued closing completes of interrupted runs that are due now (status pending).</summary>
     Task<IReadOnlyList<EtlInterruptionNotice>> GetDueInterruptionNoticesAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);

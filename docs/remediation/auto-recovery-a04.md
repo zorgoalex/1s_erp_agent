@@ -69,7 +69,21 @@ to send:
 - the same identity and generation labels as a normal `complete`;
 - no new fields.
 
-With no ACK at all, ERP does not know the run, so nothing is queued.
+**When ERP knows the run.** The notice is queued when ERP knows the run. The live test
+(`to-onec/0051`) showed that ERP opens a manual run from the `start_full_sync` result, which
+carries `data.runId`, before any batch. So ERP knows the run when either holds:
+- it acknowledged a batch;
+- the command result that carries the `runId` was delivered (`results_outbox` is
+  `acknowledged`).
+
+A recovery run's synthetic job has no result, so for it only an ACK counts.
+
+**The body** lists every **frozen** entity of the run. An entity never begun is listed with
+zeros: `readScope` from its definition, `rowsRead`/`batchesCreated` 0.
+
+**The identity** comes from the run. A run interrupted before its first read has no namespace,
+so it takes the current binding (`OneC:SourceBinding`), which `BootstrapService` passes in.
+Without a binding nothing is queued.
 
 **Sending.** `EtlInterruptionNoticeWorker` sends the stored bytes through the normal H1
 `complete` call and handles the answers:
@@ -105,4 +119,9 @@ A04b tests (`EtlAutoRecoveryA04Tests`, 7 more):
 
 Schema pins moved 15→16 in the migration tests.
 
-Full suite: 981 integration + 325 unit.
+After the live test (+2):
+- a run known only from the command result is closed with zeros, every frozen entity and the
+  binding's identity;
+- without a binding it is recovered but not closed.
+
+Full suite: 983 integration + 325 unit.

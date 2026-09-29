@@ -1,5 +1,6 @@
 using System.Text.Json;
 using ErpOnecAgent.Application.Abstractions;
+using ErpOnecAgent.Domain.Etl;
 using Microsoft.Data.Sqlite;
 
 namespace ErpOnecAgent.Infrastructure.Persistence.Sqlite;
@@ -15,7 +16,7 @@ public sealed partial class SqliteAgentStore
         "none: automatic A04 recovery after a process restart; the run was interrupted during extraction and no batch send outcome was unknown";
 
     /// <inheritdoc cref="IAgentStore.AutoRecoverInterruptedRunsAsync"/>
-    public async Task<IReadOnlyList<EtlAutoRecovery>> AutoRecoverInterruptedRunsAsync(int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<EtlAutoRecovery>> AutoRecoverInterruptedRunsAsync(int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken, string? currentSourceNamespace = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxChain, 1);
         var candidates = new List<Guid>();
@@ -29,11 +30,11 @@ public sealed partial class SqliteAgentStore
 
         var outcomes = new List<EtlAutoRecovery>();
         foreach (var runId in candidates)
-            outcomes.Add(await AutoRecoverRunAsync(runId, maxChain, nowUtc, cancellationToken).ConfigureAwait(false));
+            outcomes.Add(await AutoRecoverRunAsync(runId, maxChain, nowUtc, currentSourceNamespace, cancellationToken).ConfigureAwait(false));
         return outcomes;
     }
 
-    private async Task<EtlAutoRecovery> AutoRecoverRunAsync(Guid runId, int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken)
+    private async Task<EtlAutoRecovery> AutoRecoverRunAsync(Guid runId, int maxChain, DateTimeOffset nowUtc, string? currentSourceNamespace, CancellationToken cancellationToken)
     {
         var now = nowUtc.ToUniversalTime().ToString("O");
         var runText = runId.ToString("D");
@@ -75,9 +76,9 @@ public sealed partial class SqliteAgentStore
             return new EtlAutoRecovery(runId, EtlAutoRecoveryResult.Refused, null, attempt, (resolution as EtlRunResolutionOutcome.Refused)?.Reason);
         }
 
-        // A04b: ERP already holds acknowledged batches of this run — queue the closing complete
-        // in the same commit, so ERP closes the run at once instead of abandoning it after 24 h.
-        var notice = await EnqueueInterruptionNoticeAsync(connection, transaction, runId, nowUtc, now, cancellationToken).ConfigureAwait(false);
+        // A04b: ERP knows this run — queue the closing complete in the same commit, so ERP closes
+        // the run at once instead of abandoning it after 24 h.
+        var notice = await EnqueueInterruptionNoticeAsync(connection, transaction, runId, job?.CommandId, currentSourceNamespace, nowUtc, now, cancellationToken).ConfigureAwait(false);
 
         if (job is null)
         {
@@ -117,29 +118,55 @@ public sealed partial class SqliteAgentStore
     internal const string RunInterruptedCode = "RUN_INTERRUPTED";
     private const string RunInterruptedMessage = "The agent process stopped during extraction; the work was re-queued as a new run.";
 
-    // complete v2 for an interrupted run (to-onec/0049): partial_success, EVERY entity of the run
-    // failed RUN_INTERRUPTED (so ERP publishes none of them), batchesAcknowledged exactly the
-    // acknowledged batches. Only when ERP acknowledged at least one batch — otherwise ERP does
-    // not know the run and there is nothing to close.
-    private static async Task<bool> EnqueueInterruptionNoticeAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, DateTimeOffset nowUtc, string now, CancellationToken cancellationToken)
+    // complete v2 for an interrupted run (to-onec/0049, 0051): partial_success, EVERY frozen entity
+    // of the run failed RUN_INTERRUPTED (so ERP publishes none of them; an entity never begun is
+    // listed with zeros), batchesAcknowledged exactly the acknowledged batches. Only when ERP knows
+    // the run: it acknowledged a batch, or — for a manual run — it accepted the command result
+    // that carries the runId (ERP opens the run from it). Otherwise there is nothing to close.
+    private static async Task<bool> EnqueueInterruptionNoticeAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string? jobCommandId,
+        string? currentSourceNamespace, DateTimeOffset nowUtc, string now, CancellationToken cancellationToken)
     {
+        var runText = runId.ToString("D");
         var acknowledged = await ScalarLongAsync(connection, transaction,
             "SELECT COUNT(*) FROM etl_batches WHERE run_id=$run AND status IN ('acknowledged','deleted');",
-            cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
-        if (acknowledged == 0) return false;
+            cancellationToken, ("$run", runText)).ConfigureAwait(false);
+        var resultDelivered = jobCommandId is not null && await ScalarLongAsync(connection, transaction,
+            "SELECT COUNT(*) FROM results_outbox WHERE command_id=$command AND status='acknowledged';",
+            cancellationToken, ("$command", jobCommandId)).ConfigureAwait(false) > 0;
+        if (acknowledged == 0 && !resultDelivered) return false;
+
         var run = await ReadRunRowAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
-        if (run is null || !IsSupportedExtractionMode(run.Mode) || !TryReadRunIdentity(run, out var identity)) return false;
-        var entities = await ReadEntityRowsAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false);
-        var items = new List<object>(entities.Count);
-        foreach (var entity in entities.OrderBy(static entity => entity.EntityName, StringComparer.Ordinal))
+        if (run is null || !IsSupportedExtractionMode(run.Mode)) return false;
+        // The run records its namespace at the first Begin; a run interrupted before any read has
+        // none, and then the current binding is the identity ERP knows the agent by.
+        if (!TryReadRunIdentity(run, out var identity) && run.SourceNamespace is not null) return false;
+        identity ??= ErpOnecAgent.Application.Etl.OnecSourceBinding.ParseNamespace(currentSourceNamespace);
+        if (identity is null) return false;
+
+        var frozenJson = await ScalarStringAsync(connection, transaction,
+            "SELECT COALESCE(r.resolved_entities_json, (SELECT j.entities_json FROM etl_jobs j WHERE j.run_id=r.run_id)) FROM etl_runs r WHERE r.run_id=$run;",
+            cancellationToken, ("$run", runText)).ConfigureAwait(false);
+        if (frozenJson is null) return false;
+        var frozen = JsonSerializer.Deserialize<List<EtlEntityDefinition>>(frozenJson, JsonOptions) ?? [];
+        var begun = (await ReadEntityRowsAsync(connection, transaction, runId, cancellationToken).ConfigureAwait(false))
+            .ToDictionary(static entity => entity.EntityName, StringComparer.Ordinal);
+        if (frozen.Count == 0 || begun.Keys.Any(name => frozen.All(definition => definition.EntityCode != name))) return false;
+        var items = new List<object>(frozen.Count);
+        long rowsRead = 0, batchesCreated = 0;
+        foreach (var definition in frozen.OrderBy(static definition => definition.EntityCode, StringComparer.Ordinal))
         {
-            if (ReadScope(run.Mode, entity) is not { } scope) return false;
-            items.Add(new CompletePayloadEntity(entity.EntityName, "failed", scope, entity.RowsRead, entity.BatchesCreated, RunInterruptedCode, RunInterruptedMessage, entity.SnapshotAtUtc));
+            begun.TryGetValue(definition.EntityCode, out var entity);
+            var scope = entity is null
+                ? (run.Mode != "incremental" || definition.UpdatedAtField is null ? "full" : "delta")
+                : ReadScope(run.Mode, entity);
+            if (scope is null) return false;
+            rowsRead += entity?.RowsRead ?? 0;
+            batchesCreated += entity?.BatchesCreated ?? 0;
+            items.Add(new CompletePayloadEntity(definition.EntityCode, "failed", scope, entity?.RowsRead ?? 0, entity?.BatchesCreated ?? 0, RunInterruptedCode, RunInterruptedMessage, entity?.SnapshotAtUtc));
         }
         var payload = JsonSerializer.Serialize(new CompletePayloadV2(
             runId, "partial_success", run.Mode, identity, run.SourceGeneration,
-            entities.Sum(static entity => entity.RowsRead), entities.Sum(static entity => entity.BatchesCreated), acknowledged,
-            nowUtc.ToUniversalTime(), items.Count, items), JsonOptions);
+            rowsRead, batchesCreated, acknowledged, nowUtc.ToUniversalTime(), items.Count, items), JsonOptions);
         await ExecuteAsync(connection, transaction, """
             INSERT INTO etl_run_interruption_notices(run_id,payload_json,status,attempt_count,next_attempt_at_utc,last_error,created_at_utc,updated_at_utc)
             VALUES($run,$payload,'pending',0,$now,NULL,$now,$now);

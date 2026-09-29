@@ -201,6 +201,67 @@ public sealed class EtlAutoRecoveryA04Tests : IAsyncLifetime
         Assert.Equal(retryScheduled, await ScalarStringAsync($"SELECT next_attempt_at_utc FROM etl_run_interruption_notices WHERE run_id='{runId:D}'") is not null);
     }
 
+    [Fact]
+    public async Task A_run_erp_knows_from_the_command_result_is_closed_even_without_a_batch()
+    {
+        // to-onec/0051: ERP opens a manual run from the start_full_sync result (data.runId) —
+        // before any batch. Interrupted before its first read, the run has no recorded namespace.
+        var commandId = Guid.NewGuid();
+        var (runId, _, _) = await ClaimedManualRunAsync(["clients", "orders"], generation: "gen-7", commandId: commandId);
+        await DeliveredCommandResultAsync(commandId);
+        await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
+        Assert.Equal("INTERRUPTED_NO_CHECKPOINT", await ScalarStringAsync($"SELECT finalize_conflict_code FROM etl_runs WHERE run_id='{runId:D}'"));
+
+        var outcome = Assert.Single(await _store.AutoRecoverInterruptedRunsAsync(3, DateTimeOffset.UtcNow, CancellationToken.None, SourceNamespace));
+
+        Assert.True(outcome.InterruptionNoticeQueued);
+        using var payload = JsonDocument.Parse(Assert.Single(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None)).PayloadJson);
+        var root = payload.RootElement;
+        Assert.Equal("partial_success", root.GetProperty("status").GetString());
+        Assert.Equal(0, root.GetProperty("batchesAcknowledged").GetInt64());
+        Assert.Equal(0, root.GetProperty("batchesCreated").GetInt64());
+        Assert.Equal(0, root.GetProperty("rowsRead").GetInt64());
+        Assert.Equal(2, root.GetProperty("entitiesFailed").GetInt64());
+        // Identity from the current binding (the run never recorded one).
+        Assert.Equal("11111111-1111-1111-1111-111111111111", root.GetProperty("sourceIdentity").GetProperty("databaseId").GetString());
+        // Every FROZEN entity, never begun ones included, failed RUN_INTERRUPTED with zeros.
+        var entities = root.GetProperty("entities").EnumerateArray().ToArray();
+        Assert.Equal("clients,orders", string.Join(',', entities.Select(static entity => entity.GetProperty("entity").GetString())));
+        Assert.All(entities, static entity =>
+        {
+            Assert.Equal("failed", entity.GetProperty("status").GetString());
+            Assert.Equal("RUN_INTERRUPTED", entity.GetProperty("errorCode").GetString());
+            Assert.Equal("full", entity.GetProperty("readScope").GetString());
+            Assert.Equal(0, entity.GetProperty("rowsRead").GetInt64());
+        });
+    }
+
+    [Fact]
+    public async Task A_run_erp_does_not_know_and_without_a_binding_is_not_closed()
+    {
+        var commandId = Guid.NewGuid();
+        await ClaimedManualRunAsync(["clients"], commandId: commandId);
+        await DeliveredCommandResultAsync(commandId);
+        await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
+
+        // The result reached ERP, but with no recorded namespace and no binding there is no identity to send.
+        var outcome = Assert.Single(await _store.AutoRecoverInterruptedRunsAsync(3, DateTimeOffset.UtcNow, CancellationToken.None));
+
+        Assert.Equal(EtlAutoRecoveryResult.Requeued, outcome.Result);
+        Assert.False(outcome.InterruptionNoticeQueued);
+    }
+
+    private async Task DeliveredCommandResultAsync(Guid commandId)
+    {
+        using var document = JsonDocument.Parse("{\"entities\":[]}");
+        var payload = document.RootElement.Clone();
+        await _store.StoreCommandAsync(new ErpOnecAgent.Domain.Commands.CommandEnvelope(commandId, "start_full_sync", 1, 100, null, null, DateTimeOffset.UtcNow, null, null, null,
+            ErpOnecAgent.Domain.Common.PayloadHasher.Compute(payload), payload), DateTimeOffset.UtcNow, CancellationToken.None);
+        await ExecuteSqlAsync(
+            "INSERT INTO results_outbox(result_id,command_id,payload_json,payload_hash,status,created_at_utc,acknowledged_at_utc) VALUES($id,$command,'{}','hash','acknowledged',$now,$now);",
+            ("$id", Guid.NewGuid().ToString("D")), ("$command", commandId.ToString("D")), ("$now", DateTimeOffset.UtcNow.ToString("O")));
+    }
+
     private async Task AcknowledgedBatchAsync(Guid runId, Guid claim, string entity, int rows)
     {
         var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
@@ -260,7 +321,7 @@ public sealed class EtlAutoRecoveryA04Tests : IAsyncLifetime
         await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
     }
 
-    private async Task<(Guid RunId, Guid JobId, Guid Claim)> ClaimedManualRunAsync(string[] entities, string? generation = null)
+    private async Task<(Guid RunId, Guid JobId, Guid Claim)> ClaimedManualRunAsync(string[] entities, string? generation = null, Guid? commandId = null)
     {
         var runId = Guid.NewGuid();
         var jobId = Guid.NewGuid();
@@ -270,7 +331,7 @@ public sealed class EtlAutoRecoveryA04Tests : IAsyncLifetime
             ("$run", runId.ToString("D")), ("$mode", QueryMode), ("$manifest", JsonSerializer.Serialize(entities, JsonOptions)), ("$now", now), ("$gen", generation));
         await ExecuteSqlAsync(
             "INSERT INTO etl_jobs(job_id,command_id,run_id,mode,entities_json,configuration_version,status,command_payload_hash,acceptance_result_json,created_at_utc,updated_at_utc,row_version) VALUES($job,$cmd,$run,$mode,$defs,7,'pending','hash','{}',$now,$now,1);",
-            ("$job", jobId.ToString("D")), ("$cmd", Guid.NewGuid().ToString("D")), ("$run", runId.ToString("D")), ("$mode", QueryMode),
+            ("$job", jobId.ToString("D")), ("$cmd", (commandId ?? Guid.NewGuid()).ToString("D")), ("$run", runId.ToString("D")), ("$mode", QueryMode),
             ("$defs", JsonSerializer.Serialize(entities.Select(Entity).ToArray(), JsonOptions)), ("$now", now));
         var claimed = Assert.IsType<EtlJobClaimOutcome.Claimed>(
             await _store.TryClaimEtlJobAsync(jobId, "test-dispatcher", DateTimeOffset.UtcNow.AddMinutes(5), DateTimeOffset.UtcNow, CancellationToken.None));
