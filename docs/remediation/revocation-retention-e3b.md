@@ -102,3 +102,16 @@ Tests (`EtlC1ReviewFixTests.Hygiene_*`, 2):
   is blocked, then after R1 while young, and is deleted once past the period, with its row
   kept.
 
+**Found on stage after the upgrade:** the startup backup failed once with `SQLITE_BUSY`
+(`Maintenance cycle failed`), for the first time in 18 starts.
+
+- **Cause.** `sqlite3_backup_step` answers BUSY at once while another connection holds a
+  write lock; the busy timeout does not cover it.
+- **Fixes:**
+  - `BackupAsync` retries the copy up to 5 times (250 ms × attempt);
+  - the retention sweep no longer takes a write lock every minute: the revocation check reads
+    first and opens the write transaction only when a run has something revoked.
+- **Test:** `MaintenanceBackupTests.A_backup_outlasts_a_short_writer_instead_of_failing`, where
+  a writer holds a transaction for 0.4 s during the backup. With a single attempt it fails
+  exactly like stage (`SQLite Error 5`); with retries it passes.
+

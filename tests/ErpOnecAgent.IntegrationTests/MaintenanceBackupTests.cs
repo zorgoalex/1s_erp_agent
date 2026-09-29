@@ -20,12 +20,14 @@ public sealed class MaintenanceBackupTests : IAsyncLifetime
     private readonly SqliteTestDatabase _database = new();
     private readonly string _root = Path.Combine(Path.GetTempPath(), "ErpOnecAgentTests", "backup-" + Guid.NewGuid().ToString("N"));
     private SqliteAgentStore _store = null!;
+    private SqliteConnectionFactory _factory = null!;
 
     private string BackupDirectory => Path.Combine(_root, "data", "backups");
 
     public async Task InitializeAsync()
     {
         var factory = _database.CreateFactory(Path.Combine("data", "agent.db"));
+        _factory = factory;
         _store = new SqliteAgentStore(factory, new SqliteMigrator(factory));
         await _store.InitializeAsync(CancellationToken.None);
     }
@@ -50,6 +52,28 @@ public sealed class MaintenanceBackupTests : IAsyncLifetime
         Assert.Equal("ok", await SqliteBackupVerifier.VerifyAsync(backup, CancellationToken.None));
         // One self-contained file: no .tmp, no -wal/-shm sidecars left by the verification.
         Assert.Equal(["agent-20260926-030000.db"], Directory.GetFiles(BackupDirectory).Select(static path => Path.GetFileName(path)).ToArray());
+    }
+
+    [Fact]
+    public async Task A_backup_outlasts_a_short_writer_instead_of_failing()
+    {
+        // Stage 2026-09-29: a startup backup failed with SQLITE_BUSY while another worker wrote.
+        await using var writer = await _factory.OpenAsync(CancellationToken.None);
+        await using var transaction = (Microsoft.Data.Sqlite.SqliteTransaction)await writer.BeginTransactionAsync(CancellationToken.None);
+        await using (var insert = writer.CreateCommand())
+        {
+            insert.Transaction = transaction;
+            insert.CommandText = "INSERT INTO etl_entity_snapshot_clock(entity_name,last_snapshot_at_utc) VALUES('busy-probe','2026-01-01T00:00:00.000Z');";
+            await insert.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        var destination = Path.Combine(_root, "busy", "agent.db");
+
+        var backup = _store.BackupAsync(destination, CancellationToken.None);
+        await Task.Delay(400);
+        await transaction.CommitAsync(CancellationToken.None);
+        await backup;
+
+        Assert.Equal("ok", await SqliteBackupVerifier.VerifyAsync(destination, CancellationToken.None));
     }
 
     [Fact]

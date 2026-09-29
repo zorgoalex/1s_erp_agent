@@ -38,6 +38,8 @@ public sealed partial class SqliteAgentStore
     public async Task<IReadOnlyList<EtlRevokedRun>> BlockRunsWithRevokedEntitiesAsync(IReadOnlySet<string> activeEntityCodes, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(activeEntityCodes);
+        // The sweep runs every minute: take the write lock only when a run has something revoked.
+        if (!await AnyUnfinishedRunWithRevokedEntityAsync(activeEntityCodes, cancellationToken).ConfigureAwait(false)) return [];
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
 
@@ -103,6 +105,22 @@ public sealed partial class SqliteAgentStore
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) codes.Add(reader.GetString(0));
         return codes;
+    }
+
+    // Read-only pre-check; the write transaction re-reads everything itself.
+    private async Task<bool> AnyUnfinishedRunWithRevokedEntityAsync(IReadOnlySet<string> activeEntityCodes, CancellationToken cancellationToken)
+    {
+        await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var select = connection.CreateCommand();
+        select.CommandText = """
+            SELECT COALESCE(r.resolved_entities_json, (SELECT j.entities_json FROM etl_jobs j WHERE j.run_id=r.run_id))
+            FROM etl_runs r
+            WHERE r.status IN ('pending','running','paused','uploading','completing');
+            """;
+        await using var reader = await select.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            if (!reader.IsDBNull(0) && RevokedSensitiveEntities(reader.GetString(0), activeEntityCodes).Count > 0) return true;
+        return false;
     }
 
     private static List<string> RevokedSensitiveEntities(string entitiesJson, IReadOnlySet<string> activeEntityCodes)

@@ -43,6 +43,8 @@ public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, Sq
         return Convert.ToString(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture) ?? "unknown";
     }
 
+    internal const int BackupBusyAttempts = 5;
+
     public async Task BackupAsync(string destinationPath, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -53,7 +55,21 @@ public sealed partial class SqliteAgentStore(SqliteConnectionFactory factory, Sq
         var builder = new SqliteConnectionStringBuilder { DataSource = destinationPath, Mode = SqliteOpenMode.ReadWriteCreate, Pooling = false };
         await using var destination = new SqliteConnection(builder.ToString());
         await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
-        source.BackupDatabase(destination);
+        // sqlite3_backup_step answers BUSY/LOCKED at once while another connection holds a write
+        // lock on the source — the busy timeout does not cover it. A live service always has
+        // short writers (stage 2026-09-29: a startup backup met one), so the copy is retried.
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                source.BackupDatabase(destination);
+                break;
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6 && attempt < BackupBusyAttempts)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), cancellationToken).ConfigureAwait(false);
+            }
+        }
         // The copy inherits the WAL flag from page 1. As a rollback-journal file it is one
         // self-contained file: a read-only verify creates no -wal/-shm sidecars, and rename and
         // rotation move everything. A restored copy is switched back to WAL by the migrator.
