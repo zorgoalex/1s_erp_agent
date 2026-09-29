@@ -126,6 +126,121 @@ public sealed class EtlAutoRecoveryA04Tests : IAsyncLifetime
             new EtlScheduledRunRequest("etl:incremental", "incremental", [Entity("clients")], 7), DateTimeOffset.UtcNow, CancellationToken.None));
     }
 
+    // ---------- A04b: the closing complete of an interrupted run ----------
+
+    [Fact]
+    public async Task A_closing_complete_is_queued_when_erp_acknowledged_a_batch_of_the_interrupted_run()
+    {
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients", "orders"], generation: "gen-7");
+        await AcknowledgedBatchAsync(runId, claim, "clients", rows: 3);
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("orders"), CancellationToken.None));
+        await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
+
+        var outcome = Assert.Single(await _store.AutoRecoverInterruptedRunsAsync(3, DateTimeOffset.UtcNow, CancellationToken.None));
+
+        Assert.True(outcome.InterruptionNoticeQueued);
+        var notice = Assert.Single(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None));
+        Assert.Equal(runId, notice.RunId);
+        using var payload = JsonDocument.Parse(notice.PayloadJson);
+        var root = payload.RootElement;
+        // complete v2 exactly as agreed (to-onec/0049): no extra property, every entity failed RUN_INTERRUPTED.
+        Assert.Equal(["batchesAcknowledged", "batchesCreated", "completedAtUtc", "entities", "entitiesFailed", "mode", "rowsRead", "runId", "sourceGeneration", "sourceIdentity", "status"],
+            root.EnumerateObject().Select(static property => property.Name).Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal(runId, root.GetProperty("runId").GetGuid());
+        Assert.Equal("partial_success", root.GetProperty("status").GetString());
+        Assert.Equal(QueryMode, root.GetProperty("mode").GetString());
+        Assert.Equal("gen-7", root.GetProperty("sourceGeneration").GetString());
+        Assert.Equal(1, root.GetProperty("batchesAcknowledged").GetInt64());
+        Assert.Equal(2, root.GetProperty("entitiesFailed").GetInt64());
+        var entities = root.GetProperty("entities").EnumerateArray().ToArray();
+        Assert.Equal("clients,orders", string.Join(',', entities.Select(static entity => entity.GetProperty("entity").GetString())));
+        Assert.All(entities, static entity =>
+        {
+            Assert.Equal("failed", entity.GetProperty("status").GetString());
+            Assert.Equal("RUN_INTERRUPTED", entity.GetProperty("errorCode").GetString());
+        });
+    }
+
+    [Fact]
+    public async Task No_closing_complete_is_queued_when_erp_holds_no_batch_of_the_run()
+    {
+        await InterruptedManualRunAsync(["clients"]);
+
+        var outcome = Assert.Single(await _store.AutoRecoverInterruptedRunsAsync(3, DateTimeOffset.UtcNow, CancellationToken.None));
+
+        Assert.False(outcome.InterruptionNoticeQueued);
+        Assert.Empty(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(200, null, "sent", false)]
+    [InlineData(409, "RUN_BATCHES_MISMATCH", "refused", false)]
+    [InlineData(422, "BATCH_PAYLOAD_INVALID", "refused", false)]
+    [InlineData(503, "RUN_NOT_READY", "pending", true)]
+    [InlineData(409, null, "pending", true)]
+    public async Task The_notice_worker_sends_the_exact_bytes_and_never_retries_a_coded_refusal(int status, string? code, string expectedStatus, bool retryScheduled)
+    {
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients"]);
+        await AcknowledgedBatchAsync(runId, claim, "clients", rows: 2);
+        await _store.RecoverInterruptedEtlRunsAsync(CancellationToken.None);
+        await _store.AutoRecoverInterruptedRunsAsync(3, DateTimeOffset.UtcNow, CancellationToken.None);
+        var stored = Assert.Single(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None)).PayloadJson;
+        var erp = new CompleteOnlyErp(status == 200 ? null : new ErpApiException((System.Net.HttpStatusCode)status, code, null, "req-1"));
+        var worker = new ErpOnecAgent.Service.Workers.Etl.EtlInterruptionNoticeWorker(_store, erp, ReadyState(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ErpOnecAgent.Service.Workers.Etl.EtlInterruptionNoticeWorker>.Instance);
+
+        await worker.RunOnceAsync(CancellationToken.None);
+        await worker.RunOnceAsync(CancellationToken.None);
+
+        // Exactly the stored bytes, once: a scheduled retry lies in the future, a terminal status is never re-sent.
+        var sent = Assert.Single(erp.Sent);
+        Assert.Equal(runId, sent.RunId);
+        Assert.Equal(stored, sent.Payload);
+        Assert.Equal(expectedStatus, await ScalarStringAsync($"SELECT status FROM etl_run_interruption_notices WHERE run_id='{runId:D}'"));
+        Assert.Equal(1, await ScalarAsync($"SELECT attempt_count FROM etl_run_interruption_notices WHERE run_id='{runId:D}'"));
+        Assert.Equal(retryScheduled, await ScalarStringAsync($"SELECT next_attempt_at_utc FROM etl_run_interruption_notices WHERE run_id='{runId:D}'") is not null);
+    }
+
+    private async Task AcknowledgedBatchAsync(Guid runId, Guid claim, string entity, int rows)
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request(entity), CancellationToken.None));
+        var batch = await spool.WriteBatchAsync(runId, Entity(entity), Rows(entity, rows), null, null, CancellationToken.None);
+        Assert.IsType<EtlBatchRegistrationOutcome.Registered>(await _store.RegisterGuardedEtlBatchAsync(batch, claim, CancellationToken.None));
+        var send = Assert.IsType<EtlBatchUploadClaimOutcome.Claimed>(await _store.TryClaimBatchUploadAsync(batch.BatchId, "uploader", DateTimeOffset.UtcNow, 5, CancellationToken.None));
+        Assert.IsType<EtlBatchAckOutcome.Acknowledged>(await _store.AcknowledgeClaimedBatchAsync(batch.BatchId, send.Claim.AttemptId,
+            new EtlBatchAckEvidence("acknowledged", batch.BatchId, rows, true, DateTimeOffset.UtcNow), "ack-hash", 200, CancellationToken.None));
+    }
+
+    private static ErpOnecAgent.Service.Runtime.AgentRuntimeState ReadyState()
+    {
+        var state = new ErpOnecAgent.Service.Runtime.AgentRuntimeState();
+        state.RestoreLocalEtlPause(false);
+        state.SetRemoteMode(ErpOnecAgent.Domain.Agent.AgentMode.Normal);
+        state.CompleteBootstrap();
+        return state;
+    }
+
+    private sealed class CompleteOnlyErp(Exception? failure) : IErpClient
+    {
+        public List<(Guid RunId, string Payload)> Sent { get; } = [];
+
+        public Task CompleteEtlRunRawAsync(Guid runId, string completePayloadJson, CancellationToken cancellationToken)
+        {
+            Sent.Add((runId, completePayloadJson));
+            return failure is null ? Task.CompletedTask : Task.FromException(failure);
+        }
+
+        public Task<ErpOnecAgent.Contracts.Erp.SessionStartResponse> StartSessionAsync(ErpOnecAgent.Contracts.Erp.SessionStartRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ErpOnecAgent.Contracts.Erp.LeaseResponse> LeaseCommandAsync(ErpOnecAgent.Contracts.Erp.LeaseRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task AcknowledgeReceivedAsync(Guid commandId, ErpOnecAgent.Contracts.Erp.CommandReceivedRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task AcknowledgeResultAsync(Guid commandId, string resultJson, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ErpOnecAgent.Contracts.Erp.BatchAcknowledgement> UploadBatchAsync(EtlBatch batch, Stream content, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task CompleteEtlRunAsync(Guid runId, object summary, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task SendHeartbeatAsync(ErpOnecAgent.Contracts.Erp.HeartbeatRequest request, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<ErpOnecAgent.Contracts.Erp.RemoteConfigurationResponse?> GetConfigurationAsync(long currentVersion, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
     // ---------- helpers ----------
 
     private async Task<(Guid RunId, Guid JobId, Guid Claim)> InterruptedManualRunAsync(string[] entities, string? generation = null)

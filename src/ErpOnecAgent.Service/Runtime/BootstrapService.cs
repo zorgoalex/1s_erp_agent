@@ -74,10 +74,10 @@ public sealed class BootstrapService(
                 switch (recovered.Result)
                 {
                     case EtlAutoRecoveryResult.Requeued:
-                        logger.LogWarning("ETL_RUN_AUTO_RECOVERED RunId={RunId} NewRunId={NewRunId} Attempt={Attempt} Max={Max}", recovered.RunId, recovered.NewRunId, recovered.Attempt, maxRecoveries);
+                        logger.LogWarning("ETL_RUN_AUTO_RECOVERED RunId={RunId} NewRunId={NewRunId} Attempt={Attempt} Max={Max} CloseQueued={CloseQueued}", recovered.RunId, recovered.NewRunId, recovered.Attempt, maxRecoveries, recovered.InterruptionNoticeQueued);
                         break;
                     case EtlAutoRecoveryResult.ScheduledReleased:
-                        logger.LogWarning("ETL_RUN_AUTO_RESOLVED RunId={RunId} — interrupted scheduled run resolved; the next scheduled run redoes the work", recovered.RunId);
+                        logger.LogWarning("ETL_RUN_AUTO_RESOLVED RunId={RunId} CloseQueued={CloseQueued} — interrupted scheduled run resolved; the next scheduled run redoes the work", recovered.RunId, recovered.InterruptionNoticeQueued);
                         break;
                     case EtlAutoRecoveryResult.LimitReached:
                         logger.LogError("ETL_RUN_AUTO_RECOVERY_LIMIT RunId={RunId} Attempts={Attempts} — the run keeps being interrupted; manual resolution (R1) required", recovered.RunId, recovered.Attempt);

@@ -224,6 +224,12 @@ public interface IAgentStore
     /// </summary>
     Task<IReadOnlyList<EtlAutoRecovery>> AutoRecoverInterruptedRunsAsync(int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
+    /// <summary>A04b: queued closing completes of interrupted runs that are due now (status pending).</summary>
+    Task<IReadOnlyList<EtlInterruptionNotice>> GetDueInterruptionNoticesAsync(int limit, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
+    /// <summary>A04b: records one send attempt of a pending notice (counts the attempt; Pending with the next attempt time, or a terminal status).</summary>
+    Task RecordInterruptionNoticeAsync(Guid runId, EtlInterruptionNoticeStatus status, string? lastError, DateTimeOffset? nextAttemptAtUtc, CancellationToken cancellationToken);
+
     /// <summary>
     /// D1: attested watermark domain reset — the explicit exit from DOMAIN_CHANGED and
     /// DOMAIN_UNKNOWN. Under a generation CAS and only while no active run owns the entity,

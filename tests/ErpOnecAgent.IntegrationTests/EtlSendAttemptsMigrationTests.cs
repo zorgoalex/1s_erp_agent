@@ -26,8 +26,8 @@ public sealed class EtlSendAttemptsMigrationTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _migrationSql = new string[15];
-        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql", "011_watermark_domain_resets.sql", "012_etl_partial_runs.sql", "013_etl_source_labels.sql", "014_etl_read_completeness.sql", "015_etl_snapshot_at.sql"];
+        _migrationSql = new string[16];
+        string[] names = ["001_initial.sql", "002_retry_budgets.sql", "003_ordering_claims.sql", "004_command_payload_conflicts.sql", "005_durable_etl_jobs.sql", "006_etl_finalize.sql", "007_etl_ownership.sql", "008_etl_send_attempts.sql", "009_etl_scheduled_runs.sql", "010_etl_run_resolutions.sql", "011_watermark_domain_resets.sql", "012_etl_partial_runs.sql", "013_etl_source_labels.sql", "014_etl_read_completeness.sql", "015_etl_snapshot_at.sql", "016_etl_run_interruption_notices.sql"];
         for (var index = 0; index < names.Length; index++)
         {
             _migrationSql[index] = await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory, "Migrations", names[index]));
@@ -75,8 +75,8 @@ public sealed class EtlSendAttemptsMigrationTests : IAsyncLifetime
 
         await _migrator.ApplyAsync(CancellationToken.None);
 
-        Assert.Equal(15, SqliteMigrator.CurrentSchemaVersion);
-        Assert.Equal(15, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(16, SqliteMigrator.CurrentSchemaVersion);
+        Assert.Equal(16, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
         // Every pre-existing row in every table survives byte-identical — the in-flight
         // 'uploading' batch, the blocked run, retained + released ownership, bindings.
         Assert.Equal(commandsBefore, await SnapshotRowsAsync("SELECT * FROM commands_inbox ORDER BY command_id;"));
@@ -104,8 +104,8 @@ public sealed class EtlSendAttemptsMigrationTests : IAsyncLifetime
         Assert.Equal(0, await CountAsync("SELECT COUNT(*) FROM etl_batches WHERE quarantine_code IS NOT NULL AND quarantine_code NOT IN ('UPLOAD_OUTCOME_UNKNOWN','ACK_INVALID','UPLOAD_ATTEMPTS_EXHAUSTED','RUN_BLOCKED','RUN_FAILED','SEND_LEDGER_LOST')"));
         // The single-live-admission partial unique index exists.
         Assert.Equal(1, await CountAsync("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='ux_etl_batch_send_attempts_admitted'"));
-        // Checksums 1-15 recorded canonically.
-        for (var version = 1; version <= 15; version++)
+        // Checksums 1-16 recorded canonically.
+        for (var version = 1; version <= 16; version++)
         {
             // The v1-v7 ledger was seeded with the canonical LF checksums; 008-013 are
             // appended canonically too — independent of the checkout's line endings.
@@ -133,7 +133,7 @@ public sealed class EtlSendAttemptsMigrationTests : IAsyncLifetime
 
         Assert.Equal(batchesAfterFirst, await SnapshotRowsAsync("SELECT * FROM etl_batches ORDER BY batch_id;"));
         Assert.Equal(ledgerAfterFirst, await SnapshotRowsAsync("SELECT version,name,checksum,applied_at_utc FROM schema_migrations ORDER BY version;"));
-        Assert.Equal(15, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
+        Assert.Equal(16, await CountAsync("SELECT COUNT(*) FROM schema_migrations"));
     }
 
     [Fact]

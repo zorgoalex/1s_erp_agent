@@ -55,15 +55,33 @@ and auto-recovery share it; the manual R1 behaviour is unchanged (38 R1 tests pa
 - `ETL_RUN_AUTO_RECOVERY_LIMIT`;
 - `ETL_RUN_AUTO_RECOVERY_REFUSED`.
 
-## Open: A04b
+## A04b — closing the interrupted run at ERP
 
-The interrupted run stays open at ERP until ERP's 24 h `abandoned` timer. ERP agreed
-(`to-onec/0049`) that the agent may close it right away with `complete` v2:
-- `partial_success`, every entity `failed` with `RUN_INTERRUPTED`;
-- `batchesAcknowledged` exactly the acknowledged count;
-- 503 is retried, 409 is not retried.
+Migration **016** (`etl_run_interruption_notices`, schema v16) adds a queue of closing
+completes. It was agreed with ERP in `to-onec/0049`.
 
-That needs a durable send queue and comes as a separate slice.
+**Queueing.** In the auto-recovery commit, a closing `complete` v2 is queued when ERP
+acknowledged at least one batch of the interrupted run. The body is stored as the exact bytes
+to send:
+- `partial_success`;
+- **every** entity of the run `failed` with `RUN_INTERRUPTED`, so ERP publishes none of them;
+- `batchesAcknowledged` = exactly the run's acknowledged batches;
+- the same identity and generation labels as a normal `complete`;
+- no new fields.
+
+With no ACK at all, ERP does not know the run, so nothing is queued.
+
+**Sending.** `EtlInterruptionNoticeWorker` sends the stored bytes through the normal H1
+`complete` call and handles the answers:
+
+| Answer | Result |
+|---|---|
+| 2xx | `sent` (`ETL_INTERRUPTED_RUN_CLOSED`) |
+| coded 409/422 | `refused`, never retried; ERP abandons the run after 24 h, the safe fallback |
+| 503 / transport | retried with 10 s … 10 min backoff, at most 20 attempts, then `exhausted` |
+
+ERP closes the run at once instead of abandoning it after 24 h. The per-entity alerts it raises
+close themselves when the recovery run finishes those entities.
 
 ## Tests
 
@@ -76,4 +94,15 @@ That needs a durable send queue and comes as a separate slice.
 - a run with an admitted send (`UPLOAD_OUTCOME_UNKNOWN`) is never auto-recovered;
 - an interrupted scheduled run is resolved and its schedule key is free again.
 
-Full suite: 974 integration + 325 unit.
+A04b tests (`EtlAutoRecoveryA04Tests`, 7 more):
+- with one acknowledged batch the closing body is queued with exactly the agreed properties,
+  `partial_success`, `batchesAcknowledged` 1 and both entities `failed RUN_INTERRUPTED`;
+- without an ACK nothing is queued;
+- the worker sends the exact stored bytes once:
+  - 200 → `sent`;
+  - 409/422 with a code → `refused`, no retry;
+  - 503 or an uncoded 409 → `pending` with a future retry.
+
+Schema pins moved 15→16 in the migration tests.
+
+Full suite: 981 integration + 325 unit.

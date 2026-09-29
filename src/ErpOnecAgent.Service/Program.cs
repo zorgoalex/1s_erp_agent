@@ -78,6 +78,7 @@ static async Task<int> RunAsync(string[] args)
     builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlUploadWorker>();
     builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlCompletionWorker>();
     builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlRetentionWorker>();
+    builder.Services.AddHostedService<ErpOnecAgent.Service.Workers.Etl.EtlInterruptionNoticeWorker>();
     builder.Services.AddHostedService<HealthMonitorWorker>();
     builder.Services.AddHostedService<HeartbeatWorker>();
     builder.Services.AddHostedService<MaintenanceWorker>();

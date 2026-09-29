@@ -95,4 +95,9 @@ public enum EtlAutoRecoveryResult
 }
 
 /// <summary>One outcome of <c>AutoRecoverInterruptedRunsAsync</c>.</summary>
-public sealed record EtlAutoRecovery(Guid RunId, EtlAutoRecoveryResult Result, Guid? NewRunId, int Attempt, EtlRunResolutionRefusal? RefusalReason);
+public sealed record EtlAutoRecovery(Guid RunId, EtlAutoRecoveryResult Result, Guid? NewRunId, int Attempt, EtlRunResolutionRefusal? RefusalReason, bool InterruptionNoticeQueued = false);
+
+/// <summary>A04b: a queued closing complete for an interrupted run (exact bytes to send).</summary>
+public sealed record EtlInterruptionNotice(Guid RunId, string PayloadJson, int AttemptCount);
+
+public enum EtlInterruptionNoticeStatus { Pending, Sent, Refused, Exhausted }
