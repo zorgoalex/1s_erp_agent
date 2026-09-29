@@ -21,7 +21,8 @@ public sealed class BootstrapService(
     IOptions<ErpOptions> erpOptions,
     IOptions<OnecOptions> onecOptions,
     ILogger<BootstrapService> logger,
-    SqliteConnectionFactory? database = null) : IHostedService
+    SqliteConnectionFactory? database = null,
+    IOptions<EtlOptions>? etlOptions = null) : IHostedService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = true };
 
@@ -64,6 +65,29 @@ public sealed class BootstrapService(
         if (recovery.RunsBlocked + recovery.BatchesFenced + recovery.AttemptsOrphaned + legacyBlocked + orphans + missingFiles > 0)
             logger.LogWarning("ETL_STARTUP_RECOVERY RunsBlocked={Runs} BatchesFenced={Batches} AttemptsOrphaned={Attempts} LegacyRunsBlocked={Legacy} OrphanSpoolFiles={Orphans} MissingSpoolFiles={Missing}",
                 recovery.RunsBlocked, recovery.BatchesFenced, recovery.AttemptsOrphaned, legacyBlocked, orphans, missingFiles);
+        // A04: interrupted runs are resolved and their work re-queued automatically (bounded chain).
+        // Without EtlOptions (in-process test hosts) nothing is auto-recovered, as before A04.
+        if (etlOptions?.Value.MaxAutoRecoveries is > 0 and var maxRecoveries)
+        {
+            foreach (var recovered in await store.AutoRecoverInterruptedRunsAsync(maxRecoveries, DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false))
+            {
+                switch (recovered.Result)
+                {
+                    case EtlAutoRecoveryResult.Requeued:
+                        logger.LogWarning("ETL_RUN_AUTO_RECOVERED RunId={RunId} NewRunId={NewRunId} Attempt={Attempt} Max={Max}", recovered.RunId, recovered.NewRunId, recovered.Attempt, maxRecoveries);
+                        break;
+                    case EtlAutoRecoveryResult.ScheduledReleased:
+                        logger.LogWarning("ETL_RUN_AUTO_RESOLVED RunId={RunId} — interrupted scheduled run resolved; the next scheduled run redoes the work", recovered.RunId);
+                        break;
+                    case EtlAutoRecoveryResult.LimitReached:
+                        logger.LogError("ETL_RUN_AUTO_RECOVERY_LIMIT RunId={RunId} Attempts={Attempts} — the run keeps being interrupted; manual resolution (R1) required", recovered.RunId, recovered.Attempt);
+                        break;
+                    default:
+                        logger.LogWarning("ETL_RUN_AUTO_RECOVERY_REFUSED RunId={RunId} Reason={Reason} — manual resolution (R1) required", recovered.RunId, recovered.RefusalReason);
+                        break;
+                }
+            }
+        }
         await localPause.RestoreAsync(cancellationToken).ConfigureAwait(false);
         var active = await store.GetActiveConfigSnapshotAsync(cancellationToken).ConfigureAwait(false);
         if (active is not null)

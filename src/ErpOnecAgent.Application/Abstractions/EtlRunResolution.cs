@@ -80,3 +80,19 @@ public abstract record EtlRunResolutionOutcome
     public sealed record AlreadyResolved(EtlRunResolutionRecord Record, bool SameRequest) : EtlRunResolutionOutcome;
     public sealed record Refused(EtlRunResolutionRefusal Reason) : EtlRunResolutionOutcome;
 }
+
+/// <summary>A04: what the startup auto-recovery did with one interrupted run.</summary>
+public enum EtlAutoRecoveryResult
+{
+    /// <summary>Resolved (R1, system operator) and the same work queued as a new run.</summary>
+    Requeued,
+    /// <summary>A scheduled run: resolved; its schedule key is free for the next scheduled run.</summary>
+    ScheduledReleased,
+    /// <summary>The chain of recoveries reached the limit; the run waits for a manual R1.</summary>
+    LimitReached,
+    /// <summary>R1 refused (e.g. an admitted send attempt); nothing was written.</summary>
+    Refused
+}
+
+/// <summary>One outcome of <c>AutoRecoverInterruptedRunsAsync</c>.</summary>
+public sealed record EtlAutoRecovery(Guid RunId, EtlAutoRecoveryResult Result, Guid? NewRunId, int Attempt, EtlRunResolutionRefusal? RefusalReason);

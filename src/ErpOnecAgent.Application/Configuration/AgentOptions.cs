@@ -134,6 +134,13 @@ public sealed class EtlOptions
     /// <summary>Set after binding by the service (EtlEntityConfiguration): the binder cannot build the positional record reliably.</summary>
     public IReadOnlyList<EtlEntityDefinition> Entities { get; set; } = [];
     /// <summary>
+    /// A04: at startup an interrupted run (INTERRUPTED_NO_CHECKPOINT, no unknown send outcome) is
+    /// resolved by the agent and, for a manual job, re-queued as a new run with the same frozen
+    /// entities. This bounds the chain of such recoveries of one original run; 0 disables it (the
+    /// run then waits for a manual R1 as before).
+    /// </summary>
+    public int MaxAutoRecoveries { get; init; } = 3;
+    /// <summary>
     /// V1: verify every full read (readScope "full") with $count before and after and an
     /// independent key-only pass; the verdict goes into complete as completeness. A failed or
     /// impossible check never fails the entity — it only marks it unverified.

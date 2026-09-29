@@ -215,6 +215,16 @@ public interface IAgentStore
     Task<EtlRunResolutionOutcome> ResolveEtlRunAsync(EtlRunResolutionRequest request, DateTimeOffset nowUtc, CancellationToken cancellationToken);
 
     /// <summary>
+    /// A04 startup auto-recovery (exclusive host, after <c>RecoverInterruptedEtlRunsAsync</c>): every
+    /// unresolved run blocked INTERRUPTED_NO_CHECKPOINT is resolved through R1 as the system operator
+    /// (decision retry) and — for a manual job — the same work (mode, frozen entities, configuration
+    /// version, source generation) is queued as a new pending run + job, in ONE commit per run. A run
+    /// whose recovery chain already reached <paramref name="maxChain"/> is left for a manual R1; a run
+    /// R1 refuses (e.g. an admitted send attempt) is left untouched.
+    /// </summary>
+    Task<IReadOnlyList<EtlAutoRecovery>> AutoRecoverInterruptedRunsAsync(int maxChain, DateTimeOffset nowUtc, CancellationToken cancellationToken);
+
+    /// <summary>
     /// D1: attested watermark domain reset — the explicit exit from DOMAIN_CHANGED and
     /// DOMAIN_UNKNOWN. Under a generation CAS and only while no active run owns the entity,
     /// ONE transaction archives the row verbatim (watermark_domain_resets) and removes it;

@@ -41,17 +41,25 @@ public sealed partial class SqliteAgentStore
     {
         ValidateResolutionRequest(request);
         var now = nowUtc.ToUniversalTime().ToString("O");
-        var runText = request.RunId.ToString("D");
 
         await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
         // BEGIN IMMEDIATE: concurrent resolutions of one run serialize; the loser sees the
         // committed record.
         await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        var outcome = await ResolveInTransactionAsync(connection, transaction, request, now, cancellationToken).ConfigureAwait(false);
+        if (outcome is EtlRunResolutionOutcome.Resolved) await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        else await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
+        return outcome;
+    }
 
+    // The R1 resolution inside the caller's transaction (manual R1 and A04 auto-recovery share
+    // it). Writes only when the outcome is Resolved; the caller commits or rolls back.
+    private static async Task<EtlRunResolutionOutcome> ResolveInTransactionAsync(SqliteConnection connection, SqliteTransaction transaction, EtlRunResolutionRequest request, string now, CancellationToken cancellationToken)
+    {
+        var runText = request.RunId.ToString("D");
         var existing = await ReadResolutionRecordAsync(connection, transaction, request.RunId, cancellationToken).ConfigureAwait(false);
         if (existing is not null)
         {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
             var same = existing.OperatorId == request.OperatorId && existing.Decision == request.Decision
                 && existing.RemoteVerification == request.RemoteVerification;
             return new EtlRunResolutionOutcome.AlreadyResolved(existing, same);
@@ -82,11 +90,7 @@ public sealed partial class SqliteAgentStore
             : status is not ("failed" or "blocked") || resolvedAt is not null ? EtlRunResolutionRefusal.RunNotResolvable
             : (EtlRunResolutionRefusal?)null;
         refusal ??= await ClassifyResolutionBlockerAsync(connection, transaction, runText, extractionClaim, completionClaim, cancellationToken).ConfigureAwait(false);
-        if (refusal is not null)
-        {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-            return new EtlRunResolutionOutcome.Refused(refusal.Value);
-        }
+        if (refusal is not null) return new EtlRunResolutionOutcome.Refused(refusal.Value);
 
         // Remaining pre-acknowledgement batches can never be dispatched after resolution.
         // 'uploading' is excluded by the precondition above.
@@ -118,8 +122,6 @@ public sealed partial class SqliteAgentStore
             ("$decision", DecisionText(request.Decision)), ("$verification", request.RemoteVerification), ("$status", status), ("$conflict", conflictCode),
             ("$released", released), ("$fenced", fenced)).ConfigureAwait(false);
         if (inserted != 1) throw new InvalidOperationException($"Resolution record for ETL run {request.RunId:D} was not written.");
-
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new EtlRunResolutionOutcome.Resolved(record);
     }
 

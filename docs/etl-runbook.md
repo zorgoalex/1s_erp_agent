@@ -30,7 +30,7 @@
 | `ACK_INVALID` | ERP вернул ACK, не прошедший проверку (статус, id, checksum, число строк) |
 | `UPLOAD_ATTEMPTS_EXHAUSTED` / `COMPLETION_ATTEMPTS_EXHAUSTED` | Исчерпан лимит попыток |
 | `PRECHECK_ATTESTATION_CONTRADICTED` | ERP подтвердил попытку, которая считалась неотправленной; возможна двойная доставка |
-| `INTERRUPTED_NO_CHECKPOINT` | Процесс остановился во время извлечения |
+| `INTERRUPTED_NO_CHECKPOINT` | Процесс остановился во время извлечения. С A04 при следующем старте агент сам разрешает такой run и ставит ту же работу новым run (`ETL_RUN_AUTO_RECOVERED`), не больше `Etl:MaxAutoRecoveries` раз подряд. Вручную — только после `ETL_RUN_AUTO_RECOVERY_LIMIT` или если `MaxAutoRecoveries = 0` |
 | `SOURCE_IDENTITY_CHANGED` | Во время извлечения изменилась идентичность источника 1С |
 | `BEGIN_DOMAIN_CHANGED` / `BEGIN_DOMAIN_UNKNOWN` | Сохранённый watermark относится к другому домену (другой источник или определение) или не имеет fingerprint |
 | `DISK_RESERVE` | Запись в spool упёрлась бы в резерв диска для команд |
