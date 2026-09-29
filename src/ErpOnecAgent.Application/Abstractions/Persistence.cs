@@ -420,6 +420,17 @@ public interface IAgentStore
     /// </summary>
     Task<IReadOnlyList<EtlRevokedRun>> BlockRunsWithRevokedEntitiesAsync(IReadOnlySet<string> activeEntityCodes, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Spool hygiene: every dead-lettered batch (never delivered: quarantined upload, fenced by a
+    /// blocked, failed or resolved run) with its file path, creation time, whether its run is
+    /// closed (resolved through R1, or failed/cancelled/succeeded/partial_success) and whether its
+    /// frozen definition is sensitive (<c>deleteBatchAfterAck</c>). The caller deletes files; rows stay.
+    /// </summary>
+    Task<IReadOnlyList<EtlDeadLetterBatchFile>> GetDeadLetterBatchFilesAsync(CancellationToken cancellationToken);
+
+    /// <summary>Spool hygiene: entity codes any run froze as sensitive (<c>deleteBatchAfterAck</c>).</summary>
+    Task<IReadOnlySet<string>> GetSensitiveEntityCodesAsync(CancellationToken cancellationToken);
+
     // --- O2 dark storage APIs: the durable admitted-attempt send ledger with
     // owner-fenced claim/ACK/outcome and fail-closed unknown-outcome handling
     // (isolated new path; NOT wired into workers, recovery wiring, or the ERP
@@ -540,6 +551,12 @@ public interface ISpoolStore
 
     /// <summary>C1: moves every ready spool file not in <paramref name="referencedPaths"/> to quarantine (a crash between file rename and batch registration). Returns the moved count.</summary>
     Task<int> QuarantineUnreferencedReadyFilesAsync(IReadOnlySet<string> referencedPaths, CancellationToken cancellationToken) => Task.FromResult(0);
+
+    /// <summary>Spool hygiene: the files in the quarantine directory, with the entity parsed from the name (null when the name is not a batch file name) and the time they were quarantined.</summary>
+    Task<IReadOnlyList<SpoolQuarantinedFile>> GetQuarantinedFilesAsync(CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<SpoolQuarantinedFile>>([]);
+
+    /// <summary>Spool hygiene: deletes one quarantined file (the path must lie inside the spool root).</summary>
+    Task DeleteQuarantinedFileAsync(string path, CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 public interface ISecretStore

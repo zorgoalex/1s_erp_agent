@@ -752,6 +752,63 @@ public sealed class EtlC1ReviewFixTests : IAsyncLifetime
         Assert.Equal("acknowledged", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{batches[0].BatchId:D}'"));
     }
 
+    [Fact]
+    public async Task Hygiene_a_quarantined_sensitive_file_goes_at_once_other_quarantined_files_after_the_retention_period()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var quarantine = Directory.CreateDirectory(Path.Combine(_database.Root, "spool", "quarantine")).FullName;
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var old = DateTimeOffset.UtcNow.AddDays(-10).ToUnixTimeMilliseconds();
+        string Name(string entity, long at) => Path.Combine(quarantine, $"{entity}-{Guid.NewGuid():D}-{Guid.NewGuid():D}.ndjson.gz.orphan.{at}");
+        var phones = Name("phones", now);
+        var phonesTmp = Path.Combine(quarantine, $"phones-{Guid.NewGuid():D}-{Guid.NewGuid():D}.ndjson.gz.tmp.{now}");
+        var freshClients = Name("clients", now);
+        var oldClients = Name("clients", old);
+        var unknown = Path.Combine(quarantine, "notes.txt");
+        foreach (var path in new[] { phones, phonesTmp, freshClients, oldClients, unknown }) await File.WriteAllTextAsync(path, "x");
+        await PublishRemoteConfigurationAsync("clients", "phones");
+
+        var sweep = await RetentionWorker(spool).SweepAsync(CancellationToken.None);
+
+        Assert.Equal(3, sweep.QuarantinedFilesDeleted);
+        Assert.False(File.Exists(phones));
+        Assert.False(File.Exists(phonesTmp));
+        Assert.False(File.Exists(oldClients));
+        Assert.True(File.Exists(freshClients));
+        Assert.True(File.Exists(unknown)); // not a batch file name: only its age counts
+    }
+
+    [Fact]
+    public async Task Hygiene_dead_letter_files_sensitive_at_once_others_once_the_run_is_closed_and_the_period_is_over()
+    {
+        var spool = new FileSpoolStore(Path.Combine(_database.Root, "spool"));
+        var (phonesRun, phones) = await SealedRunWithFileAsync(spool, "phones");
+        var (clientsRun, clients) = await SealedRunWithFileAsync(spool, "clients");
+        // Both uploads end with an unknown outcome: batch dead_letter, run blocked (unresolved).
+        await UploadWorker(_store, spool, new FakeErpClient { Handler = (_, _, _) => Task.FromException<BatchUploadResponse>(new HttpRequestException("reset")) }).RunOnceAsync(CancellationToken.None);
+        Assert.Equal("dead_letter", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{clients[0].BatchId:D}'"));
+
+        var first = await RetentionWorker(spool).SweepAsync(CancellationToken.None);
+
+        Assert.False(File.Exists(phones[0].FilePath));   // sensitive: at once
+        Assert.True(File.Exists(clients[0].FilePath));   // blocked, unresolved: kept as evidence
+        Assert.Equal(1, first.DeletedFiles);
+
+        // Resolved through R1 but young: still kept.
+        Assert.IsType<EtlRunResolutionOutcome.Resolved>(await _store.ResolveEtlRunAsync(
+            new EtlRunResolutionRequest(clientsRun, "operator", EtlRunResolutionDecision.Abandon, "checked with ERP", true), DateTimeOffset.UtcNow, CancellationToken.None));
+        Assert.Equal(0, (await RetentionWorker(spool).SweepAsync(CancellationToken.None)).DeadLetterFilesDeleted);
+        Assert.True(File.Exists(clients[0].FilePath));
+
+        // Past the retention period: deleted; the row stays.
+        await ExecuteSqlAsync("UPDATE etl_batches SET created_at_utc=$old WHERE batch_id=$batch;",
+            ("$old", DateTimeOffset.UtcNow.AddDays(-10).ToString("O")), ("$batch", clients[0].BatchId.ToString("D")));
+        Assert.Equal(1, (await RetentionWorker(spool).SweepAsync(CancellationToken.None)).DeadLetterFilesDeleted);
+        Assert.False(File.Exists(clients[0].FilePath));
+        Assert.Equal("dead_letter", await ScalarStringAsync($"SELECT status FROM etl_batches WHERE batch_id='{clients[0].BatchId:D}'"));
+        _ = phonesRun;
+    }
+
     private EtlRetentionWorker RetentionWorker(ISpoolStore spool) =>
         new(_store, spool, _configuration, _state, NullLogger<EtlRetentionWorker>.Instance);
 

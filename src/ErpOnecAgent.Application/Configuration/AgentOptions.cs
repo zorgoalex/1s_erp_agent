@@ -157,6 +157,12 @@ public sealed class StorageOptions
     public long MinimumReservedBytesForCommands { get; init; } = 1L * 1024 * 1024 * 1024;
     public int CompletedCommandRetentionDays { get; init; } = 30;
     public int AcknowledgedBatchRetentionDays { get; init; } = 7;
+    /// <summary>
+    /// Spool hygiene: files of batches never delivered — dead-lettered batches of a closed run, and
+    /// files in spool/quarantine — are deleted after this many days. Files of sensitive entities
+    /// (deleteBatchAfterAck) are deleted at once regardless.
+    /// </summary>
+    public int FailedBatchRetentionDays { get; init; } = 7;
     public int BackupRetentionCount { get; init; } = 7;
     public int MaintenanceIntervalHours { get; init; } = 6;
 }

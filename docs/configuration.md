@@ -9,6 +9,7 @@ Bootstrap-настройки находятся в `appsettings.json`. Секр�
 - `Erp.ClientCertificateThumbprint` — thumbprint сертификата `LocalMachine\My`.
 - `OneC.ODataBaseUrl`, `CommandApiBaseUrl` — локальные endpoints 1С.
 - `Commands.SupportedTypes` — allowlist; неизвестный тип fail-closed уходит в dead letter.
+- `Storage.FailedBatchRetentionDays` (по умолчанию 7) — через сколько дней удаляются файлы недоставленных пакетов: `dead_letter` закрытого run и файлы в `spool/quarantine`. Файлы чувствительных сущностей (`deleteBatchAfterAck`) удаляются сразу.
 - `Etl.MaxAutoRecoveries` (по умолчанию 3) — A04: сколько раз подряд агент сам восстанавливает выгрузку, прерванную остановкой процесса. 0 — только ручное разрешение (R1).
 - `Etl.Entities` — явные поля и стратегия каждой сущности; выгрузки `select *` нет.
   - `DeleteBatchAfterAck` (по умолчанию `false`) — для чувствительных сущностей (телефоны контрагентов): файл пакета удаляется сразу после ACK ERP, остаются только метаданные. Если такая сущность пропадёт из конфигурации ERP (отзыв), незавершённые run с ней блокируются `ENTITY_REVOKED`, а все оставшиеся файлы сущности удаляются. Флаг не входит в fingerprint домена: его смена не требует новой базовой выгрузки. Подробности: `docs/remediation/revocation-retention-e3b.md`.

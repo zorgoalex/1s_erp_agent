@@ -152,3 +152,9 @@ public sealed record EtlSensitiveBatchFile(Guid BatchId, Guid RunId, string Enti
 
 /// <summary>An unfinished run blocked ENTITY_REVOKED because its frozen entities include a revoked sensitive entity.</summary>
 public sealed record EtlRevokedRun(Guid RunId, string EntityName);
+
+/// <summary>A dead-lettered batch file (see <c>GetDeadLetterBatchFilesAsync</c>).</summary>
+public sealed record EtlDeadLetterBatchFile(Guid BatchId, Guid RunId, string EntityName, string FilePath, DateTimeOffset CreatedAtUtc, bool RunClosed, bool Sensitive);
+
+/// <summary>A file in the spool quarantine directory; <see cref="EntityName"/> is null when the name is not a batch file name.</summary>
+public sealed record SpoolQuarantinedFile(string Path, string? EntityName, DateTimeOffset QuarantinedAtUtc);

@@ -171,6 +171,41 @@ public sealed class FileSpoolStore(string spoolRoot, long maxBatchCompressedByte
         return Task.FromResult(moved);
     }
 
+    // <entity>-<runId>-<batchId>.ndjson.gz, then ".tmp.<ms>" or ".orphan.<ms>" when quarantined.
+    private static readonly System.Text.RegularExpressions.Regex QuarantinedName = new(
+        @"^(?<entity>.+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ndjson\.gz(\.tmp)?(\.orphan)?(\.(?<ms>[0-9]{1,15}))?$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <inheritdoc cref="ISpoolStore.GetQuarantinedFilesAsync"/>
+    public Task<IReadOnlyList<SpoolQuarantinedFile>> GetQuarantinedFilesAsync(CancellationToken cancellationToken)
+    {
+        var quarantine = Path.Combine(_root, "quarantine");
+        if (!Directory.Exists(quarantine)) return Task.FromResult<IReadOnlyList<SpoolQuarantinedFile>>([]);
+        var files = new List<SpoolQuarantinedFile>();
+        foreach (var path in Directory.EnumerateFiles(quarantine, "*", SearchOption.TopDirectoryOnly))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var match = QuarantinedName.Match(Path.GetFileName(path));
+            // The quarantine time is the move time in the name; a file without one falls back to its write time.
+            var at = match.Success && match.Groups["ms"].Success && long.TryParse(match.Groups["ms"].Value, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var ms)
+                ? DateTimeOffset.FromUnixTimeMilliseconds(ms)
+                : new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
+            files.Add(new SpoolQuarantinedFile(path, match.Success ? match.Groups["entity"].Value : null, at));
+        }
+        return Task.FromResult<IReadOnlyList<SpoolQuarantinedFile>>(files);
+    }
+
+    /// <inheritdoc cref="ISpoolStore.DeleteQuarantinedFileAsync"/>
+    public Task DeleteQuarantinedFileAsync(string path, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var full = EnsureInsideRoot(path);
+        if (!string.Equals(Path.GetDirectoryName(full), Path.Combine(_root, "quarantine"), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Only files directly in the spool quarantine directory can be deleted this way.");
+        if (File.Exists(full)) File.Delete(full);
+        return Task.CompletedTask;
+    }
+
     private static object BuildEnvelope(JsonElement row, EtlEntityDefinition entity)
     {
         var sourceId = entity.SourceIdFrom(row);

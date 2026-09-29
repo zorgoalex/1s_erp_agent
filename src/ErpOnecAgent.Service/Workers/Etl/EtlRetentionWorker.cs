@@ -1,6 +1,8 @@
 using ErpOnecAgent.Application.Abstractions;
+using ErpOnecAgent.Application.Configuration;
 using ErpOnecAgent.Domain.Etl;
 using ErpOnecAgent.Service.Runtime;
+using Microsoft.Extensions.Options;
 
 namespace ErpOnecAgent.Service.Workers.Etl;
 
@@ -22,7 +24,8 @@ public sealed class EtlRetentionWorker(
     ISpoolStore spool,
     DynamicConfigurationState configuration,
     AgentRuntimeState state,
-    ILogger<EtlRetentionWorker> logger) : BackgroundService
+    ILogger<EtlRetentionWorker> logger,
+    IOptions<StorageOptions>? storageOptions = null) : BackgroundService
 {
     internal static TimeSpan Interval = TimeSpan.FromMinutes(1);
 
@@ -66,7 +69,8 @@ public sealed class EtlRetentionWorker(
         foreach (var file in files)
         {
             // A live batch of a still-configured entity keeps its file: it has not reached ERP yet.
-            if (!revokedEntities.Contains(file.EntityName) && !string.Equals(file.Status, "acknowledged", StringComparison.Ordinal)) continue;
+            // Acknowledged (ERP holds it) and dead-lettered (never delivered, never re-sent) files go.
+            if (!revokedEntities.Contains(file.EntityName) && file.Status is not ("acknowledged" or "dead_letter")) continue;
             if (!File.Exists(file.FilePath)) continue;
             try
             {
@@ -81,12 +85,69 @@ public sealed class EtlRetentionWorker(
         }
         if (deleted > 0 || failed > 0)
             logger.LogInformation("ETL_SENSITIVE_FILES_DELETED Deleted={Deleted} Failed={Failed} RevokedEntities={RevokedEntities}", deleted, failed, revokedEntities.Count);
-        return new EtlRetentionSweep(blockedRuns, deleted, failed);
+
+        var (deadLetters, quarantined, hygieneFailed) = await SweepUndeliveredFilesAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        return new EtlRetentionSweep(blockedRuns, deleted, failed + hygieneFailed, deadLetters, quarantined);
     }
+
+    // Spool hygiene: files of batches never delivered. A dead-lettered batch is never re-sent, so
+    // its file is only evidence: kept while its run is blocked and unresolved (the operator may
+    // inspect it), deleted FailedBatchRetentionDays after creation once the run is closed.
+    // Quarantined files (an unregistered or half-written batch) are deleted after the same period.
+    // Sensitive entities (deleteBatchAfterAck, frozen in any run or in the active configuration)
+    // lose these files at once — a quarantined half-written phones batch included.
+    private async Task<(int DeadLetters, int Quarantined, int Failed)> SweepUndeliveredFilesAsync(DynamicConfigurationSnapshot snapshot, CancellationToken cancellationToken)
+    {
+        var cutoff = DateTimeOffset.UtcNow.AddDays(-Math.Max(0, (storageOptions?.Value ?? new StorageOptions()).FailedBatchRetentionDays));
+        var deadLetters = 0;
+        var quarantined = 0;
+        var failed = 0;
+
+        foreach (var file in await store.GetDeadLetterBatchFilesAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (file.Sensitive || !file.RunClosed || file.CreatedAtUtc > cutoff || !File.Exists(file.FilePath)) continue;
+            if (await TryDeleteAsync(() => spool.DeleteAcknowledgedAsync(ToBatch(file), cancellationToken), file.BatchId.ToString("D")).ConfigureAwait(false)) deadLetters++;
+            else failed++;
+        }
+
+        var sensitive = (await store.GetSensitiveEntityCodesAsync(cancellationToken).ConfigureAwait(false)).Select(FileSpoolNameEntity).ToHashSet(StringComparer.Ordinal);
+        foreach (var entity in snapshot.Entities.Where(static entity => entity.DeleteBatchAfterAck)) sensitive.Add(FileSpoolNameEntity(entity.EntityCode));
+        foreach (var file in await spool.GetQuarantinedFilesAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var isSensitive = file.EntityName is not null && sensitive.Contains(file.EntityName);
+            if (!isSensitive && file.QuarantinedAtUtc > cutoff) continue;
+            if (await TryDeleteAsync(() => spool.DeleteQuarantinedFileAsync(file.Path, cancellationToken), Path.GetFileName(file.Path)).ConfigureAwait(false)) quarantined++;
+            else failed++;
+        }
+
+        if (deadLetters > 0 || quarantined > 0)
+            logger.LogInformation("ETL_UNDELIVERED_FILES_DELETED DeadLetterFiles={DeadLetters} QuarantinedFiles={Quarantined}", deadLetters, quarantined);
+        return (deadLetters, quarantined, failed);
+    }
+
+    private async Task<bool> TryDeleteAsync(Func<Task> delete, string what)
+    {
+        try
+        {
+            await delete().ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            logger.LogWarning(ex, "ETL_SPOOL_FILE_DELETE_FAILED File={File} — retried by the next sweep", what);
+            return false;
+        }
+    }
+
+    // Batch file names carry the sanitized entity code (FileSpoolStore.Sanitize).
+    private static string FileSpoolNameEntity(string entityCode) => ErpOnecAgent.Infrastructure.Spool.FileSpoolStore.Sanitize(entityCode);
+
+    private static EtlBatch ToBatch(EtlDeadLetterBatchFile file) =>
+        new(file.BatchId, file.RunId, file.EntityName, 1, file.FilePath, EtlBatchStatus.DeadLetter, 0, null, null, string.Empty, 0, 0, 0, DateTimeOffset.UtcNow);
 
     // The spool only needs the path (and checks it stays inside the spool root).
     private static EtlBatch ToBatch(EtlSensitiveBatchFile file) =>
         new(file.BatchId, file.RunId, file.EntityName, 1, file.FilePath, EtlBatchStatus.Acknowledged, 0, null, null, string.Empty, 0, 0, 0, DateTimeOffset.UtcNow);
 }
 
-internal sealed record EtlRetentionSweep(int BlockedRuns, int DeletedFiles, int FailedDeletes);
+internal sealed record EtlRetentionSweep(int BlockedRuns, int DeletedFiles, int FailedDeletes, int DeadLetterFilesDeleted = 0, int QuarantinedFilesDeleted = 0);

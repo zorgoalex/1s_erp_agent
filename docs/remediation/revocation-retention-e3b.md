@@ -69,3 +69,36 @@ OpenAPI 1.5.0: `deleteBatchAfterAck`, and `ENTITY_REVOKED` on `POST etl/batches`
   keeps the fingerprint.
 - **`RemoteEntityNamingTests`:** the remote flag binds (`true`/`false`/absent), and so does the
   `appsettings` flag.
+
+## Spool hygiene: files of undelivered batches (2026-09-29)
+
+Found in the A04 live test. An interruption can leave two kinds of files in the spool that
+were never delivered:
+- a half-written or unregistered batch file, which startup recovery (C1) moves to
+  `spool/quarantine`;
+- the file of a registered batch that recovery fenced `dead_letter`.
+
+Before this change, only acknowledged files were ever deleted, so a half-written
+`counterparty_phones` file would have stayed in the quarantine indefinitely.
+
+`EtlRetentionWorker` now also sweeps these files. Batch rows always stay; the log carries
+counts only (`ETL_UNDELIVERED_FILES_DELETED`).
+
+| File | Deleted |
+|---|---|
+| any file of a sensitive entity: a `dead_letter` batch or a quarantined file named after the entity | at once |
+| `dead_letter` file, run blocked and not resolved | never: kept as evidence for the operator |
+| `dead_letter` file, run closed (R1-resolved, or failed/cancelled/succeeded/partial_success) | `Storage:FailedBatchRetentionDays` (default 7) after the batch was created |
+| any other quarantined file, including names that are not batch file names | `FailedBatchRetentionDays` after it was quarantined |
+
+A sensitive entity is one with `deleteBatchAfterAck`, frozen in any run or in the active
+configuration. For a quarantined file, the quarantine time is the millisecond suffix in its
+name, or its write time when there is none. Delete failures are retried by the next sweep.
+
+Tests (`EtlC1ReviewFixTests.Hygiene_*`, 2):
+- quarantine: sensitive `.orphan` and `.tmp` files go at once, an old non-sensitive file goes,
+  a fresh one and a non-batch file stay;
+- dead letters: the sensitive file goes at once, the non-sensitive one is kept while its run
+  is blocked, then after R1 while young, and is deleted once past the period, with its row
+  kept.
+

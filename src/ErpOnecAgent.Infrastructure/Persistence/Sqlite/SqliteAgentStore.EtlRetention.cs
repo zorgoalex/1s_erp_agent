@@ -72,6 +72,39 @@ public sealed partial class SqliteAgentStore
         return blocked;
     }
 
+    /// <inheritdoc cref="IAgentStore.GetDeadLetterBatchFilesAsync"/>
+    public async Task<IReadOnlyList<EtlDeadLetterBatchFile>> GetDeadLetterBatchFilesAsync(CancellationToken cancellationToken)
+    {
+        var files = new List<EtlDeadLetterBatchFile>();
+        await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT b.batch_id, b.run_id, b.entity_name, b.file_path, b.created_at_utc,
+                   CASE WHEN r.resolved_at_utc IS NOT NULL OR r.status IN ('failed','cancelled','succeeded','partial_success') THEN 1 ELSE 0 END,
+                   COALESCE((SELECT {DeleteBatchAfterAckFlag} FROM etl_run_entities re WHERE re.run_id=b.run_id AND re.entity_name=b.entity_name), 0)
+            FROM etl_batches b JOIN etl_runs r ON r.run_id=b.run_id
+            WHERE b.status='dead_letter'
+            ORDER BY b.created_at_utc, b.batch_id;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            files.Add(new EtlDeadLetterBatchFile(Guid.Parse(reader.GetString(0)), Guid.Parse(reader.GetString(1)), reader.GetString(2), reader.GetString(3),
+                ParseDate(reader.GetString(4)), reader.GetInt64(5) == 1, reader.GetInt64(6) == 1));
+        return files;
+    }
+
+    /// <inheritdoc cref="IAgentStore.GetSensitiveEntityCodesAsync"/>
+    public async Task<IReadOnlySet<string>> GetSensitiveEntityCodesAsync(CancellationToken cancellationToken)
+    {
+        var codes = new HashSet<string>(StringComparer.Ordinal);
+        await using var connection = await factory.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT DISTINCT re.entity_name FROM etl_run_entities re WHERE {DeleteBatchAfterAckFlag} = 1;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) codes.Add(reader.GetString(0));
+        return codes;
+    }
+
     private static List<string> RevokedSensitiveEntities(string entitiesJson, IReadOnlySet<string> activeEntityCodes)
     {
         var revoked = new List<string>();
