@@ -181,6 +181,7 @@ public sealed partial class SqliteAgentStore
         // generation and stored domain fingerprint — presence distinguishes an absent
         // row from a present row with NULL values.
         bool basePresent;
+        var autoDomainReset = false;
         long? baseGeneration = null;
         string? baseCursor = null;
         string? baseFingerprint = null;
@@ -203,6 +204,28 @@ public sealed partial class SqliteAgentStore
             : baseFingerprint is null ? "unknown"
             : string.Equals(baseFingerprint, fingerprint, StringComparison.Ordinal) ? "same"
             : "changed";
+
+        // D1 amendment (user decision 2026-09-30, after stage run a811f924): an explicit full
+        // read ordered by ERP (bootstrap_full / entity_reload) re-establishes a domain whose
+        // DEFINITION changed (filter, fields, path) — it reads the entity from scratch anyway. The
+        // old row is archived exactly like an operator reset. Only when the base was written from
+        // the SAME source: a changed source (another 1C base or export epoch) keeps the manual
+        // procedure, and an incremental read still refuses DOMAIN_CHANGED. The run owns the entity
+        // here, so no other run holds the old base.
+        if (domainStatus == "changed" && request.QueryMode is "bootstrap_full" or "entity_reload"
+            && string.Equals(await ScalarStringAsync(connection, transaction,
+                    "SELECT r.source_namespace FROM watermarks w JOIN etl_runs r ON r.run_id=w.last_run_id WHERE w.entity_name=$entity;",
+                    cancellationToken, ("$entity", request.EntityName)).ConfigureAwait(false), request.SourceNamespace, StringComparison.Ordinal))
+        {
+            await ArchiveAndRemoveWatermarkAsync(connection, transaction, request.EntityName, AutoDomainResetOperator,
+                $"automatic: definition changed, explicit {request.QueryMode} of run {runId:D}", UtcNow(), cancellationToken).ConfigureAwait(false);
+            basePresent = false;
+            baseGeneration = null;
+            baseCursor = null;
+            baseFingerprint = null;
+            domainStatus = "absent";
+            autoDomainReset = true;
+        }
 
         // D1: an incremental read never establishes a domain — the first watermark of an
         // entity (and every watermark after a domain reset) comes from an explicit baseline.
@@ -292,8 +315,10 @@ public sealed partial class SqliteAgentStore
         }
 
         return new EtlEntityBeginOutcome.Begun(new EtlEntityExtractionBase(
-            request.EntityName, basePresent, baseCursor, baseGeneration, baseFingerprint, fingerprint, domainStatus));
+            request.EntityName, basePresent, baseCursor, baseGeneration, baseFingerprint, fingerprint, domainStatus), autoDomainReset);
     }
+
+    internal const string AutoDomainResetOperator = "agent:auto-domain-reset";
 
     /// <inheritdoc cref="IAgentStore.RegisterGuardedEtlBatchAsync"/>
     public async Task<EtlBatchRegistrationOutcome> RegisterGuardedEtlBatchAsync(EtlBatch batch, Guid extractionClaimId, CancellationToken cancellationToken)

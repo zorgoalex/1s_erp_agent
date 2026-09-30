@@ -78,3 +78,30 @@ transfer is verified separately.
   If one does exist, reset it.
 - A fresh deployment, or a newly enabled entity, needs an explicit
   `start_full_sync`/`reload_entity` baseline before scheduled incremental runs include it.
+
+## Amendment 2026-09-30: an explicit full read re-establishes a changed definition
+
+User decision after stage run `a811f924`. ERP changed a payment `filter`; both entities were refused
+`DOMAIN_CHANGED`, and a manual reset on the site was needed.
+
+**Now, in `BeginEtlEntityExtractionAsync`**, a domain `changed` is re-established automatically when:
+- the read is an explicit `bootstrap_full` or `entity_reload`;
+- the watermark was written from the **same source** (the `source_namespace` of its `last_run_id` equals the
+  request's).
+
+**What happens:**
+- the old row is archived into `watermark_domain_resets` exactly like an operator reset (operator
+  `agent:auto-domain-reset`) in the Begin transaction;
+- the entity is read as a new baseline;
+- the extraction worker logs `ETL_DOMAIN_AUTO_RESET`.
+
+**Unchanged:**
+- an incremental read still refuses `DOMAIN_CHANGED`;
+- a changed source (another 1C base or export epoch), a base of unknown origin (no last run) and
+  `DOMAIN_UNKNOWN` keep the manual procedure.
+
+**Tests** (`EtlAutoRecoveryA04Tests`, +4):
+- same source with a full read: auto reset and archive;
+- incremental read: refused;
+- another source: refused;
+- unknown origin: refused.

@@ -147,7 +147,8 @@ public enum EtlEntityBeginRejection
 public abstract record EtlEntityBeginOutcome
 {
     private EtlEntityBeginOutcome() { }
-    public sealed record Begun(EtlEntityExtractionBase Base) : EtlEntityBeginOutcome;
+    /// <param name="DomainAutoReset">The definition changed and the explicit full read re-established the domain (the old watermark was archived).</param>
+    public sealed record Begun(EtlEntityExtractionBase Base, bool DomainAutoReset = false) : EtlEntityBeginOutcome;
     public sealed record Rejected(EtlEntityBeginRejection Reason) : EtlEntityBeginOutcome;
 }
 

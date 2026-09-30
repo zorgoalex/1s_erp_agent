@@ -54,20 +54,29 @@ public sealed partial class SqliteAgentStore
             return new EtlWatermarkDomainResetOutcome.Refused(refusal.Value);
         }
 
-        var resetId = Guid.NewGuid();
-        var archived = await ExecuteAsync(connection, transaction, """
-            INSERT INTO watermark_domain_resets(reset_id,entity_name,reset_at_utc,operator_id,reason,prior_committed_cursor_json,prior_extracting_cursor_json,prior_generation,prior_domain_fingerprint,prior_last_run_id,prior_updated_at_utc)
-            VALUES($id,$entity,$now,$operator,$reason,$cursor,$extracting,$generation,$fp,$lastRun,$updated);
-            """, cancellationToken,
-            ("$id", resetId.ToString("D")), ("$entity", request.EntityName), ("$now", now), ("$operator", request.OperatorId), ("$reason", request.Reason),
-            ("$cursor", cursor), ("$extracting", extracting), ("$generation", generation), ("$fp", fingerprint), ("$lastRun", lastRun), ("$updated", updatedAt)).ConfigureAwait(false);
-        if (archived != 1) throw new InvalidOperationException($"Domain reset archive for '{request.EntityName}' was not written.");
-        var removed = await ExecuteAsync(connection, transaction,
-            "DELETE FROM watermarks WHERE entity_name=$entity AND generation=$generation;",
-            cancellationToken, ("$entity", request.EntityName), ("$generation", generation)).ConfigureAwait(false);
-        if (removed != 1) throw new InvalidOperationException($"Watermark '{request.EntityName}' changed mid-reset.");
+        var resetId = await ArchiveAndRemoveWatermarkAsync(connection, transaction, request.EntityName, request.OperatorId, request.Reason, now, cancellationToken).ConfigureAwait(false);
 
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new EtlWatermarkDomainResetOutcome.Reset(new EtlWatermarkDomainReset(resetId, request.EntityName, ParseDate(now), generation!.Value, cursor, fingerprint));
+    }
+
+    // The reset itself, shared by the operator reset above and the automatic one at Begin: the
+    // current row is archived verbatim into watermark_domain_resets and removed, in the caller's
+    // transaction.
+    private static async Task<Guid> ArchiveAndRemoveWatermarkAsync(SqliteConnection connection, SqliteTransaction transaction, string entityName, string operatorId, string reason, string now, CancellationToken cancellationToken)
+    {
+        var resetId = Guid.NewGuid();
+        var archived = await ExecuteAsync(connection, transaction, """
+            INSERT INTO watermark_domain_resets(reset_id,entity_name,reset_at_utc,operator_id,reason,prior_committed_cursor_json,prior_extracting_cursor_json,prior_generation,prior_domain_fingerprint,prior_last_run_id,prior_updated_at_utc)
+            SELECT $id,entity_name,$now,$operator,$reason,committed_cursor_json,extracting_cursor_json,generation,domain_fingerprint,last_run_id,updated_at_utc
+            FROM watermarks WHERE entity_name=$entity;
+            """, cancellationToken,
+            ("$id", resetId.ToString("D")), ("$entity", entityName), ("$now", now), ("$operator", operatorId), ("$reason", reason)).ConfigureAwait(false);
+        if (archived != 1) throw new InvalidOperationException($"Domain reset archive for '{entityName}' was not written.");
+        var removed = await ExecuteAsync(connection, transaction,
+            "DELETE FROM watermarks WHERE entity_name=$entity;",
+            cancellationToken, ("$entity", entityName)).ConfigureAwait(false);
+        if (removed != 1) throw new InvalidOperationException($"Watermark '{entityName}' changed mid-reset.");
+        return resetId;
     }
 }

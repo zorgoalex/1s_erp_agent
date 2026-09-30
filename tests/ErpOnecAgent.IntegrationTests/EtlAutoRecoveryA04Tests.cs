@@ -288,6 +288,66 @@ public sealed class EtlAutoRecoveryA04Tests : IAsyncLifetime
         Assert.Empty(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None));
     }
 
+    // ---------- D1 amendment (2026-09-30): a changed definition is re-established by an explicit full read ----------
+
+    [Fact]
+    public async Task An_explicit_full_read_re_establishes_a_domain_whose_definition_changed_under_the_same_source()
+    {
+        await BaseFromEarlierRunAsync("clients", SourceNamespace);
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients"]);
+
+        var begun = Assert.IsType<EtlEntityBeginOutcome.Begun>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("clients"), CancellationToken.None));
+
+        Assert.True(begun.DomainAutoReset);
+        Assert.False(begun.Base.BaseRowPresent);
+        Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM watermarks WHERE entity_name='clients'"));
+        Assert.Equal("agent:auto-domain-reset", await ScalarStringAsync("SELECT operator_id FROM watermark_domain_resets WHERE entity_name='clients'"));
+        Assert.Equal("another-definition", await ScalarStringAsync("SELECT prior_domain_fingerprint FROM watermark_domain_resets WHERE entity_name='clients'"));
+    }
+
+    [Fact]
+    public async Task An_incremental_read_still_refuses_a_changed_definition()
+    {
+        await BaseFromEarlierRunAsync("clients", SourceNamespace);
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients"]);
+
+        Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("clients") with { QueryMode = "incremental" }, CancellationToken.None));
+
+        Assert.Equal(1, await ScalarAsync("SELECT COUNT(*) FROM watermarks WHERE entity_name='clients'"));
+        Assert.Equal(0, await ScalarAsync("SELECT COUNT(*) FROM watermark_domain_resets"));
+    }
+
+    [Theory]
+    [InlineData("1c-identity:v1:33333333-3333-3333-3333-333333333333:22222222-2222-2222-2222-222222222222:test")] // another 1C base
+    [InlineData(null)] // base of unknown origin (no last run)
+    public async Task A_base_from_another_or_unknown_source_keeps_the_manual_procedure(string? baseSource)
+    {
+        await BaseFromEarlierRunAsync("clients", baseSource);
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients"]);
+
+        var rejected = Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("clients"), CancellationToken.None));
+
+        Assert.Equal(EtlEntityBeginRejection.DomainChanged, rejected.Reason);
+        Assert.Equal(1, await ScalarAsync("SELECT COUNT(*) FROM watermarks WHERE entity_name='clients'"));
+    }
+
+    // A committed base written by an earlier run of the given source, under another definition.
+    private async Task BaseFromEarlierRunAsync(string entity, string? source)
+    {
+        string? lastRun = null;
+        if (source is not null)
+        {
+            lastRun = Guid.NewGuid().ToString("D");
+            var now = DateTimeOffset.UtcNow.ToString("O");
+            await ExecuteSqlAsync(
+                "INSERT INTO etl_runs(run_id,mode,requested_entities_json,status,configuration_version,created_at_utc,updated_at_utc,row_version,source_namespace) VALUES($run,'bootstrap_full','[]','succeeded',6,$now,$now,1,$ns);",
+                ("$run", lastRun), ("$now", now), ("$ns", source));
+        }
+        await ExecuteSqlAsync(
+            "INSERT INTO watermarks(entity_name,committed_cursor_json,last_run_id,updated_at_utc,generation,domain_fingerprint) VALUES($e,'{}',$run,$now,1,'another-definition');",
+            ("$e", entity), ("$run", lastRun), ("$now", DateTimeOffset.UtcNow.ToString("O")));
+    }
+
     // A committed watermark whose domain belongs to another definition: Begin refuses DOMAIN_CHANGED.
     private Task DomainOfAnotherDefinitionAsync(string entity) => ExecuteSqlAsync(
         "INSERT INTO watermarks(entity_name,committed_cursor_json,updated_at_utc,generation,domain_fingerprint) VALUES($e,'{}',$now,1,'another-definition');",

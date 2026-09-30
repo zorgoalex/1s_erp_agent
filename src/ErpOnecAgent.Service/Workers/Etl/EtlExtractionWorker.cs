@@ -239,7 +239,10 @@ public sealed class EtlExtractionWorker(
             await BlockAsync(runId, claimId, "BEGIN_" + ToCode(rejected.Reason.ToString()), $"Entity '{entity.EntityCode}' extraction was refused: {rejected.Reason}.", cancellationToken).ConfigureAwait(false);
             return EntityResult.Stop;
         }
-        var captured = ((EtlEntityBeginOutcome.Begun)begin).Base;
+        var begun = (EtlEntityBeginOutcome.Begun)begin;
+        if (begun.DomainAutoReset)
+            logger.LogWarning("ETL_DOMAIN_AUTO_RESET RunId={RunId} Entity={Entity} Mode={Mode} — the definition changed; the explicit full read starts a new baseline (old watermark archived)", runId, entity.EntityCode, mode);
+        var captured = begun.Base;
         var committed = captured.CommittedCursorJson is null ? null : JsonSerializer.Deserialize<EtlCursor>(captured.CommittedCursorJson, JsonOptions);
         var full = mode is not "incremental";
 
