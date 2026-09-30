@@ -125,3 +125,23 @@ After the live test (+2):
 - without a binding it is recovered but not closed.
 
 Full suite: 983 integration + 325 unit.
+
+## Closing a failed run too (2026-09-30, `to-onec/0063`)
+
+**Found on stage (run `a811f924`).** After a `filter` change, both entities were refused at
+Begin with `DOMAIN_CHANGED` (D1), and the run failed locally with `ALL_ENTITIES_FAILED`. ERP had
+opened the run from the command result and kept it `receiving`: a failed run sent no
+`complete`.
+
+**Change.** `TerminateRunAsync` with status `failed` now queues the same closing `complete` v2
+through the same queue and sender, when ERP knows the run: an ACK, or a delivered command
+result.
+- Every frozen entity is `failed` with its own failure code (e.g. `DOMAIN_CHANGED`).
+- An entity without a code gets `RUN_FAILED`.
+- A `blocked` run is not closed: its outcome may be uncertain, and it goes to R1.
+
+**Tests** (`EtlAutoRecoveryA04Tests`, +2):
+- a known failed run is closed: `DOMAIN_CHANGED` on the refused entity, `RUN_FAILED` on the one
+  never begun;
+- an unknown run is not closed.
+

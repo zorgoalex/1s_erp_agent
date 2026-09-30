@@ -251,6 +251,48 @@ public sealed class EtlAutoRecoveryA04Tests : IAsyncLifetime
         Assert.False(outcome.InterruptionNoticeQueued);
     }
 
+    // ---------- to-onec/0063: a failed run ERP knows is closed too ----------
+
+    [Fact]
+    public async Task A_failed_run_erp_knows_is_closed_with_each_entitys_own_failure_code()
+    {
+        var commandId = Guid.NewGuid();
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients", "orders"], generation: "gen-7", commandId: commandId);
+        await DeliveredCommandResultAsync(commandId);
+        // Refused at Begin with DOMAIN_CHANGED, exactly as after a filter change (stage run a811f924).
+        await DomainOfAnotherDefinitionAsync("clients");
+        Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("clients"), CancellationToken.None));
+
+        Assert.IsType<EtlRunTerminationOutcome.Applied>(await _store.FailEtlRunAsync(runId, claim, "ALL_ENTITIES_FAILED: clients, orders", CancellationToken.None));
+
+        using var payload = JsonDocument.Parse(Assert.Single(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None)).PayloadJson);
+        var root = payload.RootElement;
+        Assert.Equal("partial_success", root.GetProperty("status").GetString());
+        Assert.Equal(2, root.GetProperty("entitiesFailed").GetInt64());
+        Assert.Equal("11111111-1111-1111-1111-111111111111", root.GetProperty("sourceIdentity").GetProperty("databaseId").GetString());
+        var entities = root.GetProperty("entities").EnumerateArray().ToDictionary(static e => e.GetProperty("entity").GetString()!, static e => e);
+        Assert.Equal("DOMAIN_CHANGED", entities["clients"].GetProperty("errorCode").GetString());
+        Assert.Equal("RUN_FAILED", entities["orders"].GetProperty("errorCode").GetString());
+        Assert.All(entities.Values, static e => Assert.Equal("failed", e.GetProperty("status").GetString()));
+    }
+
+    [Fact]
+    public async Task A_failed_run_erp_does_not_know_is_not_closed()
+    {
+        var (runId, _, claim) = await ClaimedManualRunAsync(["clients"]);
+        await DomainOfAnotherDefinitionAsync("clients");
+        Assert.IsType<EtlEntityBeginOutcome.Rejected>(await _store.BeginEtlEntityExtractionAsync(runId, claim, Request("clients"), CancellationToken.None));
+
+        Assert.IsType<EtlRunTerminationOutcome.Applied>(await _store.FailEtlRunAsync(runId, claim, "ALL_ENTITIES_FAILED: clients", CancellationToken.None));
+
+        Assert.Empty(await _store.GetDueInterruptionNoticesAsync(10, DateTimeOffset.UtcNow, CancellationToken.None));
+    }
+
+    // A committed watermark whose domain belongs to another definition: Begin refuses DOMAIN_CHANGED.
+    private Task DomainOfAnotherDefinitionAsync(string entity) => ExecuteSqlAsync(
+        "INSERT INTO watermarks(entity_name,committed_cursor_json,updated_at_utc,generation,domain_fingerprint) VALUES($e,'{}',$now,1,'another-definition');",
+        ("$e", entity), ("$now", DateTimeOffset.UtcNow.ToString("O")));
+
     private async Task DeliveredCommandResultAsync(Guid commandId)
     {
         using var document = JsonDocument.Parse("{\"entities\":[]}");

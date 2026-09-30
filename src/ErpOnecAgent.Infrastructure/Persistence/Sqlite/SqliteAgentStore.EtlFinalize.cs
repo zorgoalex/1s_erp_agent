@@ -1234,9 +1234,22 @@ public sealed partial class SqliteAgentStore
         await ExecuteAsync(connection, transaction,
             "UPDATE etl_jobs SET status='blocked', updated_at_utc=$now, row_version=row_version+1 WHERE run_id=$run AND status NOT IN ('finished','cancelled','blocked');",
             cancellationToken, ("$now", now), ("$run", runId.ToString("D"))).ConfigureAwait(false);
+        // A failed run ERP already knows (an ACK, or the delivered command result carrying the
+        // runId) is closed there with a complete in which every entity failed (to-onec/0063) —
+        // otherwise it stays 'receiving' until ERP abandons it after 24 h. A blocked run is left
+        // to the operator (R1): its outcome may be uncertain.
+        if (string.Equals(status, "failed", StringComparison.Ordinal))
+        {
+            var jobCommandId = await ScalarStringAsync(connection, transaction, "SELECT command_id FROM etl_jobs WHERE run_id=$run;",
+                cancellationToken, ("$run", runId.ToString("D"))).ConfigureAwait(false);
+            await EnqueueInterruptionNoticeAsync(connection, transaction, runId, jobCommandId, null, DateTimeOffset.UtcNow, now,
+                RunFailedCode, message, preferEntityFailure: true, cancellationToken).ConfigureAwait(false);
+        }
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return new EtlRunTerminationOutcome.Applied();
     }
+
+    internal const string RunFailedCode = "RUN_FAILED";
 
     private static async Task<ClaimReadiness> VerifyClaimReadinessAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, RunRow run, CancellationToken cancellationToken)
     {

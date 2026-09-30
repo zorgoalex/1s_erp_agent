@@ -78,7 +78,8 @@ public sealed partial class SqliteAgentStore
 
         // A04b: ERP knows this run — queue the closing complete in the same commit, so ERP closes
         // the run at once instead of abandoning it after 24 h.
-        var notice = await EnqueueInterruptionNoticeAsync(connection, transaction, runId, job?.CommandId, currentSourceNamespace, nowUtc, now, cancellationToken).ConfigureAwait(false);
+        var notice = await EnqueueInterruptionNoticeAsync(connection, transaction, runId, job?.CommandId, currentSourceNamespace, nowUtc, now,
+            RunInterruptedCode, RunInterruptedMessage, preferEntityFailure: false, cancellationToken).ConfigureAwait(false);
 
         if (job is null)
         {
@@ -123,8 +124,11 @@ public sealed partial class SqliteAgentStore
     // listed with zeros), batchesAcknowledged exactly the acknowledged batches. Only when ERP knows
     // the run: it acknowledged a batch, or — for a manual run — it accepted the command result
     // that carries the runId (ERP opens the run from it). Otherwise there is nothing to close.
-    private static async Task<bool> EnqueueInterruptionNoticeAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string? jobCommandId,
-        string? currentSourceNamespace, DateTimeOffset nowUtc, string now, CancellationToken cancellationToken)
+    // preferEntityFailure: a failed run (to-onec/0063) reports each entity's own failure code
+    // (e.g. DOMAIN_CHANGED at Begin) and falls back to the run code; an interrupted run reports
+    // RUN_INTERRUPTED for every entity.
+    internal static async Task<bool> EnqueueInterruptionNoticeAsync(SqliteConnection connection, SqliteTransaction transaction, Guid runId, string? jobCommandId,
+        string? currentSourceNamespace, DateTimeOffset nowUtc, string now, string code, string message, bool preferEntityFailure, CancellationToken cancellationToken)
     {
         var runText = runId.ToString("D");
         var acknowledged = await ScalarLongAsync(connection, transaction,
@@ -162,7 +166,9 @@ public sealed partial class SqliteAgentStore
             if (scope is null) return false;
             rowsRead += entity?.RowsRead ?? 0;
             batchesCreated += entity?.BatchesCreated ?? 0;
-            items.Add(new CompletePayloadEntity(definition.EntityCode, "failed", scope, entity?.RowsRead ?? 0, entity?.BatchesCreated ?? 0, RunInterruptedCode, RunInterruptedMessage, entity?.SnapshotAtUtc));
+            var entityCode = preferEntityFailure && !string.IsNullOrWhiteSpace(entity?.FailureCode) ? entity!.FailureCode! : code;
+            var entityMessage = preferEntityFailure && !string.IsNullOrWhiteSpace(entity?.FailureCode) ? entity!.FailureMessage ?? message : message;
+            items.Add(new CompletePayloadEntity(definition.EntityCode, "failed", scope, entity?.RowsRead ?? 0, entity?.BatchesCreated ?? 0, entityCode, entityMessage, entity?.SnapshotAtUtc));
         }
         var payload = JsonSerializer.Serialize(new CompletePayloadV2(
             runId, "partial_success", run.Mode, identity, run.SourceGeneration,
