@@ -36,7 +36,10 @@ public sealed class ErpSessionManager(IErpClient erp, IOptions<AgentOptions> age
             if (!response.Accepted)
             {
                 state.LatchCompatibilityRejection();
-                throw new InvalidOperationException($"ERP rejected agent version {ThisAssembly.Version}; minimum is {response.MinimumAgentVersion}.");
+                // accepted:false is not only a version verdict: ERP also refuses a session while the
+                // reported source identity awaits confirmation (to-onec/0060). The response carries no
+                // reason, so the message names the refusal, not a cause.
+                throw new InvalidOperationException($"ERP refused the session (accepted: false); agent {ThisAssembly.Version}, ERP minimum {response.MinimumAgentVersion}. The reason is on the ERP side, e.g. a source identity not yet confirmed.");
             }
             // minimumAgentVersion is contract-required (openapi: required string, non-nullable DTO).
             // An absent/malformed value can never establish compatibility — fail closed as a protocol
